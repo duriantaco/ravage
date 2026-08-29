@@ -1,0 +1,42 @@
+<nav class="site-nav" aria-label="Documentation">
+  <a class="brand" href="{{ '/' | relative_url }}" aria-label="{{ site.title }} home">
+    <img src="{{ '/assets/ravage_logo.png' | relative_url }}" alt="" width="44" height="44">
+    <span>
+      <strong>Ravage</strong>
+      <small>Docs</small>
+    </span>
+  </a>
+
+  <div class="nav-groups">
+    {% for group in site.data.navigation.groups %}
+      {% assign nav_id = include.nav_id_prefix | default: 'nav' | append: '-' | append: group.title | slugify %}
+      <section class="nav-group" aria-labelledby="{{ nav_id }}">
+        <h2 id="{{ nav_id }}">{{ group.title }}</h2>
+        <ul>
+          {% for item in group.items %}
+            {% assign active = false %}
+            {% if page.url == item.url %}
+              {% assign active = true %}
+            {% endif %}
+            <li>
+              {% if item.url contains '://' %}
+                {% assign href = item.url %}
+              {% else %}
+                {% assign href = item.url | relative_url %}
+              {% endif %}
+              <a class="nav-link{% if active %} is-active{% endif %}" href="{{ href }}"{% if active %} aria-current="page"{% endif %}>
+                <span>{{ item.title }}</span>
+              </a>
+            </li>
+          {% endfor %}
+        </ul>
+      </section>
+    {% endfor %}
+  </div>
+
+  <div class="nav-meta" aria-label="Project links">
+    {% for item in site.data.navigation.external %}
+      <a href="{{ item.url }}">{{ item.title }}</a>
+    {% endfor %}
+  </div>
+</nav>

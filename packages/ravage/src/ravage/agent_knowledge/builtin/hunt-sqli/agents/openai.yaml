@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hunt SQL Injection"
+  short_description: "Test query boundaries with paired differentials"
+  default_prompt: "Use $hunt-sqli to test an authorized data-query surface with bounded paired differential evidence."

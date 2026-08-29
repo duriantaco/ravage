@@ -1,0 +1,55 @@
+id: ravage-session-boundary-box
+name: Session Boundary Lab
+difficulty: medium
+category: local-web-box
+warning: Deliberately vulnerable training target. Do not deploy to any public network.
+compose_file: docker-compose.yml
+default_url: http://127.0.0.1:8096
+brief: brief.yaml
+healthcheck: http://127.0.0.1:8096/health
+flags:
+  - id: csrf
+    name: CSRF omission transfer
+    env: BOUNDARY_FLAG_CSRF
+    default: flag{boundary_csrf_omission}
+    expected_location: /transfer
+  - id: cors
+    name: credentialed CORS profile API
+    env: BOUNDARY_FLAG_CORS
+    default: flag{boundary_cors_profile}
+    expected_location: /api/profile
+  - id: storage
+    name: browser storage secret
+    env: BOUNDARY_FLAG_STORAGE
+    default: flag{boundary_storage_secret}
+    expected_location: /storage
+vulnerabilities:
+  - id: csrf_omission
+    title: Transfer form accepts missing CSRF token
+    class: csrf
+    summary: The state-changing transfer endpoint processes requests when the CSRF field is omitted.
+  - id: weak_session_cookie
+    title: Session cookie lacks browser security attributes
+    class: session_management
+    summary: The session cookie omits HttpOnly and SameSite, reducing containment against browser-side attacks.
+  - id: credentialed_cors
+    title: Credentialed CORS origin reflection
+    class: cors
+    summary: The profile API reflects arbitrary Origin values and allows credentials.
+  - id: clickjacking
+    title: Console page lacks frame policy
+    class: clickjacking
+    summary: The sensitive console page has no X-Frame-Options or CSP frame-ancestors policy.
+  - id: browser_storage_secret
+    title: Secret stored in sessionStorage
+    class: browser_storage
+    summary: A browser page writes a proof string into sessionStorage.
+  - id: websocket_origin
+    title: WebSocket accepts cross-origin Origin
+    class: websocket
+    summary: The WebSocket endpoint upgrades requests with arbitrary Origin values.
+attack_chain:
+  - Fetch the transfer form and submit it without the CSRF field to capture the CSRF flag.
+  - Send an Origin header to the profile API and observe credentialed CORS exposing the API flag.
+  - Inspect browser storage assignments on the storage page for the storage flag.
+  - Confirm missing frame policy and permissive WebSocket Origin handling as secondary browser-boundary findings.

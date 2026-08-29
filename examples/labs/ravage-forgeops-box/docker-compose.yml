@@ -1,0 +1,39 @@
+services:
+  proxy:
+    image: nginx:1.27-alpine
+    depends_on:
+      web:
+        condition: service_healthy
+      internal:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8090:80"
+    volumes:
+      - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+
+  web:
+    build:
+      context: ./web
+    environment:
+      FORGEOPS_FLAG_IDOR: flag{forgeops_project_bola}
+      FORGEOPS_FLAG_QUERY: flag{forgeops_audit_query_injection}
+      FORGEOPS_FLAG_JWT: flag{forgeops_forged_release_admin}
+      FORGEOPS_FLAG_TRAVERSAL: flag{forgeops_artifact_path_traversal}
+      FORGEOPS_FLAG_CMD: flag{forgeops_diag_command_injection}
+      FORGEOPS_JWT_SECRET: local-secret
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  internal:
+    build:
+      context: ./internal
+    environment:
+      FORGEOPS_FLAG_ROOT: flag{forgeops_internal_release_metadata}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9100/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20

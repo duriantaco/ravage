@@ -1,0 +1,15 @@
+mode: ai-web
+brief: test_repo.yaml
+target_url: http://127.0.0.1:8765
+
+model:
+  profile: hosted-openai
+  tier: low
+
+max_turns: 20
+tool_recon: true
+allow_paid_models: true
+
+db_path: ../runs/test-repo-ai-web.db
+workspace_dir: ../runs/test-repo-ai-web.workspace
+agent_skill: ../packages/ravage/src/ravage/agent_skills/web-pentest/skills.md

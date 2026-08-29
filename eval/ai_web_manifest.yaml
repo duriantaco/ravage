@@ -1,0 +1,63 @@
+cases:
+  - id: ai-web-openapi-vulnerable-search
+    agent: ai-web
+    profile: openapi
+    brief: examples/test_repo.yaml
+    target_url: http://127.0.0.1:8765
+    fixture: vulnerable_openapi
+    model_profile: local-ollama
+    model_tier: mid
+    max_turns: 12
+    expect:
+      present:
+        - vuln_class: sql_injection
+          endpoint_path: /search
+          param: q
+      absent:
+        - vuln_class: sql_injection
+          endpoint_path: /hash
+          param: data
+    budget:
+      max_seconds: 120.0
+      max_http_requests: 20
+
+  - id: ai-web-openapi-clean-search
+    agent: ai-web
+    profile: openapi
+    brief: examples/test_repo.yaml
+    target_url: http://127.0.0.1:8765
+    fixture: safe_openapi
+    model_profile: local-ollama
+    model_tier: mid
+    max_turns: 12
+    expect:
+      present: []
+      absent:
+        - vuln_class: sql_injection
+          endpoint_path: /search
+          param: q
+        - vuln_class: sql_injection
+          endpoint_path: /hash
+          param: data
+    budget:
+      max_seconds: 120.0
+      max_http_requests: 20
+
+  - id: ai-web-bwapp-sqli-search
+    agent: ai-web
+    profile: bwapp
+    brief: examples/bwapp.yaml
+    target_url: http://127.0.0.1:8080/bWAPP/
+    fixture: bwapp_sqli
+    model_profile: local-ollama
+    model_tier: mid
+    max_turns: 12
+    expect:
+      present:
+        - vuln_class: sql_injection
+          endpoint_path: /bWAPP/sqli_1.php
+          param: title
+      absent: []
+    budget:
+      max_seconds: 120.0
+      max_http_requests: 30

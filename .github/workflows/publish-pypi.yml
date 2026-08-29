@@ -1,0 +1,230 @@
+name: Publish PyPI Packages
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test release build
+    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            mypy==2.1.0 \
+            pydantic==2.13.4 \
+            pytest==9.0.3 \
+            pytest-asyncio==1.3.0 \
+            pyyaml==6.0.3 \
+            ruff==0.15.14
+          python -m pip install -e packages/schemas -e packages/ravage
+
+      - name: Check release metadata
+        run: python scripts/check_release.py
+
+      - name: Check maintained documentation
+        run: python scripts/check_docs.py
+
+      - name: Check cockpit JavaScript syntax
+        run: npm --prefix packages/ravage-cockpit run check
+
+      - name: Ruff clean baseline
+        run: |
+          python -m ruff check \
+            packages/schemas/src \
+            packages/schemas/tests \
+            packages/ravage/src/ravage/competitor_harness.py \
+            packages/ravage/src/ravage/self_adapter.py \
+            packages/ravage/tests/test_competitor_harness.py
+
+      - name: Repository Python syntax
+        run: python -m ruff check --select E9 .
+
+      - name: Mypy schemas
+        env:
+          MYPYPATH: packages/schemas/src
+        run: python -m mypy packages/schemas/src packages/schemas/tests
+
+      - name: Traffic capture and replay static checks
+        run: |
+          python -m ruff check packages/ravage/src/ravage/traffic
+          python -m mypy packages/ravage/src/ravage/traffic
+
+      - name: Public control-plane contract static checks
+        run: |
+          python -m ruff check \
+            packages/ravage/src/ravage/control_plane \
+            packages/ravage/tests/test_control_plane_authorization_contracts.py \
+            packages/ravage/tests/test_control_plane_runner_protocol.py \
+            packages/ravage/tests/test_runner_service.py
+          python -m mypy \
+            packages/ravage/src/ravage/control_plane \
+            packages/ravage/tests/test_control_plane_authorization_contracts.py \
+            packages/ravage/tests/test_control_plane_runner_protocol.py \
+            packages/ravage/tests/test_runner_service.py
+
+      - name: Check anti-overfit policy
+        run: python scripts/check_overfit.py
+
+      - name: Scan for raw secrets
+        run: |
+          secret_pattern='sk''-proj-|BEGIN (RSA|OPENSSH|PRIVATE) ''KEY'
+          if git grep -nE "${secret_pattern}" -- .; then
+            echo "Potential raw secret found."
+            exit 1
+          else
+            grep_status=$?
+            if [ "${grep_status}" -ne 1 ]; then
+              exit "${grep_status}"
+            fi
+          fi
+
+      - name: Smoke-test a clean base wheel install
+        run: python scripts/check_clean_install.py
+
+      - name: Run the full non-integration suite
+        run: python -m pytest -m "not integration" -q
+
+      - name: Enforce scoped Docker egress
+        env:
+          RAVAGE_REQUIRE_DOCKER_INTEGRATION: "1"
+        run: python -m pytest -m integration -q
+
+  build-schemas:
+    name: Build ravage-schemas
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Build distribution
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build packages/schemas --outdir dist/schemas
+
+      - name: Upload ravage-schemas artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ravage-schemas-dist
+          path: dist/schemas/*
+          if-no-files-found: error
+
+  build-ravage:
+    name: Build ravage
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Build distribution
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build packages/ravage --outdir dist/ravage
+
+      - name: Verify wheel contract surface
+        run: |
+          python -m pip install packages/schemas dist/ravage/*.whl
+          python - <<'PY'
+          import importlib
+          from pathlib import Path
+
+          import ravage
+
+          modules = (
+              "authorization_attestation",
+              "authorization_codec",
+              "authorization_contracts",
+              "authorization_state",
+              "identity",
+              "runner_protocol",
+              "runner_service",
+          )
+          for module in modules:
+              importlib.import_module(f"ravage.control_plane.{module}")
+          assert (Path(ravage.__file__).parent / "py.typed").is_file()
+          PY
+          sha256sum dist/ravage/*
+
+      - name: Upload ravage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ravage-dist
+          path: dist/ravage/*
+          if-no-files-found: error
+
+  publish-schemas:
+    name: Publish ravage-schemas to PyPI
+    runs-on: ubuntu-latest
+    needs:
+      - build-schemas
+      - build-ravage
+    if: github.event_name == 'release'
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download ravage-schemas artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ravage-schemas-dist
+          path: dist/schemas
+
+      - name: Publish ravage-schemas
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/schemas
+
+  publish-ravage:
+    name: Publish ravage to PyPI
+    runs-on: ubuntu-latest
+    needs:
+      - build-ravage
+      - publish-schemas
+    if: github.event_name == 'release'
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download ravage artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ravage-dist
+          path: dist/ravage
+
+      - name: Publish ravage
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/ravage

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hunt Command Execution"
+  short_description: "Test command execution boundaries safely"
+  default_prompt: "Use $hunt-rce to test an authorized command-processing surface with inert differential evidence."

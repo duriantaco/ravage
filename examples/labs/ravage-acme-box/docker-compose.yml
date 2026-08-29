@@ -1,0 +1,51 @@
+services:
+  proxy:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./proxy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "127.0.0.1:8088:80"
+    depends_on:
+      web:
+        condition: service_healthy
+    labels:
+      ravage.warning: "Deliberately vulnerable local training target. Do not deploy."
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  web:
+    build:
+      context: ./web
+    environment:
+      ACME_JWT_SECRET: dev-secret
+      ACME_INTERNAL_URL: http://internal:9000
+      RAVAGE_FLAG_LOW: flag{acme_idor_invoice_enum}
+      RAVAGE_FLAG_USER: flag{acme_catalog_union_sqli}
+      RAVAGE_FLAG_ADMIN: flag{acme_jwt_admin_panel}
+      RAVAGE_FLAG_ROOT: flag{acme_ssrf_internal_metadata}
+    expose:
+      - "8000"
+    depends_on:
+      internal:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  internal:
+    build:
+      context: ./internal
+    environment:
+      RAVAGE_FLAG_ROOT: flag{acme_ssrf_internal_metadata}
+    expose:
+      - "9000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20

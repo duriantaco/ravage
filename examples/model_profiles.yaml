@@ -1,0 +1,141 @@
+profiles:
+  local-ollama:
+    default_tier: mid
+    routes:
+      high:
+        - provider: ollama
+          model: ${RAVAGE_OLLAMA_MODEL:qwen2.5-coder:32b}
+          base_url: ${OLLAMA_BASE_URL:http://localhost:11434/v1}
+          api_key_required: false
+      mid:
+        - provider: ollama
+          model: ${RAVAGE_OLLAMA_MODEL:qwen2.5-coder:14b}
+          base_url: ${OLLAMA_BASE_URL:http://localhost:11434/v1}
+          api_key_required: false
+      low:
+        - provider: ollama
+          model: ${RAVAGE_OLLAMA_MODEL:qwen2.5-coder:7b}
+          base_url: ${OLLAMA_BASE_URL:http://localhost:11434/v1}
+          api_key_required: false
+
+  local-lmstudio:
+    default_tier: mid
+    routes:
+      high:
+        - provider: lmstudio
+          model: ${RAVAGE_LMSTUDIO_MODEL:local-model}
+          base_url: ${LMSTUDIO_BASE_URL:http://localhost:1234/v1}
+          api_key_required: false
+      mid:
+        - provider: lmstudio
+          model: ${RAVAGE_LMSTUDIO_MODEL:local-model}
+          base_url: ${LMSTUDIO_BASE_URL:http://localhost:1234/v1}
+          api_key_required: false
+      low:
+        - provider: lmstudio
+          model: ${RAVAGE_LMSTUDIO_MODEL:local-model}
+          base_url: ${LMSTUDIO_BASE_URL:http://localhost:1234/v1}
+          api_key_required: false
+
+  local-vllm:
+    default_tier: mid
+    routes:
+      high:
+        - provider: vllm
+          model: ${RAVAGE_VLLM_MODEL:local-model}
+          base_url: ${VLLM_BASE_URL:http://localhost:8000/v1}
+          api_key_required: false
+      mid:
+        - provider: vllm
+          model: ${RAVAGE_VLLM_MODEL:local-model}
+          base_url: ${VLLM_BASE_URL:http://localhost:8000/v1}
+          api_key_required: false
+      low:
+        - provider: vllm
+          model: ${RAVAGE_VLLM_MODEL:local-model}
+          base_url: ${VLLM_BASE_URL:http://localhost:8000/v1}
+          api_key_required: false
+
+  universal-litellm:
+    default_tier: mid
+    routes:
+      high:
+        - provider: litellm
+          model: ${RAVAGE_LITELLM_HIGH_MODEL:openai/gpt-5.4}
+          base_url: ${LITELLM_BASE_URL:http://localhost:4000/v1}
+          api_key_required: false
+      mid:
+        - provider: litellm
+          model: ${RAVAGE_LITELLM_MID_MODEL:openai/gpt-5.4}
+          base_url: ${LITELLM_BASE_URL:http://localhost:4000/v1}
+          api_key_required: false
+      low:
+        - provider: litellm
+          model: ${RAVAGE_LITELLM_LOW_MODEL:openai/gpt-5.4-mini}
+          base_url: ${LITELLM_BASE_URL:http://localhost:4000/v1}
+          api_key_required: false
+
+  hosted-openai:
+    default_tier: mid
+    routes:
+      high:
+        - provider: openai
+          model: ${RAVAGE_OPENAI_HIGH_MODEL:gpt-5.4}
+          api_key_env: OPENAI_API_KEY
+          output_token_limit_parameter: max_completion_tokens
+      mid:
+        - provider: openai
+          model: ${RAVAGE_OPENAI_MID_MODEL:gpt-5.4}
+          api_key_env: OPENAI_API_KEY
+          output_token_limit_parameter: max_completion_tokens
+      low:
+        - provider: openai
+          model: ${RAVAGE_OPENAI_LOW_MODEL:gpt-5.4-mini}
+          api_key_env: OPENAI_API_KEY
+          output_token_limit_parameter: max_completion_tokens
+
+  hosted-anthropic:
+    default_tier: mid
+    routes:
+      high:
+        - provider: anthropic
+          model: ${RAVAGE_ANTHROPIC_HIGH_MODEL:claude-opus-4-7}
+          api_key_env: ANTHROPIC_API_KEY
+          max_output_tokens: 4096
+      mid:
+        - provider: anthropic
+          model: ${RAVAGE_ANTHROPIC_MID_MODEL:claude-sonnet-4-6}
+          api_key_env: ANTHROPIC_API_KEY
+          max_output_tokens: 4096
+      low:
+        - provider: anthropic
+          model: ${RAVAGE_ANTHROPIC_LOW_MODEL:claude-haiku-4-5}
+          api_key_env: ANTHROPIC_API_KEY
+          max_output_tokens: 4096
+
+  mixed-fallback:
+    default_tier: mid
+    routes:
+      high:
+        - provider: openai
+          model: ${RAVAGE_OPENAI_HIGH_MODEL:gpt-5.4}
+          api_key_env: OPENAI_API_KEY
+          output_token_limit_parameter: max_completion_tokens
+        - provider: ollama
+          model: ${RAVAGE_OLLAMA_MODEL:qwen2.5-coder:32b}
+          base_url: ${OLLAMA_BASE_URL:http://localhost:11434/v1}
+          api_key_required: false
+      mid:
+        - provider: litellm
+          model: ${RAVAGE_LITELLM_MID_MODEL:openai/gpt-5.4}
+          base_url: ${LITELLM_BASE_URL:http://localhost:4000/v1}
+          api_key_required: false
+        - provider: ollama
+          model: ${RAVAGE_OLLAMA_MODEL:qwen2.5-coder:14b}
+          base_url: ${OLLAMA_BASE_URL:http://localhost:11434/v1}
+          api_key_required: false
+      low:
+        - provider: ollama
+          model: ${RAVAGE_OLLAMA_MODEL:qwen2.5-coder:7b}
+          base_url: ${OLLAMA_BASE_URL:http://localhost:11434/v1}
+          api_key_required: false

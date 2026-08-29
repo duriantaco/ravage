@@ -1,0 +1,42 @@
+[project]
+name = "ravage-schemas"
+version = "0.5.0"
+description = "Strict shared schemas for Ravage runtime components"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pydantic>=2.8",
+]
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Ravage contributors" },
+]
+urls = { Repository = "https://github.com/duriantaco/ravage", Issues = "https://github.com/duriantaco/ravage/issues" }
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pentest_schemas"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/pentest_schemas",
+    "LICENSE",
+    "README.md",
+    "pyproject.toml",
+]
+exclude = [
+    "tests",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

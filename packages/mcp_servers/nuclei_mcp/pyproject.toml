@@ -1,0 +1,14 @@
+[project]
+name = "nuclei-mcp"
+version = "0.1.0"
+description = "MCP wrapper for passive nuclei templates"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "mcp>=1.0",
+    "pydantic>=2.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+

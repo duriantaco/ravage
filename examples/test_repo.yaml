@@ -1,0 +1,14 @@
+engagement_id: "33333333-3333-4333-8333-333333333333"
+scope:
+  in_scope:
+    - "http://127.0.0.1:8765"
+  out_of_scope: []
+roe:
+  max_rps: 10
+  no_destructive_actions: true
+  data_handling: "placeholders_only"
+objectives:
+  - "sql_injection"
+budget:
+  max_cost_usd: 1.0
+  max_runtime_min: 10

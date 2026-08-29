@@ -1,0 +1,54 @@
+cases:
+  - id: openapi-vulnerable-search
+    agent: local-sqli
+    profile: openapi
+    brief: examples/test_repo.yaml
+    target_url: http://127.0.0.1:8765
+    fixture: vulnerable_openapi
+    expect:
+      present:
+        - vuln_class: sql_injection
+          endpoint_path: /search
+          param: q
+      absent:
+        - vuln_class: sql_injection
+          endpoint_path: /hash
+          param: data
+    budget:
+      max_seconds: 5.0
+      max_http_requests: 20
+
+  - id: openapi-clean-search
+    agent: local-sqli
+    profile: openapi
+    brief: examples/test_repo.yaml
+    target_url: http://127.0.0.1:8765
+    fixture: safe_openapi
+    expect:
+      present: []
+      absent:
+        - vuln_class: sql_injection
+          endpoint_path: /search
+          param: q
+        - vuln_class: sql_injection
+          endpoint_path: /hash
+          param: data
+    budget:
+      max_seconds: 5.0
+      max_http_requests: 20
+
+  - id: bwapp-sqli-search
+    agent: local-sqli
+    profile: bwapp
+    brief: examples/bwapp.yaml
+    target_url: http://127.0.0.1:8080/bWAPP/
+    fixture: bwapp_sqli
+    expect:
+      present:
+        - vuln_class: sql_injection
+          endpoint_path: /bWAPP/sqli_1.php
+          param: title
+      absent: []
+    budget:
+      max_seconds: 5.0
+      max_http_requests: 30

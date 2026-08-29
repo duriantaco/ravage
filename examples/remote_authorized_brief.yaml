@@ -1,0 +1,14 @@
+engagement_id: "99999999-9999-4999-8999-999999999999"
+scope:
+  in_scope:
+    - "https://staging.example.test"
+  out_of_scope: []
+roe:
+  max_rps: 5
+  no_destructive_actions: true
+  data_handling: "placeholders_only"
+objectives:
+  - "web_application_assessment"
+budget:
+  max_cost_usd: 5.0
+  max_runtime_min: 20

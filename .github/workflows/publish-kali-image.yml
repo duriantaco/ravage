@@ -1,0 +1,248 @@
+name: Publish Kali Tool Image
+
+on:
+  pull_request:
+    paths:
+      - sandbox/kali.Dockerfile
+      - .github/workflows/publish-kali-image.yml
+  release:
+    types:
+      - published
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-kali-image-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'publish' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ghcr.io/duriantaco/ravage-kali
+
+# One-time setup after the first publish: open the ravage-kali package settings
+# in GitHub Packages and make it public so anonymous Docker pulls work.
+jobs:
+  validate:
+    name: Validate ${{ matrix.platform }} image
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Build native validation image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: ./sandbox
+          file: ./sandbox/kali.Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          cache-from: type=gha,scope=ravage-kali-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=ravage-kali-${{ matrix.arch }},ignore-error=true
+
+  publish-platform:
+    name: Publish ${{ matrix.platform }} digest
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write # Push the architecture-specific image digest to GHCR.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate OCI labels
+        id: metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ${{ env.IMAGE }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Build and push native image by digest
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: ./sandbox
+          file: ./sandbox/kali.Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=ravage-kali-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=ravage-kali-${{ matrix.arch }},ignore-error=true
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-manifest:
+    name: Publish, sign, and attest multi-architecture image
+    if: github.event_name != 'pull_request'
+    needs:
+      - publish-platform
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write # Publish the final manifest and registry attestation.
+      id-token: write # Mint short-lived certificates for signing and attesting.
+      attestations: write # Persist GitHub's provenance attestation.
+      artifact-metadata: write # Enable actions/attest's OCI metadata integration.
+    steps:
+      - name: Download platform digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate manifest tags
+        id: metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,prefix=sha-,format=long
+            type=raw,value=latest,enable=${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'release' && !github.event.release.prerelease) }}
+            type=semver,pattern={{version}},value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' && !github.event.release.prerelease }}
+
+      - name: Create multi-architecture manifest
+        id: manifest
+        env:
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.metadata.outputs.json }}
+        run: |
+          mapfile -t tags < <(jq -r '.tags[]' <<<"${DOCKER_METADATA_OUTPUT_JSON}")
+          if [[ "${#tags[@]}" -eq 0 ]]; then
+            echo "No image tags were generated" >&2
+            exit 1
+          fi
+
+          mapfile -t digest_files < <(find /tmp/digests -maxdepth 1 -type f -print | sort)
+          if [[ "${#digest_files[@]}" -ne 2 ]]; then
+            echo "Expected exactly two platform digests, found ${#digest_files[@]}" >&2
+            exit 1
+          fi
+
+          tag_args=()
+          for tag in "${tags[@]}"; do
+            tag_args+=(--tag "$tag")
+          done
+
+          digest_refs=()
+          for digest_file in "${digest_files[@]}"; do
+            digest_refs+=("${IMAGE}@sha256:${digest_file##*/}")
+          done
+
+          docker buildx imagetools create "${tag_args[@]}" "${digest_refs[@]}"
+
+          manifest_json="$(
+            docker buildx imagetools inspect "${tags[0]}" --format '{{json .Manifest}}'
+          )"
+          digest="$(jq -r '.digest // empty' <<<"$manifest_json")"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Could not resolve final manifest digest: $digest" >&2
+            exit 1
+          fi
+          echo "digest=$digest" >>"${GITHUB_OUTPUT}"
+          echo "reference=${IMAGE}@${digest}" >>"${GITHUB_OUTPUT}"
+
+      - name: Validate manifest platforms
+        env:
+          REFERENCE: ${{ steps.manifest.outputs.reference }}
+        run: |
+          manifest="$(docker buildx imagetools inspect "$REFERENCE" --raw)"
+          jq -e '
+            [.manifests[]?.platform
+              | select(.os == "linux")
+              | "\(.os)/\(.architecture)"] as $platforms
+            | ($platforms | index("linux/amd64") != null)
+              and ($platforms | index("linux/arm64") != null)
+          ' <<<"$manifest" >/dev/null
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign final manifest
+        env:
+          REFERENCE: ${{ steps.manifest.outputs.reference }}
+        run: cosign sign --yes "$REFERENCE"
+
+      - name: Verify keyless signature
+        env:
+          REFERENCE: ${{ steps.manifest.outputs.reference }}
+        run: |
+          cosign verify \
+            --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$REFERENCE"
+
+      - name: Attest final manifest provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false

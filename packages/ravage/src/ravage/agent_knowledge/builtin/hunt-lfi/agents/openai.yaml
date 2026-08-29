@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hunt File Read Boundaries"
+  short_description: "Test file inclusion and traversal safely"
+  default_prompt: "Use $hunt-lfi to test an authorized file-resolution surface with canonicalized paired controls."

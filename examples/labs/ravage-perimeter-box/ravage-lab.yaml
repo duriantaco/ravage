@@ -1,0 +1,62 @@
+id: ravage-perimeter-box
+name: Vertex Perimeter Recon Box
+difficulty: hard
+category: local-web-box
+warning: Deliberately vulnerable training target. Do not deploy to any public network.
+compose_file: docker-compose.yml
+default_url: http://127.0.0.1:8094
+brief: brief.yaml
+healthcheck: http://127.0.0.1:8094/health
+flags:
+  - id: backup
+    name: exposed edge backup
+    env: PERIMETER_FLAG_BACKUP
+    default: flag{perimeter_backup_disclosure}
+    expected_location: /backup/gateway.conf
+  - id: debug
+    name: hidden debug trace
+    env: PERIMETER_FLAG_DEBUG
+    default: flag{perimeter_debug_trace}
+    expected_location: /debug/trace
+  - id: ops_admin
+    name: discovered ops console default credentials
+    env: PERIMETER_FLAG_ADMIN
+    default: flag{perimeter_ops_admin_panel}
+    expected_location: http://127.0.0.1:8095/console
+  - id: audit_sqli
+    name: ops audit union SQL injection
+    env: PERIMETER_FLAG_AUDIT
+    default: flag{perimeter_audit_union_sqli}
+    expected_location: http://127.0.0.1:8095/api/audit
+  - id: export_traversal
+    name: ops export path traversal
+    env: PERIMETER_FLAG_TRAVERSAL
+    default: flag{perimeter_export_path_traversal}
+    expected_location: http://127.0.0.1:8095/exports
+vulnerabilities:
+  - id: edge_backup
+    title: Hidden gateway backup disclosure
+    class: information_disclosure
+    summary: Content discovery exposes a gateway backup file containing a flag and the secondary ops origin.
+  - id: edge_debug_trace
+    title: Hidden debug trace disclosure
+    class: information_disclosure
+    summary: Content discovery exposes a debug trace endpoint with environment data and a flag.
+  - id: ops_default_credentials
+    title: Ops console accepts default admin credentials
+    class: default_credentials
+    summary: The secondary ops service accepts admin/admin and reveals the console flag.
+  - id: ops_audit_sqli
+    title: Ops audit search SQL injection
+    class: sql_injection
+    summary: The audit search endpoint interpolates q into SQL and can disclose the secrets table.
+  - id: ops_export_traversal
+    title: Ops export path traversal
+    class: path_traversal
+    summary: The authenticated export endpoint reads traversal paths outside the reports directory.
+attack_chain:
+  - Use port scanning to identify the secondary ops service on localhost port 8095.
+  - Use content discovery against the edge service to find /backup and /debug.
+  - Read the gateway backup and debug trace flags, then pivot to the explicitly scoped ops origin.
+  - Login to the ops console with default credentials from operator notes or default-credential probing.
+  - Exploit audit search SQL injection and authenticated export path traversal to capture the remaining flags.

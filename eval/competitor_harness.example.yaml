@@ -1,0 +1,70 @@
+# Example competitor harness config. The commands below are adapter smoke tests,
+# not benchmark scores. Replace each command with the real agent launcher.
+min_free_gib: 20
+
+boxes:
+  - name: ravage-acme-box
+    commit: replace-with-lab-commit
+    target_url: http://ravage-acme-box:8080
+    expected_flags: []
+
+agents:
+  - name: ravage
+    provider: configured-by-command
+    model: configured-by-command
+    command:
+      - python3
+      - -c
+      - |
+        import json
+        import os
+        from pathlib import Path
+
+        result = {
+            "cost_usd": 0.0,
+            "raw_flags": [],
+            "findings": []
+        }
+        path = Path(os.environ["RAVAGE_COMPETITOR_RESULT_PATH"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(result), encoding="utf-8")
+
+  - name: metatron
+    provider: configured-by-command
+    model: configured-by-command
+    command:
+      - python3
+      - -c
+      - |
+        import json
+        import os
+        from pathlib import Path
+
+        result = {
+            "cost_usd": 0.0,
+            "raw_flags": [],
+            "findings": []
+        }
+        path = Path(os.environ["RAVAGE_COMPETITOR_RESULT_PATH"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(result), encoding="utf-8")
+
+  - name: decepticon
+    provider: configured-by-command
+    model: configured-by-command
+    command:
+      - python3
+      - -c
+      - |
+        import json
+        import os
+        from pathlib import Path
+
+        result = {
+            "cost_usd": 0.0,
+            "raw_flags": [],
+            "findings": []
+        }
+        path = Path(os.environ["RAVAGE_COMPETITOR_RESULT_PATH"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(result), encoding="utf-8")

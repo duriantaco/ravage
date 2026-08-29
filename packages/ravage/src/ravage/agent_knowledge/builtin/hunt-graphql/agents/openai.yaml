@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hunt GraphQL Boundaries"
+  short_description: "Test GraphQL schema and object authorization"
+  default_prompt: "Use $hunt-graphql to investigate an authorized GraphQL surface using typed discovery and identity-differential evidence."

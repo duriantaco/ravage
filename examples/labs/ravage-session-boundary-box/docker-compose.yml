@@ -1,0 +1,18 @@
+services:
+  web:
+    build:
+      context: ./web
+    environment:
+      BOUNDARY_FLAG_CSRF: flag{boundary_csrf_omission}
+      BOUNDARY_FLAG_CORS: flag{boundary_cors_profile}
+      BOUNDARY_FLAG_STORAGE: flag{boundary_storage_secret}
+      BOUNDARY_PORT: "8000"
+    ports:
+      - "127.0.0.1:8096:8000"
+    labels:
+      ravage.warning: "Deliberately vulnerable local training target. Do not deploy."
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20

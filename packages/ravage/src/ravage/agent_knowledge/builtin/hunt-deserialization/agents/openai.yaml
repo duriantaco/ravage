@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hunt Unsafe Deserialization"
+  short_description: "Test serialized-data trust boundaries safely"
+  default_prompt: "Use $hunt-deserialization to test an authorized serialized-data surface with format-aware controls."

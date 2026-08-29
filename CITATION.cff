@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: >-
+  If Ravage or its published benchmark evidence contributes to your work,
+  please cite the repository and the exact commit or evidence release used.
+title: Ravage
+type: software
+authors:
+  - name: Ravage contributors
+abstract: >-
+  Evidence-first research workspace for autonomous web application security
+  evaluation on controlled, authorized targets.
+repository-code: https://github.com/duriantaco/ravage
+url: https://duriantaco.github.io/ravage/
+license: Apache-2.0
+version: 0.5.0
+keywords:
+  - web security
+  - security evaluation
+  - autonomous agents
+  - penetration testing
+  - benchmarks

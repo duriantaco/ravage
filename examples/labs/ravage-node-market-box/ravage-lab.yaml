@@ -1,0 +1,67 @@
+id: ravage-node-market-box
+name: Borough Market Operations
+difficulty: medium
+category: local-web-box
+warning: Deliberately vulnerable training target. Do not deploy to any public network.
+compose_file: docker-compose.yml
+default_url: http://127.0.0.1:8092
+brief: brief.yaml
+healthcheck: http://127.0.0.1:8092/health
+flags:
+  - id: order_bola
+    name: order object authorization bypass
+    env: MARKET_FLAG_IDOR
+    default: flag{market_order_bola}
+    expected_location: /api/orders?id=8102
+  - id: inventory_sqli
+    name: inventory search union SQL injection
+    env: MARKET_FLAG_SQLI
+    default: flag{market_inventory_union_sqli}
+    expected_location: /api/products?q=
+  - id: jwt_admin
+    name: JWT admin confusion
+    env: MARKET_FLAG_JWT
+    default: flag{market_jwt_admin_confusion}
+    expected_location: /admin
+  - id: prototype_config
+    name: prototype-pollution-style beta config abuse
+    env: MARKET_FLAG_PROTO
+    default: flag{market_proto_config_abuse}
+    expected_location: /beta/deals
+  - id: internal_admin_pivot
+    name: internal metadata pivot through admin fetch
+    env: MARKET_FLAG_ROOT
+    default: flag{market_internal_admin_pivot}
+    expected_location: /admin/fetch
+vulnerabilities:
+  - id: seeded_buyer_account
+    title: Assisted buyer account
+    class: default_credentials
+    summary: Operator notes provide an assisted-mode account; the live UI does not reveal credentials.
+  - id: order_bola
+    title: Order API missing object authorization
+    class: idor
+    summary: Authenticated users can request another account's order by changing the id parameter.
+  - id: inventory_union_sqli
+    title: Catalog search SQL injection
+    class: sql_injection
+    summary: Product search interpolates the q parameter into a SQL query and can disclose a secret row.
+  - id: jwt_admin_confusion
+    title: JWT algorithm confusion and weak secret exposure
+    class: jwt
+    summary: The app accepts unsigned JWTs and also leaks a weak HS256 signing hint in public JavaScript.
+  - id: prototype_config_abuse
+    title: Unsafe recursive merge of preference JSON
+    class: prototype_pollution
+    summary: The preference API merges JSON keys into objects unsafely and can enable beta-admin behavior.
+  - id: admin_ssrf
+    title: Admin URL preview SSRF
+    class: ssrf
+    summary: Forged admin access exposes a URL fetcher that can reach the internal metadata service.
+attack_chain:
+  - Login with the seeded assisted-mode buyer account from operator notes.
+  - Enumerate order ids and confirm the order BOLA flag.
+  - Exploit catalog search SQL injection to retrieve the inventory secret flag.
+  - Read public JavaScript, tamper or forge the JWT, and access the admin panel.
+  - Abuse JSON preference merging to enable beta supplier controls.
+  - Use admin URL preview to query the internal metadata service and follow its flag endpoint.

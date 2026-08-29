@@ -1,0 +1,11 @@
+mode: benchmark
+benchmark:
+  manifest: ../eval/ai_web_manifest.yaml
+  output_dir: ../runs/benchmarks/ai-web-hosted-canary
+  limit: 1
+  max_turns: 4
+  max_model_requests: 4
+  model:
+    profile: hosted-openai
+    tier: low
+allow_paid_models: true

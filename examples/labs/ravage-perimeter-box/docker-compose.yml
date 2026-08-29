@@ -1,0 +1,38 @@
+services:
+  edge:
+    build:
+      context: ./web
+    environment:
+      PERIMETER_ROLE: edge
+      PERIMETER_PORT: "8000"
+      PERIMETER_OPS_URL: http://127.0.0.1:8095
+      PERIMETER_FLAG_BACKUP: flag{perimeter_backup_disclosure}
+      PERIMETER_FLAG_DEBUG: flag{perimeter_debug_trace}
+    ports:
+      - "127.0.0.1:8094:8000"
+    labels:
+      ravage.warning: "Deliberately vulnerable local training target. Do not deploy."
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  ops:
+    build:
+      context: ./web
+    environment:
+      PERIMETER_ROLE: ops
+      PERIMETER_PORT: "8000"
+      PERIMETER_FLAG_ADMIN: flag{perimeter_ops_admin_panel}
+      PERIMETER_FLAG_AUDIT: flag{perimeter_audit_union_sqli}
+      PERIMETER_FLAG_TRAVERSAL: flag{perimeter_export_path_traversal}
+    ports:
+      - "127.0.0.1:8095:8000"
+    labels:
+      ravage.warning: "Deliberately vulnerable local training target. Do not deploy."
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20

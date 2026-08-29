@@ -1,0 +1,4 @@
+interface:
+  display_name: "Analyze SATCOM Artifacts"
+  short_description: "Inspect passive SATCOM artifacts safely"
+  default_prompt: "Use $analyze-satcom to inspect an authorized offline SATCOM artifact and produce evidence-backed observations."

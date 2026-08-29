@@ -1,0 +1,62 @@
+services:
+  kali:
+    build:
+      context: .
+      dockerfile: scope-client.Dockerfile
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      decoy:
+        condition: service_healthy
+      unspecified:
+        condition: service_healthy
+      target:
+        condition: service_healthy
+    networks:
+      - control-net
+      - target-net
+
+  target:
+    build:
+      context: ../../../sandbox
+      dockerfile: target.Dockerfile
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 1s
+      timeout: 2s
+      retries: 20
+    networks:
+      target-net:
+        aliases:
+          - target
+
+  decoy:
+    image: nginx:1.27-alpine
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 1s
+      timeout: 2s
+      retries: 20
+    networks:
+      control-net:
+        aliases:
+          - decoy
+
+  unspecified:
+    image: nginx:1.27-alpine
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 1s
+      timeout: 2s
+      retries: 20
+    networks:
+      control-net:
+        aliases:
+          - unspecified
+
+networks:
+  control-net:
+    driver: bridge
+  target-net:
+    driver: bridge
+    internal: false

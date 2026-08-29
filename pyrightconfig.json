@@ -1,0 +1,20 @@
+{
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": [
+        "packages/ravage/src",
+        "packages/schemas/src"
+      ]
+    }
+  ],
+  "include": [
+    "packages/ravage/src",
+    "packages/ravage/tests",
+    "packages/schemas/src",
+    "packages/schemas/tests",
+    "tests"
+  ],
+  "venv": ".venv",
+  "venvPath": "."
+}

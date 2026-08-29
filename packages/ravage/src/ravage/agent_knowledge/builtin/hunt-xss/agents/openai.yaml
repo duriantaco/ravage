@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hunt Cross-Site Scripting"
+  short_description: "Validate browser-executable injection safely"
+  default_prompt: "Use $hunt-xss to validate an authorized injection surface with context-aware browser evidence."

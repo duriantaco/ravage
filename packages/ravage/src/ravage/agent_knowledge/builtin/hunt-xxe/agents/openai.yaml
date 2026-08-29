@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hunt XML External Entities"
+  short_description: "Test XML parser boundaries with safe controls"
+  default_prompt: "Use $hunt-xxe to test an authorized XML parser using bounded entity and parser-differential evidence."

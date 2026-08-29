@@ -1,0 +1,70 @@
+groups:
+  - title: Get Started
+    items:
+      - title: Overview
+        url: /
+        description: Start here and choose the right command.
+      - title: Setup
+        url: /setup.html
+        description: Install from source, configure tools, models, and briefs.
+      - title: How To Use
+        url: /how-to-use.html
+        description: Install, run local labs, scan, attack, and inspect output.
+      - title: AI Web Operator Guide
+        url: /ai-web-operator-guide.html
+        description: Run model-driven attacks and deterministic DAST safely.
+      - title: Model Providers
+        url: /model-providers.html
+        description: Configure local and hosted OpenAI-compatible routes.
+  - title: Evaluate
+    items:
+      - title: Benchmarking
+        url: /benchmarking.html
+        description: Run XBEN cases, preflight, score, and inspect evidence.
+      - title: XBEN Comparison Runbook
+        url: /xben-comparison-runbook.html
+        description: Preserve the description-only contract and validate reports.
+      - title: Competitor Harness
+        url: /competitor-harness.html
+        description: Compare external agents with isolation and scoring rules.
+      - title: Referee Launch Plan
+        url: /benchmark-referee-launch.html
+        description: Historical-result boundaries and gates for a future cross-agent table.
+  - title: Operate
+    items:
+      - title: Authentication
+        url: /authentication.html
+        description: Configure test identities and validate managed sessions.
+      - title: Memory Design
+        url: /memory.html
+        description: Local memory model and planned review workflow.
+      - title: Loop Harness
+        url: /loop-harness.html
+        description: Attach state, verification, and trace improvement loops.
+      - title: Knowledge Skills
+        url: /skills.html
+        description: Use and evaluate opt-in advisory workflow cards.
+      - title: Passive SATCOM Analysis
+        url: /satcom.html
+        description: Inspect offline TLE and CCSDS artifacts without transmitting.
+  - title: Understand
+    items:
+      - title: Architecture
+        url: /architecture.html
+        description: System model, packages, loop, runtime, evidence, safety.
+      - title: Open Core And Pro Reports
+        url: /open-core.html
+        description: Apache-2.0 core and proprietary report extension hook.
+      - title: Technical Guide
+        url: /technical-guide.html
+        description: Code map, contracts, workflow rules, and test strategy.
+      - title: Differentiation Roadmap
+        url: /differentiation-roadmap.html
+        description: Current differentiators, limits, and planned gaps.
+external:
+  - title: GitHub
+    url: https://github.com/duriantaco/ravage
+  - title: README
+    url: https://github.com/duriantaco/ravage#readme
+  - title: Disclaimer
+    url: https://github.com/duriantaco/ravage/blob/main/DISCLAIMER.md
