@@ -1,0 +1,69 @@
+[project]
+name = "ravage"
+version = "0.5.0"
+description = "Autonomous web security research agent for controlled authorized targets"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "ravage-schemas==0.5.0",
+    "pyyaml>=6.0",
+    "cryptography>=42.0",
+    "rich>=14.1",
+]
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Ravage contributors" },
+]
+urls = { Repository = "https://github.com/duriantaco/ravage", Issues = "https://github.com/duriantaco/ravage/issues" }
+keywords = [
+    "security",
+    "pentesting",
+    "web-security",
+    "authorized-testing",
+    "research",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Security",
+]
+
+[project.optional-dependencies]
+# Headless-browser verification for the dom_execution probe. Optional: the probe
+# degrades gracefully (reports "backend unavailable") when this is not installed.
+# After installing, run `playwright install chromium` to fetch the browser.
+browser = ["playwright>=1.48"]
+
+[project.scripts]
+ravage = "ravage.__main__:main"
+
+[tool.uv.sources]
+ravage-schemas = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ravage"]
+force-include = { "src/orchestrator.py" = "orchestrator.py" }
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/ravage",
+    "src/orchestrator.py",
+    "LICENSE",
+    "README.md",
+    "pyproject.toml",
+]
+exclude = [
+    "tests",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,0 +1,30 @@
+services:
+  kali:
+    build:
+      context: .
+      dockerfile: kali.Dockerfile
+    cap_add:
+      - NET_ADMIN
+    command: ["sleep", "infinity"]
+    depends_on:
+      - target
+    networks:
+      - control-net
+      - target-net
+
+  target:
+    build:
+      context: .
+      dockerfile: target.Dockerfile
+    networks:
+      target-net:
+        aliases:
+          - target
+
+networks:
+  control-net:
+    driver: bridge
+  target-net:
+    driver: bridge
+    internal: false
+

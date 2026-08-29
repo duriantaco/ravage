@@ -1,0 +1,70 @@
+name: Benchmark reproduction or dispute
+description: Submit a complete reproduction, adapter result, scoring question, or evidence-backed dispute.
+title: "benchmark: "
+body:
+  - type: dropdown
+    id: classification
+    attributes:
+      label: Submission type
+      options:
+        - Complete release-quality reproduction
+        - Partial reproduction
+        - Smoke or development run
+        - Scoring or evidence dispute
+    validations:
+      required: true
+  - type: input
+    id: commits
+    attributes:
+      label: Ravage and benchmark commits
+      placeholder: "Ravage abc1234; benchmark def5678"
+    validations:
+      required: true
+  - type: textarea
+    id: contract
+    attributes:
+      label: Target set and input contract
+      description: Include selections, exclusions, mode, visible description/tags/source, seed, retries, resumes, and deviations.
+    validations:
+      required: true
+  - type: textarea
+    id: model
+    attributes:
+      label: Model and budget
+      description: Provider, exact model snapshot, route tier, turn/request/time limits, pricing source and date. Never include API keys.
+    validations:
+      required: true
+  - type: textarea
+    id: runtime
+    attributes:
+      label: Runtime
+      description: Tool image digest, architecture, Docker/runtime versions, concurrency, and exact sanitized command.
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Complete results and cost
+      description: Include passes, failures, errors, timeouts, false positives, out-of-scope events, and cost-accounting method.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence and hashes
+      description: Link redacted reports, row-level proof, audit verification, and SHA-256 manifests. Explain the disputed row when applicable.
+    validations:
+      required: true
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: Every terminal outcome is retained; no failed row was silently replaced.
+          required: true
+        - label: Retries, resumes, code changes, and protocol deviations are disclosed.
+          required: true
+        - label: Public artifacts were reviewed for secrets, credentials, sessions, and private target data.
+          required: true
+        - label: I understand that public XBEN results are regression evidence, not unseen-task performance.
+          required: true

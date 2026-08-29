@@ -1,0 +1,10 @@
+mode: ai-web
+brief: remote_authorized_brief.yaml
+target_url: https://staging.example.test
+allow_remote_target: true
+model:
+  profile: hosted-openai
+  tier: low
+max_turns: 12
+db_path: ../runs/remote-ai-web.db
+workspace_dir: ../runs/remote-ai-web.workspace

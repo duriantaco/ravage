@@ -1,0 +1,41 @@
+name: Feature request
+description: Propose a concrete improvement to Ravage or its evaluation workflow.
+title: "feat: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the user or research problem, not only the proposed implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: What should become possible or measurably better?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: Include alternatives considered when useful.
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety, scope, and evidence implications
+      description: Explain target authorization, execution boundaries, proof requirements, data handling, and failure modes.
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility impact
+      description: Note CLI, schema, report, adapter, benchmark, or packaging changes.
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I would be willing to help implement or test this change.

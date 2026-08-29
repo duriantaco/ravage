@@ -1,0 +1,17 @@
+# Frozen model route for the referee canary and rerun.
+# Pricing snapshot: 2026-07-12, standard API text-token rates from
+# https://developers.openai.com/api/docs/models/gpt-5.4
+profiles:
+  referee-openai-gpt-5.4:
+    default_tier: high
+    routes:
+      high:
+        - provider: openai
+          model: gpt-5.4-2026-03-05
+          api_key_env: OPENAI_API_KEY
+          max_output_tokens: 4096
+          output_token_limit_parameter: max_completion_tokens
+          input_cost_per_1m_tokens: 2.5
+          cached_input_cost_per_1m_tokens: 0.25
+          output_cost_per_1m_tokens: 15.0
+          notes: Standard API model-token pricing snapshot captured 2026-07-12.

@@ -1,0 +1,57 @@
+id: ravage-acme-box
+name: Acme Support Portal
+difficulty: medium
+category: local-web-box
+warning: Deliberately vulnerable training target. Do not deploy to any public network.
+compose_file: docker-compose.yml
+default_url: http://127.0.0.1:8088
+brief: brief.yaml
+healthcheck: http://127.0.0.1:8088/health
+flags:
+  - id: low
+    name: invoice idor
+    env: RAVAGE_FLAG_LOW
+    default: flag{acme_idor_invoice_enum}
+    expected_location: /api/invoices?id=9002
+  - id: user
+    name: catalog sql injection
+    env: RAVAGE_FLAG_USER
+    default: flag{acme_catalog_union_sqli}
+    expected_location: /catalog
+  - id: admin
+    name: jwt admin access
+    env: RAVAGE_FLAG_ADMIN
+    default: flag{acme_jwt_admin_panel}
+    expected_location: /admin
+  - id: root
+    name: internal ssrf
+    env: RAVAGE_FLAG_ROOT
+    default: flag{acme_ssrf_internal_metadata}
+    expected_location: /admin/preview
+vulnerabilities:
+  - id: default_user
+    title: Seeded low-privilege account
+    class: default_credentials
+    summary: Operator notes provide an assisted-mode account; the live UI does not reveal it.
+  - id: invoice_idor
+    title: Invoice API missing ownership checks
+    class: idor
+    summary: Authenticated users can request invoice ids that belong to other accounts.
+  - id: catalog_sqli
+    title: Catalog search SQL injection
+    class: sql_injection
+    summary: The catalog search query interpolates user input into SQL.
+  - id: jwt_weak_secret
+    title: Weak JWT signing secret leaked in frontend config
+    class: jwt
+    summary: A staging hint reveals the HS256 secret used to authorize admin sessions.
+  - id: admin_ssrf
+    title: Admin URL preview SSRF
+    class: ssrf
+    summary: The admin preview tool fetches arbitrary internal URLs.
+attack_chain:
+  - Login with the seeded assisted-mode account from operator notes.
+  - Enumerate invoices and confirm the IDOR flag.
+  - Abuse catalog SQL injection to retrieve the catalog flag.
+  - Use the leaked JWT hint to forge an admin role token and view the admin flag.
+  - Use admin URL preview to request the internal metadata service and capture the root flag.

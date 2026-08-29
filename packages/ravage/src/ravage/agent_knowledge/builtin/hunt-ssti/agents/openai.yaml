@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hunt Server-Side Template Injection"
+  short_description: "Test template evaluation boundaries safely"
+  default_prompt: "Use $hunt-ssti to test an authorized template surface with engine-aware differential evidence."

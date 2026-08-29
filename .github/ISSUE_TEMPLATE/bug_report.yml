@@ -1,0 +1,78 @@
+name: Bug report
+description: Report a reproducible defect using a local or synthetic target.
+title: "bug: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include provider keys, real credentials, customer data, cookies, or unredacted target output. Report security-boundary failures through private vulnerability reporting instead.
+  - type: input
+    id: version
+    attributes:
+      label: Ravage version or commit
+      description: Paste `ravage --version` and the exact Git commit when using a checkout.
+      placeholder: "ravage 0.5.0; commit abc1234"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, architecture, Python version, Docker version if relevant, and installation method.
+      placeholder: "macOS arm64; Python 3.12.13; Docker Desktop; scripts/bootstrap.sh"
+    validations:
+      required: true
+  - type: dropdown
+    id: command
+    attributes:
+      label: Affected command or area
+      options:
+        - attack
+        - scan
+        - lab
+        - observe/dashboard
+        - report/audit
+        - XBEN/benchmark harness
+        - competitor harness
+        - packaging/setup
+        - documentation
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Use a repository lab or synthetic fixture. Include the sanitized command and smallest reliable sequence.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include redacted errors or logs only.
+    validations:
+      required: true
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Tool runtime, model profile without keys, run mode, or other relevant details.
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: I reproduced this only on a repository lab, synthetic fixture, or explicitly authorized target.
+          required: true
+        - label: I removed secrets, credentials, cookies, flags, and private target data.
+          required: true
+        - label: This is not a confidential security vulnerability.
+          required: true

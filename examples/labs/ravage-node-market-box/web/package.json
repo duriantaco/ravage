@@ -1,0 +1,14 @@
+{
+  "name": "ravage-node-market-box",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Deliberately vulnerable local Ravage market lab. Do not deploy.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "sql.js": "^1.10.3"
+  }
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hunt Authorization Boundaries"
+  short_description: "Test object and tenant authorization safely"
+  default_prompt: "Use $hunt-idor to investigate an authorized object-level access-control surface with identity-differential evidence."

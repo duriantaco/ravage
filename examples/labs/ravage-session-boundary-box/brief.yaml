@@ -1,0 +1,35 @@
+engagement_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+scope:
+  in_scope:
+    - "http://127.0.0.1:8096"
+  out_of_scope: []
+roe:
+  max_rps: 5
+  no_destructive_actions: true
+  data_handling: "placeholders_only"
+objectives:
+  - "capture_flag"
+budget:
+  max_cost_usd: 5.0
+  max_runtime_min: 25
+context:
+  description: >-
+    Authorized assessment of a local account portal focused on session and
+    browser trust boundaries. Use non-destructive requests and retain only
+    findings confirmed by live evidence.
+  lab: ravage-session-boundary-box
+  name: Session Boundary Lab
+  difficulty: medium
+  warning: Deliberately vulnerable local training target. Do not deploy it.
+  flag_format: flag{...}
+  win_condition: Capture as many lab flags as possible from live target evidence.
+  required_capabilities:
+    - crawl
+  optional_capabilities:
+    - web_fingerprint
+  tool_recon: false
+  rules:
+    - Stay on the explicitly scoped localhost origin only.
+    - Capture flags only after a tool observation reveals them.
+    - Do not use source code as proof during a black-box run.
+    - Use non-destructive probes only.

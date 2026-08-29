@@ -1,0 +1,44 @@
+engagement_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+scope:
+  in_scope:
+    - "http://127.0.0.1:8094"
+    - "http://127.0.0.1:8095"
+  out_of_scope: []
+roe:
+  max_rps: 5
+  no_destructive_actions: true
+  data_handling: "placeholders_only"
+objectives:
+  - "capture_flag"
+budget:
+  max_cost_usd: 8.0
+  max_runtime_min: 45
+context:
+  description: >-
+    Authorized description-only black-box assessment of a local multi-service
+    application perimeter. Discover the scoped services, test exposed trust
+    boundaries, and retain only live non-destructive evidence.
+  lab: ravage-perimeter-box
+  name: Vertex Perimeter Recon Box
+  difficulty: hard
+  warning: Deliberately vulnerable local training target. Do not deploy it.
+  flag_format: flag{...}
+  win_condition: Capture as many lab flags as possible from live target evidence.
+  required_capabilities:
+    - port_scan
+    - dir_bruteforce
+  optional_capabilities:
+    - web_fingerprint
+    - crawl
+  tool_recon: true
+  tool_recon_tools:
+    - nmap_scan
+    - whatweb_scan
+    - katana_crawl
+    - ffuf_dir
+  tool_recon_ports: "8094,8095"
+  rules:
+    - Stay on the explicitly scoped localhost origins only.
+    - Capture flags only after a tool observation reveals them.
+    - Do not use source code as proof during a black-box run.
+    - Use non-destructive probes only.

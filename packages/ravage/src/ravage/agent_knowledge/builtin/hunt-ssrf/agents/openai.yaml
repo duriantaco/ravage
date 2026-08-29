@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hunt Server-Side Request Forgery"
+  short_description: "Test server-side URL fetch boundaries safely"
+  default_prompt: "Use $hunt-ssrf to test an authorized server-side URL-fetch surface with bounded differential evidence."

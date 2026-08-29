@@ -1,0 +1,42 @@
+services:
+  proxy:
+    image: nginx:1.27-alpine
+    depends_on:
+      web:
+        condition: service_healthy
+      internal:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8092:80"
+    volumes:
+      - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+
+  web:
+    build:
+      context: ./web
+    environment:
+      MARKET_FLAG_IDOR: flag{market_order_bola}
+      MARKET_FLAG_SQLI: flag{market_inventory_union_sqli}
+      MARKET_FLAG_JWT: flag{market_jwt_admin_confusion}
+      MARKET_FLAG_PROTO: flag{market_proto_config_abuse}
+      MARKET_JWT_SECRET: market-dev-secret
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  internal:
+    build:
+      context: ./internal
+    networks:
+      default:
+        aliases:
+          - market-internal
+    environment:
+      MARKET_FLAG_ROOT: flag{market_internal_admin_pivot}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9200/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20

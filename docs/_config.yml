@@ -1,0 +1,24 @@
+title: Ravage Docs
+description: Operator documentation for the Ravage security evaluation and benchmark harness.
+theme: jekyll-theme-minimal
+show_downloads: false
+url: "https://duriantaco.github.io"
+baseurl: "/ravage"
+lang: en-US
+markdown: kramdown
+
+plugins:
+  - jekyll-relative-links
+
+relative_links:
+  enabled: true
+  collections: true
+
+exclude:
+  - archive
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default

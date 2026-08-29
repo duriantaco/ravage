@@ -1,0 +1,26 @@
+line-length = 100
+target-version = "py312"
+
+[lint]
+select = ["ALL"]
+ignore = [
+    "COM812",
+    "CPY001",
+    "D100",
+    "D101",
+    "D102",
+    "D103",
+    "D104",
+    "D105",
+    "D106",
+    "D107",
+    "D203",
+    "D212",
+    "INP001",
+    "S101",
+]
+
+[format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"

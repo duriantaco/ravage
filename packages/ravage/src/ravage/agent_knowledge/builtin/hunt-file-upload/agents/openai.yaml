@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hunt File Upload Boundaries"
+  short_description: "Test upload storage and serving safely"
+  default_prompt: "Use $hunt-file-upload to test an authorized upload workflow with inert files and retrieval controls."
