@@ -1544,7 +1544,8 @@ def test_full_probe_payload_feeds_identity_aware_graph_before_clipping(
     assert operation.method == "GET"
     assert operation.route_shape == "/api/users/{int}"
     assert operation.provenance == ("probe",)
-    assert {(item.name, item.location) for item in operation.parameters} == {("expand", "query")}
+    assert operation.actionable is False
+    assert operation.parameters == ()
     [observation] = list((state.surface_graph.observations or {}).values())
     assert observation.identity_alias == "alice"
     assert observation.source_kind == "probe"
@@ -1556,7 +1557,7 @@ def test_full_probe_payload_feeds_identity_aware_graph_before_clipping(
 
     projected = json.dumps(state.surface, sort_keys=True)
     serialized_graph = json.dumps(state.surface_graph.to_json(), sort_keys=True)
-    assert "http://127.0.0.1:8765/api/users/{int}" in projected
+    assert "http://127.0.0.1:8765/api/users/{int}" not in projected
     assert observed_value not in projected
     assert observed_value not in serialized_graph
 

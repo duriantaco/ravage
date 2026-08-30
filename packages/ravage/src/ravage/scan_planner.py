@@ -566,6 +566,8 @@ def _surface_facts(state: AgentState) -> frozenset[str]:
     facts: set[str] = set()
     operations = state.surface_graph.operations or {}
     for operation in sorted(operations.values(), key=lambda item: item.operation_id):
+        if not operation.actionable:
+            continue
         _facts_from_operation(facts, operation)
     _facts_from_legacy_surface(facts, state.surface)
     _facts_from_signals(facts, state.signals)

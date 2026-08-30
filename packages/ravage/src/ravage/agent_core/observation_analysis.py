@@ -37,6 +37,20 @@ def extract_signals(text: str) -> dict[str, list[str]]:
     return signals
 
 
+def extract_probe_signals(text: str) -> dict[str, list[str]]:
+    """
+    Extract only typed finding signals from executor-owned probe JSON.
+
+    Probe request URLs and response snippets are evidence of attempts, not new
+    discovery.  Mining the full serialized payload lets attack mutations feed
+    later probes, so this boundary deliberately ignores generic text patterns.
+    """
+    signals: dict[str, list[str]] = {}
+    if _structured_result(text):
+        _collect_structured_signals(signals, text)
+    return signals
+
+
 def observation_facts(text: str) -> list[str]:
     facts: list[str] = []
     lower = text.lower()

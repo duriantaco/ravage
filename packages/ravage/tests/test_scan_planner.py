@@ -95,6 +95,43 @@ def test_generic_parameter_enables_only_breadth_input_tests() -> None:
     assert plan.decision_for("dom_execution").status is ScanPlanStatus.NOT_APPLICABLE
 
 
+def test_probe_mutations_cannot_seed_planner_facts_or_taint_later_discovery() -> None:
+    state = _state()
+    attempted = state.surface_graph.add(
+        url=f"{TARGET}/fabricated-login?command=attack",
+        method="POST",
+        parameters=(SurfaceParameter.create(name="command", location="query"),),
+        hints=("command",),
+        source_kind="probe",
+        access_level="response",
+        response_status=200,
+    )
+
+    attack_plan = build_adaptive_scan_plan(state)
+
+    assert attempted.operation_id in state.surface_graph.operations  # type: ignore[operator]
+    assert attempted.actionable is False
+    assert attempted.parameters == ()
+    assert "parameter" not in attack_plan.evidence_facts
+    assert "command_input" not in attack_plan.evidence_facts
+    assert "command_boundary" not in attack_plan.probes
+
+    discovered = state.surface_graph.add(
+        url=f"{TARGET}/fabricated-login?q=observed",
+        method="POST",
+        parameters=(SurfaceParameter.create(name="q", location="query"),),
+        source_kind="native_recon",
+    )
+    trusted_plan = build_adaptive_scan_plan(state)
+
+    assert discovered.operation_id == attempted.operation_id
+    assert discovered.actionable is True
+    assert {item.name for item in discovered.parameters} == {"q"}
+    assert "parameter" in trusted_plan.evidence_facts
+    assert "command_input" not in trusted_plan.evidence_facts
+    assert "command_boundary" not in trusted_plan.probes
+
+
 def test_typed_graph_facts_route_relevant_breadth_probes() -> None:
     state = _state()
     graph = state.surface_graph

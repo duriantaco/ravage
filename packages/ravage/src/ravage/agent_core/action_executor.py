@@ -14,7 +14,11 @@ from uuid import UUID, uuid5
 from ravage.agent_core.agent_state import AgentState, append_unique, merge_signals
 from ravage.agent_core.agent_strategy import observation_digest
 from ravage.agent_core.live_events import http_step_payload, mask_headers
-from ravage.agent_core.observation_analysis import classify_action_result, extract_signals
+from ravage.agent_core.observation_analysis import (
+    classify_action_result,
+    extract_probe_signals,
+    extract_signals,
+)
 from ravage.agent_core.surface_graph_ingest import ingest_probe_result, project_surface_graph
 from ravage.auth.sessions import AuthenticationError
 from ravage.finding_evidence import confirmed_finding_evidence_failures
@@ -2375,7 +2379,10 @@ def record_probe_result(  # noqa: PLR0913
         source_kind=kind,
         recognized_proofs=recognized_proofs,
     )
-    merge_signals(state, extract_signals(text))
+    signals = (
+        extract_probe_signals(text) if kind == "tool_run_probe" else extract_signals(text)
+    )
+    merge_signals(state, signals)
     known_proof_replayed = _only_known_auto_capture_proofs(
         text,
         enabled=proof_recognition_enabled,

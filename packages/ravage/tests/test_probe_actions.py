@@ -18,9 +18,12 @@ from ravage.agent_core.surface_graph_ingest import (
     SURFACE_OBSERVATION_INPUT_SCHEMA,
 )
 from ravage.probe_suite import available_probes
+from ravage.probe_suite_parts.sqli.sqli_targets import _sqli_targets
+from ravage.probe_suite_parts.support import _form_targets
 from ravage.run_data.audit import AuditStore
 from ravage.run_data.workspace import AgentWorkspace
 from ravage.runtime import ToolResult, ToolRuntime
+from ravage.scan_planner import build_adaptive_scan_plan
 from ravage.web_core.http_probe import ProbeResponse
 from ravage.web_core.poc_validator import validate_http_poc
 
@@ -130,6 +133,107 @@ def test_executor_owned_probe_batch_feeds_canonical_surface_graph(
     [observation] = (state.surface_graph.observations or {}).values()
     assert observation.identity_alias == "anonymous"
     assert "not-persisted" not in json.dumps(state.surface_graph.to_json())
+
+
+def test_browser_attack_traffic_cannot_fabricate_future_forms_or_targets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_url = "http://127.0.0.1/"
+    attack_url = f"{target_url}fabricated-login?username=attack&password=attack"
+    fabricated_form = (
+        '<form action="/fabricated-login" method="post">'
+        '<input name="username"><input name="password"></form>'
+    )
+    probe_text = json.dumps(
+        {
+            "ok": True,
+            "probe": "browser_boundary",
+            "summary": "attack response contained target-controlled markup",
+            "findings": [
+                {
+                    "type": "clickjacking_frame_policy_missing",
+                    "url": attack_url,
+                    "body_snippet": fabricated_form,
+                }
+            ],
+            "requests": [
+                {
+                    "method": "POST",
+                    "url": attack_url,
+                    "status": 200,
+                    "body_snippet": fabricated_form,
+                    "request_headers": {"X-Ravage-Probe": "attack"},
+                    "probe_kind": "browser_boundary_attack",
+                },
+                {
+                    "method": "GET",
+                    "url": f"{target_url}fabricated-admin?tenant=attack",
+                    "status": 403,
+                    "body_snippet": "access denied",
+                    "probe_kind": "browser_boundary_attack",
+                },
+            ],
+            "errors": [],
+        }
+    )
+
+    def runner(*args: object, **kwargs: object) -> _CompletedProbeRunner:
+        del args, kwargs
+        return _CompletedProbeRunner(
+            json.dumps({"status": "ok", "ok": True, "text": probe_text})
+        )
+
+    _patch_probe_runner(monkeypatch, runner)
+    state = AgentState(
+        surface={"target_url": target_url, "origin": target_url.rstrip("/")},
+        surface_graph=SurfaceGraphState.for_target(target_url),
+    )
+    targets_before = _sqli_targets(state)
+    plan_before = build_adaptive_scan_plan(state).probes
+    audit = AuditStore(tmp_path / "audit.db")
+    try:
+        execute_action(
+            {"action": "run_probe", "probe": "browser_boundary"},
+            target_url=target_url,
+            runtime=_ProofRuntime(),
+            state=state,
+            workspace=AgentWorkspace.open(tmp_path / "workspace"),
+            audit=audit,
+            engagement_id=uuid4(),
+            repeat_count=1,
+            max_observation_chars=2_000,
+            max_transcript_chars=8_000,
+        )
+    finally:
+        audit.close()
+
+    attempts = tuple((state.surface_graph.operations or {}).values())
+    assert {attempt.route_shape for attempt in attempts} == {
+        "/fabricated-admin",
+        "/fabricated-login",
+    }
+    assert all(attempt.provenance == ("probe",) for attempt in attempts)
+    assert all(attempt.actionable is False for attempt in attempts)
+    assert all(attempt.parameters == () for attempt in attempts)
+    assert len(state.surface_graph.observations or {}) == 2
+    prompt_graph = state.surface_graph.to_prompt_json()
+    assert prompt_graph["operations"] == []
+    assert prompt_graph["counts"] == {
+        "operations": 2,
+        "candidate_operations": 0,
+        "identity_observations": 2,
+    }
+    assert state.surface.get("endpoints") == []
+    assert state.surface.get("request_templates") == []
+    assert state.surface.get("parameters") == []
+    assert _form_targets(state, limit=10) == []
+    assert _sqli_targets(state) == targets_before
+    plan_after = build_adaptive_scan_plan(state)
+    assert plan_after.probes == plan_before
+    assert "parameter" not in plan_after.evidence_facts
+    for key in ("forms", "endpoints", "parameters", "request_templates"):
+        assert not state.signals.get(key)
 
 
 def test_validate_http_poc_replays_same_origin_expectations(
