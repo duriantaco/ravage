@@ -12,6 +12,7 @@ ACTION_USE = re.compile(r"^\s*uses:\s*([^\s#]+)", re.MULTILINE)
 MINIMUM_PRODUCTION_RELEASE_GUARDS = 2
 PRODUCTION_PYPI_PUBLISH_JOB_COUNT = 2
 TEST_PYPI_PUBLISH_JOB_COUNT = 2
+RAVAGE_PROJECT_VERSION_MARKER_COUNT = 2
 PYPI_PUBLISH_ACTION = (
     "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
 )
@@ -143,3 +144,24 @@ def test_release_please_updates_public_install_pins() -> None:
     }
 
     assert generic_paths >= PUBLIC_INSTALL_DOCS
+
+
+def test_release_please_uses_one_updater_for_both_ravage_versions() -> None:
+    config = json.loads(
+        (ROOT / "tools/release/release-please-config.json").read_text(encoding="utf-8")
+    )
+    extra_files = config["packages"]["."]["extra-files"]
+    ravage_project_entries = [
+        item
+        for item in extra_files
+        if isinstance(item, dict) and item.get("path") == "packages/ravage/pyproject.toml"
+    ]
+    project_text = (ROOT / "packages/ravage/pyproject.toml").read_text(encoding="utf-8")
+
+    assert ravage_project_entries == [
+        {"type": "generic", "path": "packages/ravage/pyproject.toml"}
+    ]
+    assert (
+        project_text.count("x-release-please-version")
+        == RAVAGE_PROJECT_VERSION_MARKER_COUNT
+    )

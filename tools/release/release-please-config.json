@@ -21,11 +21,6 @@
           "path": "packages/schemas/src/pentest_schemas/_version.py"
         },
         {
-          "type": "toml",
-          "path": "packages/ravage/pyproject.toml",
-          "jsonpath": "$.project.version"
-        },
-        {
           "type": "generic",
           "path": "packages/ravage/src/ravage/_version.py"
         },

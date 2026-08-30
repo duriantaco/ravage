@@ -1,6 +1,6 @@
 [project]
 name = "ravage"
-version = "0.6.0"
+version = "0.6.0" # x-release-please-version
 description = "Autonomous web security research agent for controlled authorized targets"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
