@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import json
 import re
-from typing import Callable, cast
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, cast
 from urllib.parse import urlsplit
 
-from ravage.agent_core.agent_state import AgentState
-from ravage.web_core.http_probe import ProbeResponse, ProbeSession, form_defaults, inject_query_param
+from ravage.deterministic_agents.xss_payloads import (
+    _XSS_PROOF_TOKENS,
+    _dom_exec_payloads,
+)
 from ravage.probe_suite_parts.result import ProbeRunResult
 from ravage.probe_suite_parts.support import (
+    _absolute_same_origin_url,
     _dedupe,
     _form_input_names,
     _form_targets,
@@ -18,12 +22,17 @@ from ravage.probe_suite_parts.support import (
     _parameter_targets,
     _string_items,
 )
-from ravage.web_core.proof_recognizer import recognize_proofs
 from ravage.runtime.browser import BrowserObservation, BrowserStatus
-from ravage.deterministic_agents.xss_payloads import (
-    _XSS_PROOF_TOKENS,
-    _dom_exec_payloads,
+from ravage.web_core.http_probe import (
+    ProbeResponse,
+    ProbeSession,
+    form_defaults,
+    inject_query_param,
 )
+from ravage.web_core.proof_recognizer import recognize_proofs
+
+if TYPE_CHECKING:
+    from ravage.agent_core.agent_state import AgentState
 
 
 _DOM_EXEC_NAV_BUDGET = 16
@@ -105,9 +114,12 @@ def _run_dom_execution_targets(
     render_request_fn: RenderRequestFn | None,
     run: _DomExecutionRun,
 ) -> ProbeRunResult | None:
-    for target in _dom_targets(state):
+    for candidate in _dom_targets(state):
         if run.budget <= 0:
             break
+        target = _scoped_dom_target(session, candidate)
+        if target is None:
+            continue
         name = str(target.get("name") or "")
         base = str(target.get("url") or "")
         if not name or not base:
@@ -128,6 +140,31 @@ def _run_dom_execution_targets(
         if run.findings:
             break
     return None
+
+
+def _scoped_dom_target(
+    session: ProbeSession,
+    target: dict[str, object],
+) -> dict[str, object] | None:
+    raw_page_url = str(target.get("page_url") or "")
+    page_url = _absolute_same_origin_url(raw_page_url, base_url=session.target_url)
+    if raw_page_url and (not page_url or not session.in_scope(page_url)):
+        return None
+    base_url = page_url or session.target_url
+    url = _absolute_same_origin_url(target.get("url"), base_url=base_url)
+    if not url or not session.in_scope(url):
+        return None
+    scoped = dict(target)
+    scoped["url"] = url
+    scoped["page_url"] = page_url
+    raw_form = target.get("form")
+    if isinstance(raw_form, dict):
+        form = dict(raw_form)
+        form["action"] = url
+        if scoped["page_url"]:
+            form["page"] = scoped["page_url"]
+        scoped["form"] = form
+    return scoped
 
 
 def _run_dom_execution_target(

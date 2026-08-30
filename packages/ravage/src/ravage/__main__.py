@@ -235,6 +235,38 @@ DEFAULT_SCAN_PROBES = (
     "browser_boundary",
 )
 
+_SCAN_DISCOVERY_PROBES = (
+    "surface_map",
+    "secret_sweep",
+    "direct_exposure",
+    "api_behavior",
+    "browser_boundary",
+)
+
+_SCAN_PROBE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "browser_boundary": ("surface_map",),
+    "captcha_form_state": ("stateful_session",),
+    "cms_exposure": ("direct_exposure",),
+    "cookie_deserialization": ("stateful_session",),
+    "csrf_session": ("stateful_session",),
+    "dom_execution": ("xss_context", "xss_filter_constraint"),
+    "file_read_extract": ("file_fetch_parser",),
+    "filtered_query_bypass": ("sqli_differential",),
+    "graphql_exploit": ("api_behavior",),
+    "idor_boundary": ("api_behavior", "stateful_session"),
+    "jwt_exploit": ("api_behavior", "stateful_session"),
+    "preg_match_subject": ("sqli_differential",),
+    "reflection_value_boundary": ("input_reflection",),
+    "sqli_auth_transition": ("sqli_exploit",),
+    "sqli_exploit": ("data_query", "sqli_differential"),
+    "ssti_deferred_context_closure": ("ssti_fingerprint",),
+    "ssti_fingerprint": ("server_rendering",),
+    "werkzeug_console": ("direct_exposure",),
+    "xss_context": ("input_reflection",),
+    "xss_filter_constraint": ("xss_context",),
+    "xxe_boundary": ("file_fetch_parser",),
+}
+
 BRIEF_DESCRIPTION_TODO = (
     "TODO: describe the target, challenge text, rules, credentials, and win condition."
 )
@@ -4299,13 +4331,43 @@ def _attack_resume_workspace(resume_from: Path) -> Path:
 
 
 def _selected_scan_probes(requested: list[str], *, all_probes: bool) -> list[str]:
-    known = {item["name"] for item in available_probes()}
-    selected = sorted(known) if all_probes else list(requested or DEFAULT_SCAN_PROBES)
+    catalog = [item["name"] for item in available_probes()]
+    known = set(catalog)
+    selected = (
+        _dependency_ordered_scan_probes(catalog)
+        if all_probes
+        else list(requested or DEFAULT_SCAN_PROBES)
+    )
     unknown = [probe for probe in selected if probe not in known]
     if unknown:
         choices = ", ".join(sorted(known))
         message = f"unknown probe(s): {', '.join(unknown)}; choices: {choices}"
         raise SystemExit(message)
+    return selected
+
+
+def _dependency_ordered_scan_probes(catalog: list[str]) -> list[str]:
+    """Return a stable breadth-before-depth order for the complete probe catalog."""
+    known = set(catalog)
+    pending = list(catalog)
+    selected: list[str] = []
+    completed: set[str] = set()
+    while pending:
+        for index, probe in enumerate(pending):
+            dependencies = set(_SCAN_PROBE_DEPENDENCIES.get(probe, ()))
+            if probe not in _SCAN_DISCOVERY_PROBES:
+                dependencies.update(item for item in _SCAN_DISCOVERY_PROBES if item in known)
+            if all(
+                dependency not in known or dependency in completed
+                for dependency in dependencies
+            ):
+                selected.append(probe)
+                completed.add(probe)
+                pending.pop(index)
+                break
+        else:
+            unresolved = ", ".join(pending)
+            raise RuntimeError(f"cyclic deterministic scan probe dependencies: {unresolved}")
     return selected
 
 

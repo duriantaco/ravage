@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import secrets
 from typing import cast
-from urllib.parse import unquote_plus, urlsplit, urlunsplit
+from urllib.parse import unquote_plus, urljoin, urlsplit, urlunsplit
 
 from ravage.agent_core.agent_state import AgentState
 from ravage.web_core.http_probe import ProbeResponse, ProbeSession
@@ -568,6 +568,27 @@ def _url_in_scope(url: str, origin: str) -> bool:
     if not action_parts.scheme and not action_parts.netloc:
         return True
     return (action_parts.scheme, action_parts.netloc) == (origin_parts.scheme, origin_parts.netloc)
+
+
+def _absolute_same_origin_url(value: object, *, base_url: str) -> str:
+    """Resolve one observed URL while rejecting malformed or cross-origin targets."""
+    text = str(value or "").strip()
+    if not text or not base_url:
+        return ""
+    try:
+        absolute = urljoin(base_url, text)
+    except ValueError:
+        return ""
+    cleaned = _clean_signal_endpoint(absolute, origin=base_url)
+    if not cleaned or not _url_in_scope(cleaned, base_url):
+        return ""
+    try:
+        parsed = urlsplit(cleaned)
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+        return ""
+    return cleaned
 
 
 def _url_looks_static_oauth_redirect(url: str) -> bool:

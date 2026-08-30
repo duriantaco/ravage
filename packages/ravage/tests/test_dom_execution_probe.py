@@ -121,6 +121,94 @@ def test_dom_execution_finding_carries_executor_execution_marker(monkeypatch) ->
     assert evidence["token_executed"] is True
 
 
+def test_dom_execution_only_dispatches_absolute_same_origin_targets(monkeypatch) -> None:
+    _set_available(monkeypatch, available=True)
+    state = AgentState()
+    state.surface = {
+        "target_url": "http://127.0.0.1:8000/app/start",
+        "parameters": [
+            {
+                "name": "unsafe",
+                "locations": ["https://example.test/cross-origin"],
+                "priority": 100,
+            },
+            {
+                "name": "q",
+                "locations": ["../search?q=1"],
+                "priority": 90,
+            },
+        ],
+    }
+    rendered_urls: list[str] = []
+
+    def fake_render(url: str, **kwargs: object) -> BrowserObservation:
+        rendered_urls.append(url)
+        token = str(kwargs.get("token") or "")
+        return BrowserObservation(
+            available=True,
+            url=url,
+            token_executed=True,
+            final_url=url,
+            executed_values=[token],
+        )
+
+    monkeypatch.setattr(probe_suite, "render_url", fake_render)
+
+    result = run_builtin_probe(
+        "dom_execution",
+        target_url="http://127.0.0.1:8000/app/start",
+        state=state,
+    )
+
+    assert result.ok is True
+    assert rendered_urls
+    assert all(url.startswith("http://127.0.0.1:8000/") for url in rendered_urls)
+    assert rendered_urls[0].startswith("http://127.0.0.1:8000/search?")
+
+
+def test_dom_execution_resolves_relative_form_action_against_observed_page(monkeypatch) -> None:
+    _set_available(monkeypatch, available=True)
+    state = AgentState()
+    state.surface = {
+        "target_url": "http://127.0.0.1:8000/app/start",
+        "forms": [
+            {
+                "action": "submit",
+                "page": "/nested/form",
+                "method": "POST",
+                "inputs": [{"name": "comment", "type": "text"}],
+            }
+        ],
+    }
+    rendered: dict[str, object] = {}
+
+    def fake_render_request(url: str, **kwargs: object) -> BrowserObservation:
+        rendered["url"] = url
+        rendered["page_url"] = kwargs.get("page_url")
+        token = str(kwargs.get("token") or "")
+        return BrowserObservation(
+            available=True,
+            url=url,
+            token_executed=True,
+            final_url=url,
+            executed_values=[token],
+        )
+
+    monkeypatch.setattr(probe_suite, "render_request", fake_render_request)
+
+    result = run_builtin_probe(
+        "dom_execution",
+        target_url="http://127.0.0.1:8000/app/start",
+        state=state,
+    )
+
+    assert result.ok is True
+    assert rendered == {
+        "url": "http://127.0.0.1:8000/nested/submit",
+        "page_url": "http://127.0.0.1:8000/nested/form",
+    }
+
+
 def test_dom_execution_surfaces_render_errors(monkeypatch) -> None:
     _set_available(monkeypatch, available=True)
 

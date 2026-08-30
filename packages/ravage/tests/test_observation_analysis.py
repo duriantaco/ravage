@@ -39,6 +39,25 @@ def test_extract_signals_ignores_local_tool_paths_as_endpoints() -> None:
     assert all("/var/www" not in endpoint for endpoint in signals["endpoints"])
 
 
+def test_extract_signals_does_not_treat_server_version_as_relative_endpoint() -> None:
+    signals = extract_signals(
+        json.dumps(
+            {
+                "requests": [
+                    {
+                        "url": "http://127.0.0.1/app",
+                        "headers": {"Server": "nginx/1.27.5"},
+                        "body_snippet": '<a href="/actual-route">Route</a>',
+                    }
+                ]
+            }
+        )
+    )
+
+    assert "/actual-route" in signals["endpoints"]
+    assert "/1.27.5" not in signals["endpoints"]
+
+
 def test_extract_signals_collects_fetch_endpoint_and_json_body_key() -> None:
     html = """
     <script>
