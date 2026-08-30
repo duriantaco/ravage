@@ -54,6 +54,9 @@ def _default_labs_dir() -> Path:
     checkout_labs = Path(__file__).resolve().parents[4] / "examples" / "labs"
     if checkout_labs.is_dir():
         return checkout_labs
+    packaged_labs = Path(__file__).resolve().parent / "_resources" / "labs"
+    if packaged_labs.is_dir():
+        return packaged_labs
     return Path("examples/labs")
 
 

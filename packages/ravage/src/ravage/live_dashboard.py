@@ -50,8 +50,19 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from typing import Any
 
-FRONTEND_DIR = Path(__file__).resolve().parents[3] / "ravage-cockpit"
-REPO_ASSETS_DIR = Path(__file__).resolve().parents[4] / "assets"
+_PACKAGE_RESOURCES_DIR = Path(__file__).resolve().parent / "_resources"
+_CHECKOUT_FRONTEND_DIR = Path(__file__).resolve().parents[3] / "ravage-cockpit"
+_CHECKOUT_LOGO_PATH = Path(__file__).resolve().parents[4] / "assets" / "ravage_logo.png"
+FRONTEND_DIR = (
+    _CHECKOUT_FRONTEND_DIR
+    if _CHECKOUT_FRONTEND_DIR.is_dir()
+    else _PACKAGE_RESOURCES_DIR / "cockpit"
+)
+LOGO_PATH = (
+    _CHECKOUT_LOGO_PATH
+    if _CHECKOUT_LOGO_PATH.is_file()
+    else _PACKAGE_RESOURCES_DIR / "assets" / "ravage_logo.png"
+)
 
 __all__ = [
     "CockpitServer",
@@ -763,7 +774,7 @@ def _handler(settings: DashboardSettings) -> type[BaseHTTPRequestHandler]:
                 self._send_state_stream()
                 return
             if path == "/assets/ravage_logo.png":
-                self._send_file(REPO_ASSETS_DIR / "ravage_logo.png")
+                self._send_file(LOGO_PATH)
                 return
             self._send_frontend_file(path)
 
