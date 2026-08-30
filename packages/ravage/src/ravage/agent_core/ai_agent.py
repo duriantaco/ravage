@@ -99,7 +99,6 @@ from ravage.run_data.brief import load_engagement_brief
 from ravage.run_data.workspace import AgentWorkspace
 from ravage.runtime import (
     DEFAULT_TOOL_IMAGE,
-    DockerFallbackToolRuntime,
     DockerToolRuntime,
     ExternalToolRuntime,
     NoProcessToolRuntime,
@@ -291,7 +290,7 @@ class AIWebAgentSettings:
     knowledge_pack_sha256: str | None = None
     knowledge_pack_limit: int = DEFAULT_KNOWLEDGE_CARD_LIMIT
     knowledge_pack_max_chars: int = DEFAULT_KNOWLEDGE_MAX_CHARS
-    tool_runtime_mode: ToolRuntimeMode = "host"
+    tool_runtime_mode: ToolRuntimeMode = "docker"
     tool_image: str = DEFAULT_TOOL_IMAGE
     allow_remote_target: bool = False
     allow_degraded: bool = False
@@ -2607,10 +2606,8 @@ def _make_tool_runtime(
     }
     if settings.allow_remote_target and not is_local_url(target_url):
         return DockerToolRuntime(**runtime_kwargs)
-    if settings.tool_runtime_mode == "docker":
+    if settings.tool_runtime_mode in {"docker", "auto"}:
         return DockerToolRuntime(**runtime_kwargs)
-    if settings.tool_runtime_mode == "auto":
-        return DockerFallbackToolRuntime(**runtime_kwargs)
     return ExternalToolRuntime()
 
 

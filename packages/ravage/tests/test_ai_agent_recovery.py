@@ -259,6 +259,7 @@ def test_recovery_profile_escalates_hands_off_and_solves_under_one_budget(
         brief_path=brief_path,
         target_url=TARGET_URL,
         settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
             db_path=tmp_path / "audit.db",
             workspace_dir=workspace,
             model_client=model,
@@ -347,6 +348,7 @@ def test_recovery_executes_route_aligned_xss_objective_when_model_keeps_looping(
         brief_path=brief_path,
         target_url=TARGET_URL,
         settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
             db_path=tmp_path / "audit.db",
             workspace_dir=workspace,
             model_client=model,
@@ -393,6 +395,7 @@ def test_default_and_explicit_off_profiles_keep_identical_prompts_and_no_recover
         brief_path=brief_path,
         target_url=TARGET_URL,
         settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
             db_path=tmp_path / "default.db",
             workspace_dir=tmp_path / "default-workspace",
             model_client=default_model,
@@ -403,6 +406,7 @@ def test_default_and_explicit_off_profiles_keep_identical_prompts_and_no_recover
         brief_path=brief_path,
         target_url=TARGET_URL,
         settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
             db_path=tmp_path / "explicit.db",
             workspace_dir=tmp_path / "explicit-workspace",
             model_client=explicit_model,
@@ -437,6 +441,7 @@ def test_multi_finding_run_continues_after_proof_and_resume_uses_next_turn(
         brief_path=brief_path,
         target_url=TARGET_URL,
         settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
             db_path=db_path,
             workspace_dir=workspace,
             model_client=first_model,
@@ -447,6 +452,7 @@ def test_multi_finding_run_continues_after_proof_and_resume_uses_next_turn(
         brief_path=brief_path,
         target_url=TARGET_URL,
         settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
             db_path=db_path,
             workspace_dir=workspace,
             model_client=second_model,
@@ -496,6 +502,7 @@ def test_recovery_core_final_cannot_end_the_campaign_without_target_proof(
         brief_path=brief_path,
         target_url=TARGET_URL,
         settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
             db_path=tmp_path / "audit.db",
             workspace_dir=workspace,
             model_client=model,
@@ -542,6 +549,7 @@ def test_recovery_resume_charges_an_interrupted_model_request_without_replaying_
             brief_path=brief_path,
             target_url=TARGET_URL,
             settings=AIWebAgentSettings(
+                tool_runtime_mode="host",
                 db_path=db_path,
                 workspace_dir=workspace,
                 model_client=_InterruptingClient(),
@@ -568,6 +576,7 @@ def test_recovery_resume_charges_an_interrupted_model_request_without_replaying_
         brief_path=brief_path,
         target_url=TARGET_URL,
         settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
             db_path=db_path,
             workspace_dir=workspace,
             model_client=resumed_model,
@@ -633,6 +642,7 @@ def test_no_progress_campaign_stops_without_blindly_consuming_the_global_budget(
         brief_path=brief_path,
         target_url=TARGET_URL,
         settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
             db_path=tmp_path / "audit.db",
             workspace_dir=workspace,
             model_client=model,

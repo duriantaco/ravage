@@ -262,6 +262,7 @@ def test_injected_model_final_cannot_bypass_required_proof_count(
         brief_path=brief_path,
         target_url="http://127.0.0.1:8765",
         settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
             db_path=tmp_path / "audit.db",
             workspace_dir=tmp_path / "workspace",
             model_client=model,
@@ -325,6 +326,7 @@ def test_two_proofs_from_one_closure_probe_finish_without_another_model_turn(
         brief_path=brief_path,
         target_url="http://127.0.0.1:8765",
         settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
             db_path=tmp_path / "audit.db",
             workspace_dir=tmp_path / "workspace",
             model_client=model,
@@ -367,6 +369,7 @@ def test_third_identical_action_is_replaced_before_execution(
         brief_path=brief_path,
         target_url="http://127.0.0.1:8765",
         settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
             db_path=tmp_path / "audit.db",
             workspace_dir=tmp_path / "workspace",
             model_client=model,
@@ -411,6 +414,7 @@ def test_completed_task_queue_synthesizes_terminal_without_another_model_turn(
         brief_path=brief_path,
         target_url="http://127.0.0.1:8765",
         settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
             db_path=tmp_path / "audit.db",
             workspace_dir=tmp_path / "workspace",
             model_client=model,

@@ -14,6 +14,7 @@ from ravage.agent_core.ai_agent import (
     run_ai_web_agent,
 )
 from ravage.memory import MemoryItem, MemoryRunSettings, MemoryStore
+from ravage.runtime import FakeToolRuntime
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -74,6 +75,8 @@ def test_ai_web_memory_read_injects_only_verified_or_promoted_memories(
         brief_path=brief_path,
         target_url="http://127.0.0.1:8765",
         settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
+            tool_runtime=FakeToolRuntime(),
             db_path=tmp_path / "run.db",
             workspace_dir=tmp_path / "workspace",
             model_client=model,
@@ -165,6 +168,8 @@ def test_ai_web_memory_write_stores_reflection_candidates_after_confirmed_eviden
         brief_path=brief_path,
         target_url="http://127.0.0.1:8765",
         settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
+            tool_runtime=FakeToolRuntime(),
             db_path=tmp_path / "run.db",
             workspace_dir=tmp_path / "workspace",
             model_client=model,
@@ -228,6 +233,8 @@ def test_retrieved_memory_cannot_bypass_evidence_gate(tmp_path: Path) -> None:
         brief_path=brief_path,
         target_url="http://127.0.0.1:8765",
         settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
+            tool_runtime=FakeToolRuntime(),
             db_path=db_path,
             workspace_dir=tmp_path / "workspace",
             model_client=model,
@@ -321,6 +328,8 @@ def test_ai_web_memory_records_model_provenance(tmp_path: Path) -> None:
         brief_path=brief_path,
         target_url="http://127.0.0.1:8765",
         settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
+            tool_runtime=FakeToolRuntime(),
             db_path=tmp_path / "run.db",
             workspace_dir=tmp_path / "workspace",
             model_client=model,
@@ -375,6 +384,8 @@ def test_agent_finished_reports_max_turns_as_incomplete(tmp_path: Path) -> None:
         brief_path=brief_path,
         target_url="http://127.0.0.1:8765",
         settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
+            tool_runtime=FakeToolRuntime(),
             db_path=tmp_path / "run.db",
             workspace_dir=tmp_path / "workspace",
             model_client=model,
@@ -414,6 +425,8 @@ def test_agent_finished_reports_cost_budget_as_incomplete(tmp_path: Path) -> Non
         brief_path=brief_path,
         target_url="http://127.0.0.1:8765",
         settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
+            tool_runtime=FakeToolRuntime(),
             db_path=tmp_path / "run.db",
             workspace_dir=tmp_path / "workspace",
             model_client=model,

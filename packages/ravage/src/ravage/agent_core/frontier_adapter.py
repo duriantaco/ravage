@@ -48,7 +48,6 @@ from ravage.run_data.audit import AuditStore
 from ravage.run_data.brief import load_engagement_brief
 from ravage.run_data.workspace import AgentWorkspace
 from ravage.runtime import (
-    DockerFallbackToolRuntime,
     DockerToolRuntime,
     ExternalToolRuntime,
     NoProcessToolRuntime,
@@ -579,10 +578,8 @@ def _make_route_runtime(
         "cleanup_evidence_path": os.environ.get("RAVAGE_TOOL_NETWORK_EVIDENCE_PATH"),
         "allow_remote_target": settings.allow_remote_target,
     }
-    if settings.allow_remote_target or settings.tool_runtime_mode == "docker":
+    if settings.allow_remote_target or settings.tool_runtime_mode in {"docker", "auto"}:
         return DockerToolRuntime(**runtime_kwargs)
-    if settings.tool_runtime_mode == "auto":
-        return DockerFallbackToolRuntime(**runtime_kwargs)
     return ExternalToolRuntime()
 
 
