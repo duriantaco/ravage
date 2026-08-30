@@ -266,6 +266,18 @@ def test_cockpit_server_serves_state_and_stream(tmp_path: Path) -> None:
             state = json.loads(response.read())
         assert state["manifest"]["run_id"] == "XBEN-001-24"
 
+        with urllib.request.urlopen(base + "/", timeout=5) as response:  # noqa: S310
+            frontend = response.read().decode("utf-8")
+        assert response.status == 200
+        assert "Ravage Cockpit" in frontend
+
+        with urllib.request.urlopen(  # noqa: S310
+            base + "/assets/ravage_logo.png", timeout=5
+        ) as response:
+            logo = response.read()
+        assert response.status == 200
+        assert logo.startswith(b"\x89PNG\r\n\x1a\n")
+
         with urllib.request.urlopen(base + "/api/events/stream", timeout=5) as response:  # noqa: S310
             frame = response.read(64)
         assert frame  # the stream produces bytes immediately (state event / keepalive)

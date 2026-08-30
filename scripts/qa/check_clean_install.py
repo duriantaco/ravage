@@ -5,10 +5,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
+import time
+from http import HTTPStatus
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[2]
 _COMMAND_TIMEOUT_SECONDS = 300
@@ -111,8 +116,33 @@ def _run_smoke(work_dir: Path) -> int:
         raise SmokeCheckError("clean `ravage doctor --json` did not return JSON") from exc
     _assert_doctor_payload(doctor)
 
+    lab_result = _run(
+        clean_ravage,
+        "lab",
+        "list",
+        cwd=work_dir,
+        env=environment,
+        capture=True,
+    )
+    for lab_id in (
+        "ravage-acme-box",
+        "ravage-forgeops-box",
+        "ravage-node-market-box",
+        "ravage-perimeter-box",
+        "ravage-session-boundary-box",
+    ):
+        if lab_id not in lab_result.stdout:
+            raise SmokeCheckError(f"clean `ravage lab list` omitted {lab_id}")
+
+    _assert_observe_ui(
+        clean_ravage,
+        run_dir=work_dir / "sample-run",
+        cwd=work_dir,
+        env=environment,
+    )
+
     sys.stdout.write(
-        "clean install check passed: base wheels, no Playwright, CLI help, and doctor\n"
+        "clean install check passed: wheels, CLI, doctor, labs, and cockpit UI\n"
     )
     return 0
 
@@ -137,6 +167,95 @@ def _assert_doctor_payload(payload: object) -> None:
         or "not installed" not in str(browser.get("detail", "")).lower()
     ):
         raise SmokeCheckError("clean base doctor did not report Playwright as optional")
+
+
+def _assert_observe_ui(
+    ravage_command: Path,
+    *,
+    run_dir: Path,
+    cwd: Path,
+    env: dict[str, str],
+) -> None:
+    workspace = run_dir / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "events.jsonl").write_text("", encoding="utf-8")
+    port = _available_loopback_port()
+    command = [
+        str(ravage_command),
+        "observe",
+        str(run_dir),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+    ]
+    process = subprocess.Popen(  # noqa: S603 - installed console script under test.
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_for_cockpit(process, port=port)
+        frontend = _read_url(f"http://127.0.0.1:{port}/")
+        if b"Ravage Cockpit" not in frontend:
+            raise SmokeCheckError("clean `ravage observe` did not serve the cockpit UI")
+        javascript = _read_url(f"http://127.0.0.1:{port}/src/main.js")
+        if not javascript:
+            raise SmokeCheckError("clean `ravage observe` served empty cockpit JavaScript")
+        stylesheet = _read_url(f"http://127.0.0.1:{port}/src/styles.css")
+        if not stylesheet:
+            raise SmokeCheckError("clean `ravage observe` served empty cockpit CSS")
+        logo = _read_url(f"http://127.0.0.1:{port}/assets/ravage_logo.png")
+        if not logo.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise SmokeCheckError("clean `ravage observe` did not serve the packaged logo")
+    finally:
+        _stop_process(process)
+
+
+def _available_loopback_port() -> int:
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def _wait_for_cockpit(process: subprocess.Popen[str], *, port: int) -> None:
+    deadline = time.monotonic() + 10
+    url = f"http://127.0.0.1:{port}/api/state"
+    while time.monotonic() < deadline:
+        returncode = process.poll()
+        if returncode is not None:
+            stdout, stderr = process.communicate()
+            detail = "\n".join(part for part in (stdout, stderr) if part).strip()
+            raise SmokeCheckError(
+                f"clean `ravage observe` exited before serving (exit {returncode}): {detail}"
+            )
+        try:
+            _read_url(url)
+        except URLError:
+            time.sleep(0.05)
+            continue
+        return
+    raise SmokeCheckError("clean `ravage observe` did not start within 10 seconds")
+
+
+def _read_url(url: str) -> bytes:
+    with urlopen(url, timeout=2) as response:  # noqa: S310 - fixed loopback smoke target.
+        if response.status != HTTPStatus.OK:
+            raise SmokeCheckError(f"clean cockpit returned HTTP {response.status} for {url}")
+        return response.read()
+
+
+def _stop_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
 
 
 def _require_empty_directory(path: Path) -> None:
