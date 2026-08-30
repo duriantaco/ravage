@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pytest
+
 from ravage import __main__ as cli
 from ravage.agent_core.agent_state import AgentState, load_agent_state
 from ravage.probe_suite import available_probes
@@ -9,8 +11,6 @@ from ravage.probe_suite_parts.result import ProbeRunResult
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import pytest
 
 
 _BRIEF = """
@@ -32,6 +32,19 @@ context:
   description: "Local deterministic scan routing test."
   win_condition: "Record observed target surface."
 """.lstrip()
+
+
+def test_scan_help_warns_that_all_probes_is_high_traffic(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["scan", "--help"])
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "broad catalog" in output
+    assert "thousands of bounded requests" in output
+    assert "authorized remote targets" in output
 
 
 def test_all_scan_probes_follow_dependencies_but_explicit_order_is_preserved() -> None:

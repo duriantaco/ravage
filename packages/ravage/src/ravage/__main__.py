@@ -2402,8 +2402,9 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
         prog="ravage scan",
         description="Run deterministic built-in probes without model calls.",
         epilog=(
-            "Use --all-probes for the full in-tree probe catalog, or repeat "
-            "--probe for a focused run."
+            "Use --all-probes for the broad, high-traffic in-tree catalog; it may "
+            "generate thousands of bounded requests. Repeat --probe for a focused "
+            "run, especially against authorized remote targets."
         ),
     )
     parser.add_argument(
@@ -2430,7 +2431,7 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
     parser.add_argument(
         "--all-probes",
         action="store_true",
-        help="run every built-in deterministic probe",
+        help="run the broad catalog; may generate thousands of bounded requests",
     )
     parser.add_argument(
         "--list-probes",
