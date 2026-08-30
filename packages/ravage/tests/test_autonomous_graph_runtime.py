@@ -314,6 +314,28 @@ def test_host_backend_never_claims_target_network_isolation(
         runtime.close()
 
 
+def test_host_backend_process_environment_scrubs_parent_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-openai-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-anthropic-secret")
+    monkeypatch.setenv("RAVAGE_ARBITRARY_PARENT_SECRET", "fake-parent-secret")
+    workspace = tmp_path / "workspace"
+    backend = HostGraphProcessBackend(workspace)
+
+    backend.ensure_started(TARGET_URL)
+    environment = backend.process_env()
+
+    assert "OPENAI_API_KEY" not in environment
+    assert "ANTHROPIC_API_KEY" not in environment
+    assert "RAVAGE_ARBITRARY_PARENT_SECRET" not in environment
+    assert environment["RAVAGE_TARGET_URL"] == TARGET_URL
+    assert environment["PYTHONUNBUFFERED"] == "1"
+    assert environment["HOME"] == str(workspace)
+    assert environment["PATH"]
+
+
 def test_docker_backend_builds_resource_capped_process_group_command(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

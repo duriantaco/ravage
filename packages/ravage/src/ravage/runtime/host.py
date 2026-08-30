@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import sys
@@ -15,6 +14,7 @@ from ravage.tool_paths import (
 
 from .common import (
     assert_local_url,
+    child_process_environment,
     cleanup_path,
     clip,
     safe_code,
@@ -112,10 +112,14 @@ class ExternalToolRuntime(ToolRuntime):
         target_url: str,
         timeout_seconds: int | None,
     ) -> ToolResult:
-        env = dict(os.environ)
+        env = child_process_environment(
+            home=self.workdir,
+            overrides={
+                "RAVAGE_TARGET_URL": target_url,
+                "PYTHONUNBUFFERED": "1",
+            },
+        )
         prepend_executable_path(env, self._project_tool_bin)
-        env["RAVAGE_TARGET_URL"] = target_url
-        env["PYTHONUNBUFFERED"] = "1"
         timeout = timeout_or_default(timeout_seconds, default=self.timeout_seconds)
         execution_argv = _argv_with_project_tool_path(argv, self._project_tool_bin)
         try:
