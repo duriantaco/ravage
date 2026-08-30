@@ -3,7 +3,9 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from ipaddress import ip_address
 from typing import TYPE_CHECKING, Literal
+from urllib.parse import urlparse
 
 import yaml  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -58,6 +60,17 @@ DEFAULT_BASE_URL: dict[ProviderKind, str] = {
     "vllm": "http://localhost:8000/v1",
     "litellm": "http://localhost:4000/v1",
 }
+OPENAI_NATIVE_BASE_URL = "https://api.openai.com/v1"
+ANTHROPIC_NATIVE_BASE_URL = "https://api.anthropic.com"
+DIRECT_CHAT_PROVIDERS: frozenset[ProviderKind] = frozenset(
+    {
+        "openai",
+        "anthropic",
+        "litellm",
+        "custom_openai",
+        *LOCAL_PROVIDERS,
+    }
+)
 TIER_ORDER: tuple[ModelTier, ...] = ("high", "mid", "low")
 ENV_TEMPLATE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::([^}]*))?\}")
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -95,6 +108,22 @@ def openai_standard_token_prices(
         if long_context is not None:
             return long_context
     return OPENAI_STANDARD_TOKEN_PRICES.get(model)
+
+
+# Claude API Standard pricing per 1M tokens, verified 2026-08-30.
+# https://platform.claude.com/docs/en/about-claude/pricing
+# https://platform.claude.com/docs/en/about-claude/model-deprecations
+# https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions
+ANTHROPIC_STANDARD_TOKEN_PRICES: dict[str, TokenPrices] = {
+    "claude-opus-4-7": TokenPrices(5.0, 0.5, 25.0),
+    "claude-sonnet-4-6": TokenPrices(3.0, 0.3, 15.0),
+    "claude-haiku-4-5": TokenPrices(1.0, 0.1, 5.0),
+    "claude-haiku-4-5-20251001": TokenPrices(1.0, 0.1, 5.0),
+}
+
+
+def anthropic_standard_token_prices(model: str) -> TokenPrices | None:
+    return ANTHROPIC_STANDARD_TOKEN_PRICES.get(model)
 
 
 DEFAULT_MODEL_CONFIG: dict[str, object] = {
@@ -269,7 +298,10 @@ DEFAULT_MODEL_CONFIG: dict[str, object] = {
                 "low": [
                     {
                         "provider": "anthropic",
-                        "model": "${RAVAGE_ANTHROPIC_LOW_MODEL:claude-haiku-4-5}",
+                        "model": (
+                            "${RAVAGE_ANTHROPIC_LOW_MODEL:"
+                            "claude-haiku-4-5-20251001}"
+                        ),
                         "api_key_env": "ANTHROPIC_API_KEY",
                         "max_output_tokens": 4096,
                     }
@@ -369,6 +401,13 @@ class ModelRoute(BaseModel):
                 raise ValueError(message)
         return value
 
+    @model_validator(mode="after")
+    def _required_api_key_has_environment_variable(self) -> ModelRoute:
+        if self._default_api_key_required() and self.effective_api_key_env() is None:
+            message = "api_key_env is required when api_key_required is true"
+            raise ValueError(message)
+        return self
+
     def effective_base_url(self) -> str | None:
         return self.base_url or DEFAULT_BASE_URL.get(self.provider)
 
@@ -448,10 +487,26 @@ class ResolvedModelRoute:
     timeout_seconds: float
     max_retries: int
     cached_input_cost_per_1m_tokens: float | None = None
+    api_key_required: bool = False
 
     @property
     def ready(self) -> bool:
-        return not self.missing_env
+        return not self.missing_env and not self.missing_pricing and self.transport_issue is None
+
+    @property
+    def missing_pricing(self) -> tuple[str, ...]:
+        if not _route_requires_accountable_pricing(self):
+            return ()
+        prices = (
+            ("input_cost_per_1m_tokens", self.input_cost_per_1m_tokens),
+            ("cached_input_cost_per_1m_tokens", self.cached_input_cost_per_1m_tokens),
+            ("output_cost_per_1m_tokens", self.output_cost_per_1m_tokens),
+        )
+        return tuple(name for name, value in prices if value is None)
+
+    @property
+    def transport_issue(self) -> str | None:
+        return model_route_transport_issue(self)
 
 
 def load_model_registry(
@@ -556,6 +611,7 @@ def _resolve_model_route(
         timeout_seconds=route.timeout_seconds,
         max_retries=route.max_retries,
         cached_input_cost_per_1m_tokens=cached_input_cost,
+        api_key_required=route._default_api_key_required(),
     )
 
 
@@ -569,12 +625,71 @@ def _effective_token_prices(
     )
     if any(value is not None for value in configured):
         return configured
-    if route.provider != "openai" or route.base_url is not None:
+    if route.base_url is not None:
         return configured
-    known = openai_standard_token_prices(route.model)
+    if route.provider == "openai":
+        known = openai_standard_token_prices(route.model)
+    elif route.provider == "anthropic":
+        known = anthropic_standard_token_prices(route.model)
+    else:
+        known = None
     if known is None:
         return configured
     return known.input_per_1m, known.cached_input_per_1m, known.output_per_1m
+
+
+def _route_requires_accountable_pricing(route: ResolvedModelRoute) -> bool:
+    return not route_is_nonbillable_local(route)
+
+
+def route_is_nonbillable_local(route: ResolvedModelRoute) -> bool:
+    """Return whether a built-in local provider is credentialless and loopback-only."""
+    if route.provider not in LOCAL_PROVIDERS:
+        return False
+    if route.api_key_env is not None or route.api_key_required:
+        return False
+    hostname = (urlparse(route.base_url or "").hostname or "").lower().rstrip(".")
+    if hostname == "localhost":
+        return True
+    try:
+        return ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def model_route_transport_issue(route: ResolvedModelRoute) -> str | None:
+    if route.provider not in DIRECT_CHAT_PROVIDERS:
+        return "unsupported_direct_provider"
+    base_url = (route.base_url or "").rstrip("/")
+    if route.provider == "custom_openai" and not base_url:
+        return "custom_openai_base_url_required"
+    if route.provider == "openai" and base_url and base_url != OPENAI_NATIVE_BASE_URL:
+        return "openai_native_base_url_required"
+    if route.provider == "anthropic" and base_url != ANTHROPIC_NATIVE_BASE_URL:
+        return "anthropic_native_base_url_required"
+    return None
+
+
+def model_route_transport_error(route: ResolvedModelRoute) -> str | None:
+    issue = model_route_transport_issue(route)
+    if issue == "unsupported_direct_provider":
+        return (
+            f"provider={route.provider} has no direct chat transport; "
+            "use provider=custom_openai or provider=litellm with a configured gateway"
+        )
+    if issue == "custom_openai_base_url_required":
+        return "provider=custom_openai requires an explicit base_url"
+    if issue == "openai_native_base_url_required":
+        return (
+            f"provider=openai only supports {OPENAI_NATIVE_BASE_URL}; "
+            "use provider=custom_openai for a gateway"
+        )
+    if issue == "anthropic_native_base_url_required":
+        return (
+            f"provider=anthropic only supports {ANTHROPIC_NATIVE_BASE_URL}; "
+            "use provider=litellm for a gateway"
+        )
+    return None
 
 
 def _missing_env_names(route: ModelRoute, env: Mapping[str, str]) -> tuple[str, ...]:
@@ -631,6 +746,11 @@ def _model_route_detail_line(route: ResolvedModelRoute) -> str:
     if route.missing_env:
         missing_env = ",".join(route.missing_env)
         parts.append(f"missing_env={missing_env}")
+    if route.missing_pricing:
+        missing_pricing = ",".join(route.missing_pricing)
+        parts.append(f"missing_pricing={missing_pricing}")
+    if route.transport_issue is not None:
+        parts.append(f"transport_issue={route.transport_issue}")
     return " ".join(parts)
 
 

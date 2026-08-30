@@ -3168,7 +3168,7 @@ def _create_init_files(
             "ANTHROPIC_API_KEY=\n"
             "RAVAGE_OPENAI_LOW_MODEL=gpt-5.4-mini-2026-03-17\n"
             "RAVAGE_OPENAI_MID_MODEL=gpt-5.4-2026-03-05\n"
-            "RAVAGE_ANTHROPIC_LOW_MODEL=claude-haiku-4-5\n"
+            "RAVAGE_ANTHROPIC_LOW_MODEL=claude-haiku-4-5-20251001\n"
             "RAVAGE_ANTHROPIC_MID_MODEL=claude-sonnet-4-6\n"
         )
     )
@@ -3664,11 +3664,36 @@ def _setup_model_check(
         }
     missing = sorted({env for route in routes for env in route.missing_env})
     location = f" in {env_file}" if env_file is not None else ""
+    transport_issues = sorted(
+        {route.transport_issue for route in routes if route.transport_issue is not None}
+    )
+    if transport_issues:
+        return {
+            "name": "model",
+            "status": "fail",
+            "detail": "unsupported model transport: " + ", ".join(transport_issues),
+            "fix": "Use native OpenAI/Anthropic or a configured custom_openai/LiteLLM gateway.",
+        }
+    if missing:
+        return {
+            "name": "model",
+            "status": "fail",
+            "detail": "missing env: " + ", ".join(missing),
+            "fix": f"Set {', '.join(missing)}{location}, then rerun this check.",
+        }
+    missing_pricing = sorted({field for route in routes for field in route.missing_pricing})
+    if missing_pricing:
+        return {
+            "name": "model",
+            "status": "fail",
+            "detail": "missing pricing: " + ", ".join(missing_pricing),
+            "fix": "Add explicit current token prices to the model route, then rerun this check.",
+        }
     return {
         "name": "model",
         "status": "fail",
-        "detail": "missing env: " + ", ".join(missing),
-        "fix": f"Set {', '.join(missing)}{location}, then rerun this check.",
+        "detail": "no usable model route",
+        "fix": "Check the model profile/configuration and rerun this check.",
     }
 
 

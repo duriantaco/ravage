@@ -28,11 +28,11 @@ from ravage.agent_core.autonomous_graph.provider_continuity import (
 )
 from ravage.agent_core.autonomous_graph.worker import GraphModelReply
 from ravage.model_core.providers import (
-    LOCAL_PROVIDERS,
     ResolvedModelRoute,
     load_model_registry,
     ready_model_routes,
     resolve_model_routes,
+    route_is_nonbillable_local,
 )
 
 if TYPE_CHECKING:
@@ -482,6 +482,20 @@ def select_graph_model_portfolio(
         message = "no ready model route for autonomous agent graph"
         if missing:
             message += f"; missing env: {', '.join(missing)}"
+        missing_pricing = sorted(
+            {field for route in routes for field in route.missing_pricing}
+        )
+        if missing_pricing:
+            message += f"; missing pricing: {', '.join(missing_pricing)}"
+        transport_issues = sorted(
+            {
+                route.transport_issue
+                for route in routes
+                if route.transport_issue is not None
+            }
+        )
+        if transport_issues:
+            message += f"; transport issues: {', '.join(transport_issues)}"
         raise RuntimeError(message)
     return tuple(
         GraphModelEndpoint(
@@ -591,8 +605,7 @@ def _require_accountable_reply(
     route: ResolvedModelRoute,
     reply: ModelReply,
 ) -> None:
-    local_custom = route.provider == "custom_openai" and route.api_key_env is None
-    if route.provider in LOCAL_PROVIDERS or local_custom or reply.cost_known:
+    if route_is_nonbillable_local(route) or reply.cost_known:
         return
     raise RuntimeError(
         "paid autonomous-graph response cannot be cost-accounted: "

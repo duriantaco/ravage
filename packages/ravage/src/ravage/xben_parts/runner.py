@@ -25,11 +25,11 @@ from ravage.live_dashboard import (
     start_cockpit,
 )
 from ravage.model_core.providers import (
-    LOCAL_PROVIDERS,
     ResolvedModelRoute,
     load_model_registry,
     ready_model_routes,
     resolve_model_routes,
+    route_is_nonbillable_local,
 )
 from ravage.outcome_evidence import load_run_outcome
 from ravage.run_data.run_manifest import (
@@ -1056,7 +1056,9 @@ def _selected_route_cost_is_known(settings: XbenSettings) -> bool:
     if route is None:
         return False
     return (
-        route.input_cost_per_1m_tokens is not None and route.output_cost_per_1m_tokens is not None
+        route.input_cost_per_1m_tokens is not None
+        and route.cached_input_cost_per_1m_tokens is not None
+        and route.output_cost_per_1m_tokens is not None
     )
 
 
@@ -1518,7 +1520,7 @@ def _routes_for_cost_and_risk(
 
 def _has_paid_model_risk(routes: Sequence[ResolvedModelRoute]) -> bool:
     for route in routes:
-        if route.provider not in LOCAL_PROVIDERS:
+        if not route_is_nonbillable_local(route):
             return True
     return False
 
@@ -1527,7 +1529,9 @@ def _routes_have_complete_pricing(routes: Sequence[ResolvedModelRoute]) -> bool:
     if not routes:
         return False
     return all(
-        route.input_cost_per_1m_tokens is not None and route.output_cost_per_1m_tokens is not None
+        route.input_cost_per_1m_tokens is not None
+        and route.cached_input_cost_per_1m_tokens is not None
+        and route.output_cost_per_1m_tokens is not None
         for route in routes
     )
 

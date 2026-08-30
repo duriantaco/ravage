@@ -21,6 +21,7 @@ from ravage.agent_core.frontier_timeout_hygiene import (
     TimeoutCleanupRecord,
 )
 from ravage.auth import AuthArtifactRedactor, SecretValue
+from ravage.model_core.providers import load_model_registry, resolve_model_routes
 from ravage.runtime import FakeToolRuntime, ToolResult
 from ravage.traffic.policy import (
     TrafficPolicyConfig,
@@ -250,6 +251,41 @@ def _raise_after_audit_close(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AuditCloseError(message)
 
     monkeypatch.setattr(frontier_adapter.AuditStore, "close", close_then_fail)
+
+
+def test_credentialless_remote_route_cannot_bypass_frontier_cost_accounting(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "models.yaml"
+    config.write_text(
+        """
+profiles:
+  remote:
+    routes:
+      mid:
+        - provider: custom_openai
+          model: paid-remote-model
+          base_url: https://paid-model.example/v1
+          api_key_required: false
+          input_cost_per_1m_tokens: 1.0
+          cached_input_cost_per_1m_tokens: 1.0
+          output_cost_per_1m_tokens: 2.0
+""".lstrip(),
+        encoding="utf-8",
+    )
+    registry = load_model_registry(config, env={})
+    route = resolve_model_routes(
+        registry,
+        profile_name="remote",
+        tier="mid",
+        env={},
+    )[0]
+
+    with pytest.raises(RuntimeError, match="cannot be cost-accounted"):
+        frontier_adapter._require_accountable_reply(  # noqa: SLF001
+            route=route,
+            reply=ModelReply(content="{}", usage_reported=False, cost_known=False),
+        )
 
 
 def test_legacy_observe_frontier_creates_the_canonical_run_ledger(

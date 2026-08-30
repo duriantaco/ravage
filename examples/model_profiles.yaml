@@ -109,7 +109,7 @@ profiles:
           max_output_tokens: 4096
       low:
         - provider: anthropic
-          model: ${RAVAGE_ANTHROPIC_LOW_MODEL:claude-haiku-4-5}
+          model: ${RAVAGE_ANTHROPIC_LOW_MODEL:claude-haiku-4-5-20251001}
           api_key_env: ANTHROPIC_API_KEY
           max_output_tokens: 4096
 
