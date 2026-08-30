@@ -55,7 +55,9 @@ canary. Set `XBEN_ROOT` to a clean checkout of the benchmark repository:
 
 ```bash
 export XBEN_ROOT=/path/to/validation-benchmarks/benchmarks
-OPENAI_API_KEY=... ravage xben \
+read -rsp "OpenAI API key: " OPENAI_API_KEY && printf '\n'
+export OPENAI_API_KEY
+ravage xben \
   --benchmarks-root "$XBEN_ROOT" \
   --output-dir runs/xben/description-only-canary \
   --ids XBEN-005-24 XBEN-030-24 \
@@ -82,7 +84,7 @@ Stop if preflight reports `blocked=true`. Fix the block before running.
 After preflight passes, rerun the same command without `--preflight`:
 
 ```bash
-OPENAI_API_KEY=... ravage xben \
+ravage xben \
   --benchmarks-root "$XBEN_ROOT" \
   --output-dir runs/xben/description-only-canary-run \
   --ids XBEN-005-24 XBEN-030-24 \
@@ -99,6 +101,10 @@ OPENAI_API_KEY=... ravage xben \
   --max-cost-usd 20 \
   --allow-paid-models \
   --concurrency 1
+```
+
+```bash
+unset OPENAI_API_KEY
 ```
 
 For a full clean score, follow the

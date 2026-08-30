@@ -48,6 +48,17 @@ Ravage loads `.env.ravage` beside the brief directly and infers a configured
 hosted route; do not shell-source the file. Use `--env-file`,
 `--model-profile`, or `--model-tier` only when overriding those defaults.
 
+Unauthenticated process-capable attacks use Docker by default and never
+silently fall back to host execution. `--tool-runtime host` is an explicit
+trusted-localhost opt-in that runs model-selected code with your filesystem
+permissions. Its child environment excludes provider keys, but it is not a
+filesystem sandbox.
+
+Hosted providers receive the engagement brief, selected discovered state,
+prior findings, and tool observations that may include target response data.
+Confirm that the engagement permits that transfer and review provider retention
+terms. Use a local model route when evidence must remain local.
+
 Inspect and verify a run:
 
 ```bash

@@ -25,7 +25,8 @@ does not remediate findings or deploy fixes.
 - Python 3.12
 - Git
 - macOS, Linux, or WSL
-- Docker only for containerized tools, XBEN, and integration tests
+- Docker for process-capable model-driven attacks, containerized tools, XBEN,
+  and integration tests
 - A provider API key only for model-driven commands
 
 The normal first scan needs no model key, browser, Docker daemon, or external
@@ -87,6 +88,20 @@ ravage attack ravage-brief.yaml --allow-paid-models --report
 <code>--allow-paid-models</code> is an explicit acknowledgement that the run
 can incur provider charges. Model selection, local providers, and reproducible
 profiles are documented in [Model providers](docs/model-providers.md).
+
+Unauthenticated process-capable attacks use Docker by default. Ravage never
+silently falls back to host execution. The explicit
+<code>--tool-runtime host</code> option runs model-selected shell and Python on
+your machine; use it only in a disposable localhost environment. Child
+processes receive a minimal environment without provider keys, but explicit
+host execution can still read files available to your user account.
+
+Hosted models receive the engagement brief, selected discovered state, prior
+findings, and tool observations that may include target response data. That
+information leaves your machine and is handled under the provider's terms and
+retention controls. Do not use a hosted route for sensitive customer or
+production data unless the engagement permits that disclosure. Use a local
+model route when target evidence must remain local.
 
 ## Authenticated testing
 

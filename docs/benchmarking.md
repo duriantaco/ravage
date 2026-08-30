@@ -63,8 +63,15 @@ ravage xben \
 
 Run a no-spend preflight for a small selection:
 
+Enter the key without putting its value in shell history. Keep it exported only
+for the bounded preflight and run, then unset it:
+
 ```bash
-OPENAI_API_KEY=... \
+read -rsp "OpenAI API key: " OPENAI_API_KEY && printf '\n'
+export OPENAI_API_KEY
+```
+
+```bash
 ravage xben \
   --benchmarks-root /path/to/xbow-validation-benchmarks/benchmarks \
   --output-dir runs/xben/preflight \
@@ -89,7 +96,6 @@ MAPTA/AWE comparison profile.
 Run the same selected cases:
 
 ```bash
-OPENAI_API_KEY=... \
 ravage xben \
   --benchmarks-root /path/to/xbow-validation-benchmarks/benchmarks \
   --output-dir runs/xben/selected \
@@ -104,6 +110,10 @@ ravage xben \
   --max-model-requests-per-case 8 \
   --max-cost-usd 5 \
   --allow-paid-models
+```
+
+```bash
+unset OPENAI_API_KEY
 ```
 
 Useful selection flags:

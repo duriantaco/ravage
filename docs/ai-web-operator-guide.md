@@ -254,9 +254,10 @@ ravage attack brief.yaml \
 The documented remote command uses native metered HTTP only. Whole-run low-noise
 mode disables bounded tool recon and all opaque process/browser-process schemas
 so every permitted target request shares the durable cap and sub-1-RPS pacing.
-Local attacks instead default to observe mode and `--tool-runtime host`; use
-`--tool-runtime auto` for local Docker fallback or `--tool-runtime docker` to
-require the image.
+Local attacks default to observe traffic mode and the Docker tool runtime.
+`--tool-runtime auto` is also Docker-only and never silently falls back to the
+host. `--tool-runtime host` is an explicit trusted-localhost opt-in that runs
+model-selected code with the operator's filesystem permissions.
 
 If the complete remote origin is authorized and the written ROE permits command,
 Python, scanner, or other process-backed work, prepare the tool image separately:
@@ -276,8 +277,8 @@ ravage attack brief.yaml \
   --report
 ```
 
-For a localhost run that deliberately uses Docker fallback, the corresponding
-tool-runtime selection is:
+For a localhost run that explicitly selects the Docker-only `auto` alias, the
+corresponding tool-runtime selection is:
 
 ```bash
 ravage attack examples/labs/ravage-acme-box/brief.yaml \
