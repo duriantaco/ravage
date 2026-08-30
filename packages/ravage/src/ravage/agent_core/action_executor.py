@@ -319,7 +319,7 @@ def execute_action(  # noqa: PLR0913
                     traffic_policy.to_reference() if traffic_policy is not None else None
                 ),
             )
-        result = _record_probe_result(
+        result = record_probe_result(
             probe_result.text,
             ok=probe_result.ok,
             kind="tool_run_probe",
@@ -336,7 +336,7 @@ def execute_action(  # noqa: PLR0913
             session_mode=session_mode,
             authentication=authentication,
         )
-        return _record_verified_probe_finding(
+        return record_verified_probe_findings(
             probe=probe,
             probe_text=probe_result.text,
             result=result,
@@ -433,7 +433,7 @@ def execute_action(  # noqa: PLR0913
             )
             validation_payload["session_mode"] = session_mode
             validation_text = json.dumps(validation_payload, indent=2, sort_keys=True)
-        result = _record_probe_result(
+        result = record_probe_result(
             validation_text,
             ok=validation_result.ok,
             kind="tool_validate_poc",
@@ -942,7 +942,7 @@ def _record_validated_finding(  # noqa: PLR0913
     )
 
 
-def _record_verified_probe_finding(  # noqa: C901, PLR0912, PLR0913
+def record_verified_probe_findings(  # noqa: C901, PLR0912, PLR0913
     *,
     probe: str,
     probe_text: str,
@@ -1056,6 +1056,12 @@ def _record_verified_probe_finding(  # noqa: C901, PLR0912, PLR0913
             engagement_id=engagement_id,
         )
     return current
+
+
+# Compatibility alias for existing internal consumers. New deterministic
+# runners should use the public shared recorder above instead of creating a
+# second finding-promotion path.
+_record_verified_probe_finding = record_verified_probe_findings
 
 
 def _raw_probe_finding(
@@ -2315,7 +2321,7 @@ def _tool_proof_text(result: ToolResult) -> str:
     return "\n".join(parts)
 
 
-def _record_probe_result(  # noqa: PLR0913
+def record_probe_result(  # noqa: PLR0913
     text: str,
     *,
     ok: bool,
@@ -2408,6 +2414,12 @@ def _record_probe_result(  # noqa: PLR0913
         evidence_observation=text,
         session_mode=session_mode,
     )
+
+
+# Compatibility alias for focused tests and older internal imports. Keeping a
+# single implementation makes probe provenance identical across agent and scan
+# entry points.
+_record_probe_result = record_probe_result
 
 
 def _ingest_probe_surface_graph(

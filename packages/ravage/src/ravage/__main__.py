@@ -26,14 +26,16 @@ from uuid import UUID, uuid4
 import yaml  # type: ignore[import-untyped]
 
 from ravage import authbench, cli_tool_check, cli_tools, package_version
+from ravage.agent_core.action_executor import (
+    record_probe_result,
+    record_verified_probe_findings,
+)
 from ravage.agent_core.agent_state import (
     AgentState,
     load_agent_state,
-    merge_signals,
     resolve_agent_state_path,
     save_agent_state,
 )
-from ravage.agent_core.agent_strategy import observation_digest
 from ravage.agent_core.ai_agent import (
     AIWebAgentSettings,
     route_has_paid_transport_risk,
@@ -46,7 +48,7 @@ from ravage.agent_core.autonomous_route_selection import (
     AUTONOMOUS_ROUTE_ENGINES,
     run_selected_autonomous_route,
 )
-from ravage.agent_core.observation_analysis import extract_signals
+from ravage.agent_core.surface_graph import SurfaceGraphState
 from ravage.agent_knowledge import describe_knowledge_pack
 from ravage.agent_knowledge.cli import handle_skills_command
 from ravage.auth import (
@@ -187,6 +189,8 @@ _MAX_RESULT_IDENTIFIER_CHARS = 64
 _MAX_SCAN_PROOF_SCAN_CHARS = 8_000_000
 _MAX_SCAN_PROOF_VALUE_CHARS = 650_000
 _MAX_SCAN_PROOF_NODES = 20_000
+_MAX_SCAN_OBSERVATION_CHARS = 10_000
+_MAX_SCAN_TRANSCRIPT_CHARS = 80_000
 
 _TOP_LEVEL_COMMANDS = (
     "attack",
@@ -2538,7 +2542,10 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
             "scope manifest could not be initialized"
         )
     audit = AuditStore(db_path, scope=brief.scope)
-    state = AgentState(summary="deterministic scan")
+    surface_graph = SurfaceGraphState.for_target(target_url)
+    state = AgentState(summary="deterministic scan", surface_graph=surface_graph)
+    state.surface["target_url"] = target_url
+    state.surface["origin"] = surface_graph.target_origin
     state.surface["scope_in_scope"] = list(brief.scope.in_scope)
     state.surface["scope_out_of_scope"] = list(brief.scope.out_of_scope)
     state.surface["scope_max_rps"] = brief.roe.max_rps
@@ -2569,7 +2576,8 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
     )
     workspace.record_event(kind="scan_started", payload=start_payload)
 
-    findings_count = 0
+    probe_observations_count = 0
+    confirmed_findings_count = 0
     observed_request_count = 0
     observed_http_response_count = 0
     transport_errors: list[str] = []
@@ -2664,7 +2672,7 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
                 error = str(request.get("error") or "").strip()
                 if error and error not in transport_errors:
                     transport_errors.append(error)
-            findings_count += len(result.findings)
+            probe_observations_count += len(result.findings)
             raw_payload = {
                 "probe": probe,
                 "ok": result.ok,
@@ -2684,14 +2692,39 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
             payload = _require_scan_payload(artifact_redactor.redact(raw_payload))
             text = json.dumps(payload, indent=2, sort_keys=True)
             safe_summary = artifact_redactor.redact_text(result.summary)
+            action_id = f"scan-{index:03d}-{probe}"
+            session_mode = (
+                f"identity:{parsed.identity}" if use_authenticated_session else "anonymous"
+            )
+            probe_result = record_probe_result(
+                text,
+                ok=result.ok,
+                kind="tool_run_probe",
+                state=state,
+                workspace=workspace,
+                audit=audit,
+                engagement_id=brief.engagement_id,
+                proof_recognition_enabled=False,
+                action_id=action_id,
+                repeat_count=1,
+                timed_out=False,
+                max_observation_chars=_MAX_SCAN_OBSERVATION_CHARS,
+                max_transcript_chars=_MAX_SCAN_TRANSCRIPT_CHARS,
+                session_mode=session_mode,
+                authentication=auth_owner,
+            )
+            scan_payload = dict(payload)
+            scan_payload["action_id"] = action_id
+            scan_payload["source_observation_id"] = str(
+                state.last_observation.get("observation_id") or ""
+            )
             audit.record(
                 engagement_id=brief.engagement_id,
                 actor="tool",
                 action="scan_probe",
-                payload=payload,
+                payload=scan_payload,
             )
-            workspace.record_event(kind="scan_probe", payload=payload)
-            workspace.record_transcript(role="tool", content=text)
+            workspace.record_event(kind="scan_probe", payload=scan_payload)
             state.turn = index
             state.actions.append(
                 {
@@ -2701,8 +2734,17 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
                     "summary": safe_summary,
                 }
             )
-            state.last_observation = observation_digest(text)
-            merge_signals(state, extract_signals(text))
+            record_verified_probe_findings(
+                probe=probe,
+                probe_text=text,
+                result=probe_result,
+                target_url=target_url,
+                state=state,
+                workspace=workspace,
+                audit=audit,
+                engagement_id=brief.engagement_id,
+                action_id=action_id,
+            )
             _capture_scan_proofs(
                 recognized_proofs,
                 state=state,
@@ -2726,6 +2768,10 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
             observed_responses=observed_http_response_count,
             transport_errors=transport_errors,
             redactor=artifact_redactor,
+        )
+        confirmed_findings_count = audit.count_findings(
+            status="confirmed",
+            engagement_id=brief.engagement_id,
         )
     except BaseException as exc:
         failure_payload: dict[str, object] = {
@@ -2804,7 +2850,8 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
         "identity": parsed.identity or "",
         "probes_run": len(selected_probes),
         "skipped_authenticated_probes": skipped_authenticated_probes,
-        "findings_count": findings_count,
+        "probe_observations_count": probe_observations_count,
+        "confirmed_findings_count": confirmed_findings_count,
         "traffic_requests": traffic_requests,
         "traffic_contracts": traffic_contracts,
         "traffic_recorder_errors": traffic_recorder_errors,
