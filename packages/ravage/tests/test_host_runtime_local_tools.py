@@ -44,3 +44,43 @@ def test_host_runtime_executes_project_local_tool_from_temporary_workdir(
 
     assert result.ok is True
     assert result.stdout == "project-local tool ran\n"
+
+
+def test_host_runtime_scrubs_parent_secrets_from_shell_and_python(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-openai-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-anthropic-secret")
+    monkeypatch.setenv("RAVAGE_ARBITRARY_PARENT_SECRET", "fake-parent-secret")
+    runtime = ExternalToolRuntime()
+    try:
+        shell = runtime.run_command(
+            command=(
+                "printf '%s|%s|%s|%s' "
+                '"${OPENAI_API_KEY-unset}" "${ANTHROPIC_API_KEY-unset}" '
+                '"${RAVAGE_ARBITRARY_PARENT_SECRET-unset}" "$RAVAGE_TARGET_URL"'
+            ),
+            target_url="http://127.0.0.1:8765",
+        )
+        python = runtime.run_python(
+            code=(
+                "import os\n"
+                "keys = ('OPENAI_API_KEY', 'ANTHROPIC_API_KEY', "
+                "'RAVAGE_ARBITRARY_PARENT_SECRET')\n"
+                "print('|'.join(os.environ.get(key, 'unset') for key in keys))\n"
+                "print(os.environ['RAVAGE_TARGET_URL'])\n"
+                "print(os.environ['HOME'])\n"
+            ),
+            target_url="http://127.0.0.1:8765",
+        )
+    finally:
+        runtime.close()
+
+    assert shell.ok is True
+    assert shell.stdout == "unset|unset|unset|http://127.0.0.1:8765"
+    assert python.ok is True
+    assert python.stdout.splitlines() == [
+        "unset|unset|unset",
+        "http://127.0.0.1:8765",
+        str(runtime.workdir),
+    ]

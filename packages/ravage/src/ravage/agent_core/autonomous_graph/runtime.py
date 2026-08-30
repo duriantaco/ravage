@@ -20,6 +20,7 @@ from ravage.runtime.common import (
     assert_http_url,
     assert_local_url,
     assert_tool_target_url,
+    child_process_environment,
     safe_command,
 )
 from ravage.runtime.scoped_network import ScopedDockerNetwork
@@ -755,10 +756,13 @@ class HostGraphProcessBackend:
         return self.workspace
 
     def process_env(self) -> Mapping[str, str]:
-        env = dict(os.environ)
-        env["RAVAGE_TARGET_URL"] = self._target_url
-        env["PYTHONUNBUFFERED"] = "1"
-        return env
+        return child_process_environment(
+            home=self.workspace,
+            overrides={
+                "RAVAGE_TARGET_URL": self._target_url,
+                "PYTHONUNBUFFERED": "1",
+            },
+        )
 
     def close(self) -> dict[str, object]:
         return {
