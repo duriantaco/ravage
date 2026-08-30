@@ -150,7 +150,6 @@ _BINDING_TAMPERS = {
     "cohort": "control",
     "repeat": 2,
     "execution_kind": "fixture",
-    "evaluation_side": "champion",
     "is_control": True,
     "expected_vulnerability_count": 4,
     "run_id": _digest("c"),
@@ -169,6 +168,16 @@ def test_every_execution_binding_substitution_breaks_the_signature(
     signed, _private, public = _signed()
     payload = deepcopy(signed.to_json())
     payload["binding"][field] = replacement  # type: ignore[index]
+
+    with pytest.raises(ExecutionAttestationError, match="signature verification"):
+        verify_signed_execution_envelope(payload, public_key=public)
+
+
+def test_campaign_scoped_champion_side_is_signed() -> None:
+    signed, _private, public = _signed()
+    payload = deepcopy(signed.to_json())
+    payload["binding"]["evaluation_side"] = "champion"  # type: ignore[index]
+    payload["binding"]["candidate_id"] = None  # type: ignore[index]
 
     with pytest.raises(ExecutionAttestationError, match="signature verification"):
         verify_signed_execution_envelope(payload, public_key=public)
@@ -274,10 +283,16 @@ def test_artifact_case_path_must_be_normalized_relative_posix(path: str) -> None
 
 
 def test_evaluation_side_is_explicit_and_bounded() -> None:
-    assert replace(_binding(), evaluation_side="champion").evaluation_side == "champion"
+    champion = replace(_binding(), evaluation_side="champion", candidate_id=None)
+    assert champion.evaluation_side == "champion"
+    assert champion.candidate_id is None
 
     with pytest.raises(ExecutionAttestationError, match="evaluation_side"):
         replace(_binding(), evaluation_side="baseline")
+    with pytest.raises(ExecutionAttestationError, match="campaign-scoped"):
+        replace(_binding(), evaluation_side="champion")
+    with pytest.raises(ExecutionAttestationError, match="candidate execution identity"):
+        replace(_binding(), candidate_id=None)
 
 
 def test_types_bounds_accounting_and_verdict_identity_fail_closed() -> None:

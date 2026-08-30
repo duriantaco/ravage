@@ -144,7 +144,7 @@ def _execution_envelope(  # noqa: PLR0913 - execution identity is deliberately e
     candidate_patch = str(candidate["patch_object"])
     binding = ExecutionBinding(
         campaign_id=str(campaign["campaign_id"]),
-        candidate_id=candidate_id,
+        candidate_id=None if side == "champion" else candidate_id,
         candidate_tree_digest=(
             str(campaign["champion_tree"])
             if side == "champion"

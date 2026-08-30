@@ -83,7 +83,7 @@ class ExecutionBinding:
     """Evaluator-owned identities that pin one exact external execution."""
 
     campaign_id: str
-    candidate_id: str
+    candidate_id: str | None
     candidate_tree_digest: str
     candidate_content_digest: str
     evaluation_suite_object: str
@@ -111,11 +111,7 @@ class ExecutionBinding:
             or not self.campaign_id.startswith("campaign_")
         ):
             raise ExecutionAttestationError("execution campaign identity is invalid")
-        if (
-            _ID_RE.fullmatch(self.candidate_id) is None
-            or not self.candidate_id.startswith("candidate_")
-        ):
-            raise ExecutionAttestationError("execution candidate identity is invalid")
+        _validate_execution_subject(self.evaluation_side, self.candidate_id)
         if _GIT_TREE_RE.fullmatch(self.candidate_tree_digest) is None:
             raise ExecutionAttestationError("execution candidate tree digest is invalid")
         for label, value in (
@@ -140,10 +136,6 @@ class ExecutionBinding:
         _validate_int(self.repeat, "repeat", minimum=1, maximum=_MAX_REPEAT)
         if self.execution_kind not in _EXECUTION_KINDS:
             raise ExecutionAttestationError("execution kind must be fixture or live")
-        if self.evaluation_side not in _EVALUATION_SIDES:
-            raise ExecutionAttestationError(
-                "evaluation_side must be champion or candidate"
-            )
         if not isinstance(self.is_control, bool):
             raise ExecutionAttestationError("is_control must be a boolean")
         _validate_optional_int(
@@ -215,7 +207,11 @@ class ExecutionBinding:
             raise ExecutionAttestationError("execution binding schema is unsupported")
         return cls(
             campaign_id=_text(payload["campaign_id"], "campaign_id"),
-            candidate_id=_text(payload["candidate_id"], "candidate_id"),
+            candidate_id=(
+                None
+                if payload["candidate_id"] is None
+                else _text(payload["candidate_id"], "candidate_id")
+            ),
             candidate_tree_digest=_text(
                 payload["candidate_tree_digest"], "candidate_tree_digest"
             ),
@@ -643,6 +639,22 @@ def _validate_finding_verdicts(
     if digests != tuple(sorted(digests)):
         raise ExecutionAttestationError("finding verdicts must use canonical digest order")
     return verdicts
+
+
+def _validate_execution_subject(side: object, candidate_id: object) -> None:
+    if side not in _EVALUATION_SIDES:
+        raise ExecutionAttestationError(
+            "evaluation_side must be champion or candidate"
+        )
+    if side == "candidate":
+        if (
+            not isinstance(candidate_id, str)
+            or _ID_RE.fullmatch(candidate_id) is None
+            or not candidate_id.startswith("candidate_")
+        ):
+            raise ExecutionAttestationError("candidate execution identity is invalid")
+    elif candidate_id is not None:
+        raise ExecutionAttestationError("champion execution must be campaign-scoped")
 
 
 def _validate_artifact_case_path(value: object) -> None:

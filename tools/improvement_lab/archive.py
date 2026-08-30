@@ -785,9 +785,10 @@ class LabArchive:
         campaign = self._load_manifest("campaigns", str(candidate["campaign_id"]))
         suite = self.campaign_evaluation_suite(candidate_id)
         binding = signed.binding
+        expected_subject = candidate_id if binding.evaluation_side == "candidate" else None
         if (
             binding.campaign_id != candidate["campaign_id"]
-            or binding.candidate_id != candidate_id
+            or binding.candidate_id != expected_subject
             or binding.evaluation_suite_object != campaign["evaluation_suite_object"]
             or binding.trusted_tests_digest != suite.trusted_tests_digest
             or binding.runner_image != campaign["runner_image"]
