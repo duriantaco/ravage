@@ -3,7 +3,11 @@ from __future__ import annotations
 import json
 
 from ravage.agent_core.agent_state import AgentState
-from ravage.agent_core.agent_tasks import active_tasks_for_prompt, refresh_mission_board, update_mission_from_action
+from ravage.agent_core.agent_tasks import (
+    active_tasks_for_prompt,
+    refresh_mission_board,
+    update_mission_from_action,
+)
 
 
 def test_empty_secret_sweep_blocks_after_two_attempts() -> None:
@@ -101,6 +105,65 @@ def test_confirmed_data_query_signal_stays_active_after_inconclusive_probe() -> 
 
     assert state.tasks[0]["status"] == "in_progress"
     assert active_tasks_for_prompt(state, limit=1)[0]["id"] == "data-query"
+
+
+def test_confirmed_finding_keeps_proof_oriented_task_open_until_proof() -> None:
+    for continue_after_proof in (False, True):
+        state = AgentState()
+        state.surface = {
+            "flag_objective": True,
+            "continue_after_proof": continue_after_proof,
+        }
+        state.tasks = [_task("data-query", priority=90)]
+        action = {
+            "action": "run_probe",
+            "task_id": "data-query",
+            "probe": "sqli_differential",
+        }
+
+        update_mission_from_action(
+            state,
+            action=action,
+            outcome={"outcome": "finding_confirmed", "observation": "confirmed SQLi"},
+        )
+
+        assert state.tasks[0]["status"] == "in_progress"
+
+        update_mission_from_action(
+            state,
+            action={
+                "action": "capture_flag",
+                "task_id": "data-query",
+            },
+            outcome={"outcome": "same_as_before", "observation": "proof already captured"},
+        )
+
+        assert state.tasks[0]["status"] == "in_progress"
+
+        update_mission_from_action(
+            state,
+            action={**action, "probe": "sqli_exploit"},
+            outcome={"outcome": "flag_candidate", "observation": "proof captured"},
+        )
+
+        assert state.tasks[0]["status"] == "done"
+
+
+def test_confirmed_finding_completes_non_proof_assessment_task() -> None:
+    state = AgentState(surface={"flag_objective": False})
+    state.tasks = [_task("data-query", priority=90)]
+
+    update_mission_from_action(
+        state,
+        action={
+            "action": "run_probe",
+            "task_id": "data-query",
+            "probe": "sqli_differential",
+        },
+        outcome={"outcome": "finding_confirmed", "observation": "confirmed SQLi"},
+    )
+
+    assert state.tasks[0]["status"] == "done"
 
 
 def test_generic_form_prioritizes_input_reflection_before_data_query() -> None:

@@ -122,7 +122,6 @@ def update_mission_from_action(
     _record_task_evidence(task, action=action, result=result, observation=observation)
     task["status"] = _status_after_action(
         task=task,
-        action=action,
         result=result,
         attempts=attempts,
         observation=observation,
@@ -169,7 +168,6 @@ def _record_task_evidence(
 def _status_after_action(
     *,
     task: dict[str, object],
-    action: Mapping[str, object],
     result: str,
     attempts: int,
     observation: str,
@@ -178,7 +176,7 @@ def _status_after_action(
     current_status = _status(task.get("status"))
     task_id = str(task.get("id") or "")
 
-    if _action_completed_task(action=action, result=result):
+    if _action_completed_task(state=state, result=result):
         return "done"
     if _flag_sweep_has_gone_stale(task_id=task_id, result=result, attempts=attempts):
         return "blocked"
@@ -202,10 +200,16 @@ def _status_after_action(
     return current_status
 
 
-def _action_completed_task(*, action: Mapping[str, object], result: str) -> bool:
-    if result in {"finding_confirmed", "flag_candidate"}:
+def _action_completed_task(
+    *,
+    state: AgentState,
+    result: str,
+) -> bool:
+    if result == "flag_candidate":
         return True
-    return action.get("action") == "capture_flag"
+    if result == "finding_confirmed":
+        return not _flag_objective_enabled(state.surface)
+    return False
 
 
 def _flag_sweep_has_gone_stale(*, task_id: str, result: str, attempts: int) -> bool:

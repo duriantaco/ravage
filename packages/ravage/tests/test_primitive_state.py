@@ -112,6 +112,195 @@ def test_captured_flag_clears_lock() -> None:
     assert derive_primitives(state)  # still derivable, but not a live lock
 
 
+def test_unrelated_captured_flag_keeps_sql_lock_in_multi_proof_run() -> None:
+    state = AgentState(
+        turn=4,
+        flags=["FLAG{unrelated}"],
+        actions=[
+            {
+                "action": "run_probe",
+                "probe": "idor_boundary",
+                "outcome": "flag_candidate",
+            }
+        ],
+        surface={"continue_after_proof": True},
+    )
+    _confirm(state, "sql_injection_error_signal", input="id")
+
+    assert promote_primitives(state) == ["sqli_confirmed"]
+    assert locked_primitive(state) == "sqli_confirmed"
+    assert locked_probe(state) == "sqli_exploit"
+    assert routed_probes(state)["sqli_exploit"] == LOCKED_PROBE_SCORE
+
+
+def test_matching_specialist_proof_closes_only_its_multi_proof_primitive() -> None:
+    state = AgentState(
+        turn=5,
+        flags=["FLAG{unrelated}", "FLAG{sql}"],
+        attempts=[
+            {
+                "selected_action": {
+                    "action": "run_probe",
+                    "probe": "sqli_differential",
+                    "task_id": "data-query",
+                },
+                "state_delta": {"flags_delta": 1},
+                "turn": 5,
+            }
+        ],
+        surface={"continue_after_proof": True},
+    )
+    _confirm(state, "sql_injection_error_signal", input="id")
+    _confirm(state, "ssrf_boundary_signal", input="url")
+
+    assert promote_primitives(state) == ["sqli_confirmed", "ssrf_confirmed"]
+    assert locked_primitive(state) == "ssrf_confirmed"
+    assert locked_probe(state) == "ssrf_boundary"
+
+
+def test_replayed_known_proof_does_not_close_multi_proof_primitive() -> None:
+    state = AgentState(
+        turn=5,
+        flags=["FLAG{sql}"],
+        surface={"continue_after_proof": True},
+    )
+    _confirm(state, "sql_injection_error_signal", input="id")
+    assert promote_primitives(state) == ["sqli_confirmed"]
+    state.attempts.append(
+        {
+            "turn": 6,
+            "selected_action": {
+                "action": "run_probe",
+                "probe": "sqli_exploit",
+                "task_id": "data-query",
+            },
+            "outcome": {"classification": "flag_candidate"},
+            "state_delta": {"flags_delta": 0},
+        }
+    )
+
+    assert locked_primitive(state) == "sqli_confirmed"
+    assert locked_probe(state) == "sqli_exploit"
+
+
+def test_novel_explicit_capture_closes_matching_preceding_probe_branch() -> None:
+    state = AgentState(
+        turn=5,
+        flags=["FLAG{unrelated}", "FLAG{sql}"],
+        surface={"continue_after_proof": True},
+    )
+    _confirm(state, "sql_injection_error_signal", input="id")
+    assert promote_primitives(state) == ["sqli_confirmed"]
+    state.attempts.extend(
+        [
+            {
+                "turn": 5,
+                "selected_action": {
+                    "action": "run_probe",
+                    "probe": "sqli_differential",
+                    "task_id": "data-query",
+                },
+                "outcome": {"ok": True, "classification": "confirmed_signal"},
+                "state_delta": {"flags_delta": 0},
+            },
+            {
+                "turn": 6,
+                "selected_action": {
+                    "action": "capture_flag",
+                    "task_id": "data-query",
+                },
+                "outcome": {"ok": True, "classification": "flag_candidate"},
+                "state_delta": {"flags_delta": 1},
+            },
+        ]
+    )
+
+    assert locked_primitive(state) is None
+    assert locked_probe(state) is None
+
+
+def test_novel_explicit_capture_does_not_close_by_task_id_alone() -> None:
+    state = AgentState(
+        turn=5,
+        flags=["FLAG{unrelated}", "FLAG{other}"],
+        surface={"continue_after_proof": True},
+    )
+    _confirm(state, "sql_injection_error_signal", input="id")
+    assert promote_primitives(state) == ["sqli_confirmed"]
+    state.attempts.extend(
+        [
+            {
+                "turn": 5,
+                "selected_action": {
+                    "action": "run_probe",
+                    "probe": "xss_context",
+                    "task_id": "data-query",
+                },
+                "outcome": {"ok": True, "classification": "confirmed_signal"},
+                "state_delta": {"flags_delta": 0},
+            },
+            {
+                "turn": 6,
+                "selected_action": {
+                    "action": "capture_flag",
+                    "task_id": "data-query",
+                },
+                "outcome": {"ok": True, "classification": "flag_candidate"},
+                "state_delta": {"flags_delta": 1},
+            },
+        ]
+    )
+
+    assert locked_primitive(state) == "sqli_confirmed"
+    assert locked_probe(state) == "sqli_exploit"
+
+
+def test_novel_explicit_capture_uses_the_nearest_evidence_action() -> None:
+    state = AgentState(
+        turn=5,
+        flags=["FLAG{unrelated}", "FLAG{command}"],
+        surface={"continue_after_proof": True},
+    )
+    _confirm(state, "sql_injection_error_signal", input="id")
+    assert promote_primitives(state) == ["sqli_confirmed"]
+    state.attempts.extend(
+        [
+            {
+                "turn": 5,
+                "selected_action": {
+                    "action": "run_probe",
+                    "probe": "sqli_differential",
+                    "task_id": "data-query",
+                },
+                "outcome": {"ok": True, "classification": "confirmed_signal"},
+                "state_delta": {"flags_delta": 0},
+            },
+            {
+                "turn": 6,
+                "selected_action": {
+                    "action": "run_command",
+                    "command": "bounded custom follow-up",
+                    "task_id": "data-query",
+                },
+                "outcome": {"ok": True, "classification": "observed"},
+                "state_delta": {"flags_delta": 0},
+            },
+            {
+                "turn": 7,
+                "selected_action": {
+                    "action": "capture_flag",
+                    "task_id": "data-query",
+                },
+                "outcome": {"ok": True, "classification": "flag_candidate"},
+                "state_delta": {"flags_delta": 1},
+            },
+        ]
+    )
+
+    assert locked_primitive(state) == "sqli_confirmed"
+    assert locked_probe(state) == "sqli_exploit"
+
+
 def test_budget_directive_escalates_when_primitive_goes_stale() -> None:
     state = AgentState(turn=3)
     _confirm(state, "sql_injection_error_signal", input="id")

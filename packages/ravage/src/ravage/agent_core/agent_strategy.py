@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from hashlib import sha256
 from typing import Any
 
 
@@ -30,12 +32,19 @@ class ActionLedger:
 
     def remember(self, action: Mapping[str, object], *, context: str = "") -> int:
         fingerprint = action_fingerprint(action, context=context)
-        count = self.fingerprints.get(fingerprint, 0) + 1
+        count = self.count(action, context=context) + 1
         self.fingerprints[fingerprint] = count
         return count
 
     def repeated(self, action: Mapping[str, object], *, context: str = "") -> bool:
-        return self.fingerprints.get(action_fingerprint(action, context=context), 0) > 0
+        return self.count(action, context=context) > 0
+
+    def count(self, action: Mapping[str, object], *, context: str = "") -> int:
+        fingerprints = (
+            action_fingerprint(action, context=context),
+            _legacy_action_fingerprint(action, context=context),
+        )
+        return max(self.fingerprints.get(item, 0) for item in fingerprints)
 
     def to_json(self) -> dict[str, int]:
         return dict(sorted(self.fingerprints.items()))
@@ -187,6 +196,81 @@ def action_fingerprint(action: Mapping[str, object], *, context: str = "") -> st
     elif kind == "run_probe":
         body = str(action.get("probe") or "")
     elif kind == "validate_poc":
+        # Only canonical dispatch material can cause physical requests. Mutable
+        # expectations and report prose cannot disguise a third replay.
+        body = json.dumps(
+            _validate_poc_dispatch_steps(action.get("steps")),
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    else:
+        body = str(action)
+    normalized = body if kind == "validate_poc" else re.sub(r"\s+", " ", body.strip())
+    normalized = re.sub(r"ravage-[a-z0-9_:-]+", "ravage-*", normalized, flags=re.I)
+    material_digest = sha256(normalized.encode("utf-8")).hexdigest()
+
+    if context:
+        suffix = f"|ctx:{context}"
+    else:
+        suffix = ""
+    return f"{kind}:sha256:{material_digest}{suffix}"
+
+
+def _validate_poc_dispatch_steps(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    dispatch_steps: list[dict[str, object]] = []
+    for raw_step in value[:12]:
+        if not isinstance(raw_step, dict):
+            continue
+        headers = _fingerprint_header_dict(raw_step.get("headers"))
+        form = _fingerprint_string_dict(raw_step.get("form"))
+        if form:
+            method = "POST"
+            body: str | None = None
+            headers = {
+                "content-type": "application/x-www-form-urlencoded",
+                **headers,
+            }
+        else:
+            method = str(raw_step.get("method") or "GET").upper()
+            raw_body = raw_step.get("body")
+            body = None if raw_body is None else str(raw_body)
+        dispatch_steps.append(
+            {
+                "method": method,
+                "url": str(raw_step.get("url") or ""),
+                "headers": headers,
+                "form": form,
+                "body": body,
+            }
+        )
+    return dispatch_steps
+
+
+def _fingerprint_string_dict(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(key): str(item) for key, item in value.items()}
+
+
+def _fingerprint_header_dict(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(key).casefold(): str(item) for key, item in value.items()}
+
+
+def _legacy_action_fingerprint(action: Mapping[str, object], *, context: str = "") -> str:
+    """Read pre-digest ledger entries so resumed runs keep their physical cap."""
+    kind = str(action.get("action") or "")
+    if kind == "run_command":
+        body = str(action.get("command") or "")
+    elif kind == "run_python":
+        body = str(action.get("code") or "")
+    elif kind == "run_probe":
+        body = str(action.get("probe") or "")
+    elif kind == "validate_poc":
         body = str(
             {
                 "steps": action.get("steps") or [],
@@ -197,11 +281,7 @@ def action_fingerprint(action: Mapping[str, object], *, context: str = "") -> st
         body = str(action)
     normalized = re.sub(r"\s+", " ", body.strip())
     normalized = re.sub(r"ravage-[a-z0-9_:-]+", "ravage-*", normalized, flags=re.I)
- 
-    if context:
-        suffix = f"|ctx:{context}"
-    else:
-        suffix = ""
+    suffix = f"|ctx:{context}" if context else ""
     return f"{kind}:{normalized[:500]}{suffix}"
 
 

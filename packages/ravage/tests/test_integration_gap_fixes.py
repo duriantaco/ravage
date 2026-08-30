@@ -6,7 +6,11 @@ import pytest
 from ravage.agent_core.action_executor import _command_timeout
 from ravage.agent_core.agent_state import AgentState
 from ravage.agent_core.agent_strategy import ActionLedger, action_fingerprint
-from ravage.agent_core.ai_agent import _model_action, _repeat_context
+from ravage.agent_core.ai_agent import (
+    _model_action,
+    _repeat_context,
+    _would_hit_repeat_guard,
+)
 from ravage.agent_core.primitive_state import promote_primitives
 
 
@@ -24,6 +28,72 @@ def test_action_fingerprint_changes_with_context() -> None:
     assert action_fingerprint(action, context="host:localhost") == action_fingerprint(
         action, context="host:localhost"
     )
+
+
+def test_validate_poc_fingerprint_uses_only_canonical_execution_steps() -> None:
+    first = {
+        "action": "validate_poc",
+        "steps": [
+            {
+                "method": "POST",
+                "url": "/search",
+                "headers": {"content-type": "application/json", "x-test": "one"},
+                "body": '{"query":"safe"}',
+                "expect_contains": "first response marker",
+            }
+        ],
+        "finding": {"hypothesis": "first prose"},
+    }
+    equivalent = {
+        "action": "validate_poc",
+        "steps": [
+            {
+                "body": '{"query":"safe"}',
+                "headers": {"X-Test": "one", "Content-Type": "application/json"},
+                "url": "/search",
+                "method": "POST",
+                "expect_contains": "rewritten non-dispatch expectation",
+            }
+        ],
+        "finding": {"hypothesis": "rewritten non-dispatch prose"},
+    }
+    changed_request = {
+        **equivalent,
+        "steps": [{**equivalent["steps"][0], "url": "/other-search"}],
+    }
+
+    assert action_fingerprint(first) == action_fingerprint(equivalent)
+    assert action_fingerprint(first) != action_fingerprint(changed_request)
+    ledger = ActionLedger()
+    assert ledger.remember(first) == 1
+    assert ledger.remember(equivalent) == 2
+    assert ledger.count(first) == 2
+
+    changed_body = {
+        **equivalent,
+        "steps": [{**equivalent["steps"][0], "body": '{"query":"safe  value"}'}],
+    }
+    assert action_fingerprint(first) != action_fingerprint(changed_body)
+
+
+def test_action_fingerprint_hashes_material_beyond_the_old_prefix_limit() -> None:
+    shared_prefix = "x" * 600
+    first = {"action": "run_command", "command": f"{shared_prefix} first"}
+    second = {"action": "run_command", "command": f"{shared_prefix} second"}
+
+    assert action_fingerprint(first) != action_fingerprint(second)
+    assert shared_prefix not in action_fingerprint(first)
+
+
+def test_repeat_guard_honors_a_legacy_fingerprint_after_state_round_trip() -> None:
+    action = {"action": "run_probe", "probe": "cms_exposure"}
+    original = AgentState()
+    original.ledger.fingerprints["run_probe:cms_exposure"] = 2
+
+    restored = AgentState.from_json(original.to_json())
+
+    assert restored.ledger.count(action) == 2
+    assert _would_hit_repeat_guard(restored, action)
 
 
 def test_repeat_context_reflects_canonical_host() -> None:
@@ -59,6 +129,55 @@ def test_locked_primitive_overrides_custom_model_loop() -> None:
     assert action["action"] == "run_probe"
     assert action["probe"] == "sqli_exploit"
     assert action["task_id"] == "data-query"
+
+
+def test_multi_proof_sql_lock_survives_unrelated_captured_proof() -> None:
+    state = AgentState(
+        turn=5,
+        flags=["FLAG{unrelated}"],
+        actions=[
+            {
+                "action": "run_probe",
+                "probe": "idor_boundary",
+                "outcome": "flag_candidate",
+            }
+        ],
+        surface={"continue_after_proof": True},
+    )
+    state.signals["markers"] = ["sql_injection_error_signal"]
+    promote_primitives(state)
+
+    action = _model_action(
+        '{"action":"run_probe","task_id":"input-reflection","probe":"xss_context"}',
+        state=state,
+        turn=5,
+        max_turns=40,
+    )
+
+    assert action["action"] == "run_probe"
+    assert action["probe"] == "sqli_exploit"
+    assert action["task_id"] == "data-query"
+
+
+def test_multi_proof_tier_one_route_survives_unrelated_captured_proof() -> None:
+    state = AgentState(
+        turn=5,
+        flags=["FLAG{unrelated}"],
+        surface={"continue_after_proof": True},
+    )
+    state.signals["markers"] = ["jwt_observed"]
+    promote_primitives(state)
+
+    action = _model_action(
+        '{"action":"run_probe","task_id":"input-reflection","probe":"xss_context"}',
+        state=state,
+        turn=5,
+        max_turns=40,
+    )
+
+    assert action["action"] == "run_probe"
+    assert action["probe"] == "jwt_exploit"
+    assert action["task_id"] == "api-behavior"
 
 
 def test_locked_primitive_override_stops_after_two_specialist_attempts() -> None:

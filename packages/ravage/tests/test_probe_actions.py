@@ -11,6 +11,7 @@ from pentest_schemas import Scope
 from ravage.agent_core.action_executor import ActionResult, _clip_probe_text, execute_action
 from ravage.agent_core.action_parser import parse_action
 from ravage.agent_core.agent_state import AgentState
+from ravage.agent_core.agent_strategy import observation_digest
 from ravage.agent_core.surface_graph import SurfaceGraphState
 from ravage.agent_core.surface_graph_ingest import (
     SURFACE_OBSERVATION_BATCH_SCHEMA,
@@ -971,6 +972,49 @@ def test_terminal_proof_recognition_is_benchmark_gated(
     assert capsys.readouterr().out == ""
 
 
+def test_process_output_admits_only_one_proof_per_observation(tmp_path: Path) -> None:
+    class TwoProofRuntime(_ProofRuntime):
+        def run_command(
+            self,
+            *,
+            command: str,
+            target_url: str,
+            timeout_seconds: int | None = None,
+        ) -> ToolResult:
+            del command, target_url, timeout_seconds
+            return ToolResult(
+                ok=True,
+                tool="command",
+                command=("sh", "-lc", "echo proof"),
+                exit_code=0,
+                stdout="flag{process_one} flag{process_two}",
+                stderr="",
+            )
+
+    state = AgentState()
+    audit = AuditStore(tmp_path / "audit.db")
+    try:
+        outcome = execute_action(
+            {"action": "run_command", "task_id": "surface-map", "command": "echo proof"},
+            target_url="http://127.0.0.1/",
+            runtime=TwoProofRuntime(),
+            state=state,
+            workspace=AgentWorkspace.open(tmp_path / "workspace"),
+            audit=audit,
+            engagement_id=uuid4(),
+            repeat_count=1,
+            max_observation_chars=2000,
+            max_transcript_chars=4000,
+            proof_recognition_enabled=True,
+        )
+    finally:
+        audit.close()
+
+    assert outcome.flag == "flag{process_one}"
+    assert state.flags == ["flag{process_one}"]
+    assert state.last_observation["recognized_proofs"] == ["flag{process_one}"]
+
+
 def test_long_tool_action_result_preserves_stdout_head_and_tail(tmp_path: Path) -> None:
     class LongOutputRuntime(_ProofRuntime):
         def run_command(
@@ -1256,7 +1300,9 @@ def test_capture_flag_accepts_observed_proof(
     state = AgentState()
     state.last_observation = {
         "snippet": "target response contained flag{observed_capture_proof}",
+        "observation_id": "target-observation-1",
         "source_kind": "tool_run_probe",
+        "recognized_proofs": ["flag{observed_capture_proof}"],
     }
     audit = AuditStore(tmp_path / "audit.db")
     workspace = AgentWorkspace.open(tmp_path / "workspace")
@@ -1292,6 +1338,89 @@ def test_capture_flag_accepts_observed_proof(
     captured = next(event for event in events if event["kind"] == "flag_captured")
     assert captured["payload"]["action_id"] == "capture-observed"
     assert capsys.readouterr().out == ""
+
+
+def test_rejected_capture_cannot_seed_its_own_evidence(tmp_path: Path) -> None:
+    proof = "flag{model_authored_guess}"
+    state = AgentState()
+    workspace = AgentWorkspace.open(tmp_path / "workspace")
+    audit = AuditStore(tmp_path / "audit.db")
+    action = {
+        "action": "capture_flag",
+        "task_id": "stateful-session",
+        "flag": proof,
+        "evidence": "model claim",
+    }
+    try:
+        first = execute_action(
+            action,
+            target_url="http://127.0.0.1/",
+            runtime=_ProofRuntime(),
+            state=state,
+            workspace=workspace,
+            audit=audit,
+            engagement_id=uuid4(),
+            repeat_count=1,
+            max_observation_chars=2000,
+            max_transcript_chars=4000,
+        )
+        state.last_observation = observation_digest(first.observation)
+        second = execute_action(
+            action,
+            target_url="http://127.0.0.1/",
+            runtime=_ProofRuntime(),
+            state=state,
+            workspace=workspace,
+            audit=audit,
+            engagement_id=uuid4(),
+            repeat_count=2,
+            max_observation_chars=2000,
+            max_transcript_chars=4000,
+        )
+    finally:
+        audit.close()
+
+    assert first.outcome == "blocked"
+    assert second.outcome == "blocked"
+    assert state.flags == []
+
+
+def test_capture_flag_treats_known_proof_as_non_material(tmp_path: Path) -> None:
+    proof = "flag{observed_capture_proof}"
+    state = AgentState(flags=[proof])
+    events: list[dict[str, object]] = []
+    workspace = AgentWorkspace.open(tmp_path / "workspace", event_sink=events.append)
+    audit = AuditStore(tmp_path / "audit.db")
+    try:
+        outcome = execute_action(
+            {
+                "action": "capture_flag",
+                "task_id": "stateful-session",
+                "flag": proof,
+                "evidence": "copied from an earlier target response",
+            },
+            target_url="http://127.0.0.1/",
+            runtime=_ProofRuntime(),
+            state=state,
+            workspace=workspace,
+            audit=audit,
+            engagement_id=uuid4(),
+            repeat_count=1,
+            max_observation_chars=2000,
+            max_transcript_chars=4000,
+            action_id="capture-duplicate",
+        )
+    finally:
+        audit.close()
+
+    assert outcome.ok is True
+    assert outcome.stop is False
+    assert outcome.outcome == "same_as_before"
+    assert outcome.flag == ""
+    assert state.flags == [proof]
+    assert not any(event["kind"] == "flag_captured" for event in events)
+    duplicate = next(event for event in events if event["kind"] == "flag_capture_duplicate")
+    assert duplicate["payload"]["action_id"] == "capture-duplicate"
 
 
 def test_capture_flag_rejects_unobserved_proof_shaped_guess(tmp_path: Path) -> None:
@@ -1432,6 +1561,155 @@ def test_builtin_probe_output_auto_captures_when_benchmark_gated(
     assert isinstance(payload, dict)
     assert payload["action_id"] == "probe-auto-capture"
     assert payload["flag_record_path"] == str(workspace.events_path)
+
+
+def test_builtin_probe_auto_captures_all_novel_proofs_from_one_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_probe_runner(monkeypatch, _probe_runner_with_two_proofs)
+    events: list[dict[str, object]] = []
+    state = AgentState()
+    workspace = AgentWorkspace.open(tmp_path / "workspace", event_sink=events.append)
+    audit = AuditStore(tmp_path / "audit.db")
+    try:
+        outcome = execute_action(
+            {
+                "action": "run_probe",
+                "task_id": "data-query",
+                "probe": "sqli_differential",
+            },
+            target_url="http://127.0.0.1/",
+            runtime=_ProofRuntime(),
+            state=state,
+            workspace=workspace,
+            audit=audit,
+            engagement_id=uuid4(),
+            repeat_count=1,
+            max_observation_chars=2000,
+            max_transcript_chars=4000,
+            proof_recognition_enabled=True,
+            action_id="probe-two-proofs",
+        )
+    finally:
+        audit.close()
+
+    assert outcome.outcome == "flag_candidate"
+    assert len(state.flags) == 2
+    captured = [event for event in events if event["kind"] == "flag_captured"]
+    assert len(captured) == 2
+    assert {event["payload"]["action_id"] for event in captured} == {"probe-two-proofs"}
+
+
+def test_broad_probe_fallback_prefers_a_novel_proof_after_a_known_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_probe_runner(monkeypatch, _probe_runner_with_known_then_novel_proof)
+    state = AgentState(flags=["flag{known_first}"])
+    audit = AuditStore(tmp_path / "audit.db")
+    try:
+        outcome = execute_action(
+            {
+                "action": "run_probe",
+                "task_id": "surface-map",
+                "probe": "surface_map",
+            },
+            target_url="http://127.0.0.1/",
+            runtime=_ProofRuntime(),
+            state=state,
+            workspace=AgentWorkspace.open(tmp_path / "workspace"),
+            audit=audit,
+            engagement_id=uuid4(),
+            repeat_count=1,
+            max_observation_chars=2000,
+            max_transcript_chars=4000,
+            proof_recognition_enabled=True,
+        )
+    finally:
+        audit.close()
+
+    assert outcome.flag == "flag{novel_second}"
+    assert state.flags == ["flag{known_first}", "flag{novel_second}"]
+    assert state.last_observation["recognized_proofs"] == ["flag{novel_second}"]
+
+
+def test_builtin_probe_known_proof_replay_is_non_material(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_probe_runner(monkeypatch, _probe_runner_with_proof)
+    proof = "flag{probe_auto_capture_123}"
+    state = AgentState(flags=[proof])
+    events: list[dict[str, object]] = []
+    workspace = AgentWorkspace.open(tmp_path / "workspace", event_sink=events.append)
+    audit = AuditStore(tmp_path / "audit.db")
+    try:
+        outcome = execute_action(
+            {
+                "action": "run_probe",
+                "task_id": "data-query",
+                "probe": "sqli_differential",
+            },
+            target_url="http://127.0.0.1/",
+            runtime=_ProofRuntime(),
+            state=state,
+            workspace=workspace,
+            audit=audit,
+            engagement_id=uuid4(),
+            repeat_count=1,
+            max_observation_chars=2000,
+            max_transcript_chars=4000,
+            proof_recognition_enabled=True,
+            action_id="probe-known-proof",
+        )
+    finally:
+        audit.close()
+
+    assert outcome.stop is False
+    assert outcome.outcome == "same_as_before"
+    assert outcome.flag == ""
+    assert state.flags == [proof]
+    assert not any(event["kind"] == "flag_captured" for event in events)
+
+
+def test_builtin_probe_known_proof_replay_preserves_new_signal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_probe_runner(monkeypatch, _probe_runner_with_known_proof_and_finding)
+    proof = "flag{probe_auto_capture_123}"
+    state = AgentState(flags=[proof])
+    events: list[dict[str, object]] = []
+    workspace = AgentWorkspace.open(tmp_path / "workspace", event_sink=events.append)
+    audit = AuditStore(tmp_path / "audit.db")
+    try:
+        outcome = execute_action(
+            {
+                "action": "run_probe",
+                "task_id": "data-query",
+                "probe": "sqli_differential",
+            },
+            target_url="http://127.0.0.1/",
+            runtime=_ProofRuntime(),
+            state=state,
+            workspace=workspace,
+            audit=audit,
+            engagement_id=uuid4(),
+            repeat_count=1,
+            max_observation_chars=2000,
+            max_transcript_chars=4000,
+            proof_recognition_enabled=True,
+            action_id="probe-known-proof-new-signal",
+        )
+    finally:
+        audit.close()
+
+    assert outcome.stop is False
+    assert outcome.outcome == "confirmed_signal"
+    assert outcome.flag == ""
+    assert state.flags == [proof]
+    assert not any(event["kind"] == "flag_captured" for event in events)
 
 
 def test_builtin_probe_output_scans_full_text_before_clipping(
@@ -2155,6 +2433,77 @@ def _probe_runner_with_proof(*args: object, **kwargs: object) -> _CompletedProbe
                 "status": "ok",
                 "ok": True,
                 "text": json.dumps({"ok": True, "summary": "saw flag{probe_auto_capture_123}"}),
+            }
+        )
+    )
+
+
+def _probe_runner_with_known_proof_and_finding(
+    *args: object,
+    **kwargs: object,
+) -> _CompletedProbeRunner:
+    del args, kwargs
+    return _CompletedProbeRunner(
+        json.dumps(
+            {
+                "status": "ok",
+                "ok": True,
+                "text": json.dumps(
+                    {
+                        "ok": True,
+                        "probe": "sqli_differential",
+                        "summary": "saw flag{probe_auto_capture_123}",
+                        "findings": [{"type": "sql_injection_error_signal"}],
+                    }
+                ),
+            }
+        )
+    )
+
+
+def _probe_runner_with_two_proofs(*args: object, **kwargs: object) -> _CompletedProbeRunner:
+    del args, kwargs
+    return _CompletedProbeRunner(
+        json.dumps(
+            {
+                "status": "ok",
+                "ok": True,
+                "text": json.dumps(
+                    {
+                        "ok": True,
+                        "summary": "saw flag{first_observation} and flag{second_observation}",
+                        "findings": [
+                            {
+                                "type": "synthetic_extracted_proof",
+                                "proofs": [
+                                    "flag{first_observation}",
+                                    "flag{second_observation}",
+                                ],
+                            }
+                        ],
+                    }
+                ),
+            }
+        )
+    )
+
+
+def _probe_runner_with_known_then_novel_proof(
+    *args: object,
+    **kwargs: object,
+) -> _CompletedProbeRunner:
+    del args, kwargs
+    return _CompletedProbeRunner(
+        json.dumps(
+            {
+                "status": "ok",
+                "ok": True,
+                "text": json.dumps(
+                    {
+                        "ok": True,
+                        "summary": "saw flag{known_first} and flag{novel_second}",
+                    }
+                ),
             }
         )
     )

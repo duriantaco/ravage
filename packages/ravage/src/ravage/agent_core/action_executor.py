@@ -49,6 +49,7 @@ _MAX_DISPLAY_NAME_CHARS = 80
 _MAX_DISPLAY_SUMMARY_CHARS = 240
 _MAX_FINDING_EVIDENCE_CHARS = 1_200
 _MAX_FINDING_TEXT_CHARS = 1_000
+MAX_IDENTICAL_ACTION_EXECUTIONS = 2
 _FINDING_SEVERITIES = {"Critical", "High", "Medium", "Low", "Informational"}
 _VULN_CLASS_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 _HTTP_FINDING_CLASS_ALIASES = {
@@ -203,7 +204,10 @@ def execute_action(  # noqa: PLR0913
             engagement_id=engagement_id,
             action_id=action_id,
         )
-    if kind in {"run_command", "run_python", "run_probe", "validate_poc"} and repeat_count > 2:
+    if (
+        kind in {"run_command", "run_python", "run_probe", "validate_poc"}
+        and repeat_count > MAX_IDENTICAL_ACTION_EXECUTIONS
+    ):
         return _repeated(
             action,
             repeat_count=repeat_count,
@@ -748,6 +752,22 @@ def _capture(  # noqa: PLR0913
             outcome="blocked",
         )
     payload["flag"] = flag
+    if flag in state.flags:
+        payload["reason"] = "proof was already captured"
+        _record(
+            audit,
+            engagement_id,
+            actor="agent",
+            action="flag_capture_duplicate",
+            payload=payload,
+        )
+        workspace.record_event(kind="flag_capture_duplicate", payload=payload)
+        return ActionResult(
+            ok=True,
+            observation=json.dumps(payload),
+            stop=False,
+            outcome="same_as_before",
+        )
     if not _capture_has_observed_evidence(flag, state=state):
         payload["error"] = (
             "capture_flag requires the exact proof string to appear in recent target evidence"
@@ -2095,11 +2115,14 @@ def _capture_has_observed_evidence(
 ) -> bool:
     # Only the most recent executor-produced observation is admissible. Model-authored
     # evidence, hypotheses, facts, and signals cannot validate the model's own claim.
+    observation_id = str(state.last_observation.get("observation_id") or "").strip()
+    source_kind = str(state.last_observation.get("source_kind") or "").strip()
+    if not observation_id or not source_kind.startswith("tool_"):
+        return False
     recognized = state.last_observation.get("recognized_proofs")
-    if isinstance(recognized, list):
-        return flag in {item for item in recognized if isinstance(item, str)}
-    observed = json.dumps(state.last_observation, sort_keys=True, default=str)
-    return flag in observed
+    if not isinstance(recognized, list):
+        return False
+    return flag in {item for item in recognized if isinstance(item, str)}
 
 
 def _capture_provenance(
@@ -2163,7 +2186,9 @@ def _record_tool_result(  # noqa: PLR0913
 ) -> ActionResult:
     observation_id = str(uuid.uuid4())
     proof_text = _tool_proof_text(result)
-    recognized_proofs = recognize_proofs(proof_text)
+    # Process actions are model-authored and may echo arbitrary text. Preserve
+    # the established single-proof evidence boundary for each observation.
+    recognized_proofs = recognize_proofs(proof_text)[:1]
     payload = _tool_result_payload(
         result,
         repeat_count=repeat_count,
@@ -2189,6 +2214,12 @@ def _record_tool_result(  # noqa: PLR0913
         recognized_proofs=recognized_proofs,
     )
 
+    known_proof_replayed = _only_known_auto_capture_proofs(
+        proof_text,
+        enabled=proof_recognition_enabled,
+        state=state,
+        recognized_proofs=recognized_proofs,
+    )
     found = _capture_recognized_proof(
         proof_text,
         enabled=proof_recognition_enabled,
@@ -2198,6 +2229,7 @@ def _record_tool_result(  # noqa: PLR0913
         engagement_id=engagement_id,
         evidence="tool output",
         action_id=action_id,
+        recognized_proofs=recognized_proofs,
     )
 
     outcome = classify_action_result(
@@ -2208,6 +2240,8 @@ def _record_tool_result(  # noqa: PLR0913
     )
     if found:
         outcome = "flag_candidate"
+    elif known_proof_replayed and outcome == "observed":
+        outcome = "same_as_before"
 
     model_tool_text = _tool_text(result, max_chars=max_observation_chars)
     return _action_result_from_observation(
@@ -2300,7 +2334,12 @@ def _record_probe_result(  # noqa: PLR0913
     authentication: ManagedAttackAuthentication | None = None,
 ) -> ActionResult:
     observation_id = str(uuid.uuid4())
-    recognized_proofs = _authentication_safe_proofs(text, authentication=authentication)
+    recognized_proofs = _probe_recognized_proofs(
+        text,
+        kind=kind,
+        authentication=authentication,
+        known_proofs=state.flags,
+    )
     if kind == "tool_run_probe":
         _ingest_probe_surface_graph(
             text,
@@ -2331,6 +2370,12 @@ def _record_probe_result(  # noqa: PLR0913
         recognized_proofs=recognized_proofs,
     )
     merge_signals(state, extract_signals(text))
+    known_proof_replayed = _only_known_auto_capture_proofs(
+        text,
+        enabled=proof_recognition_enabled,
+        state=state,
+        recognized_proofs=recognized_proofs,
+    )
     found = _capture_recognized_proof(
         text,
         enabled=proof_recognition_enabled,
@@ -2348,6 +2393,8 @@ def _record_probe_result(  # noqa: PLR0913
         text=clipped,
         trusted_target_evidence=kind in {"tool_run_probe", "tool_validate_poc"},
     )
+    if known_proof_replayed and not found and outcome == "observed":
+        outcome = "same_as_before"
     return _action_result_from_observation(
         ok=ok,
         repeat_count=repeat_count,
@@ -2500,21 +2547,37 @@ def _capture_recognized_proof(
 ) -> str:
     if not enabled:
         return ""
+    first_captured = ""
     for proof in _auto_capture_proofs(text, recognized_proofs=recognized_proofs):
-        if proof not in state.flags:
-            state.flags.append(proof)
-            payload = {
-                "flag": proof,
-                "evidence": evidence,
-                "flag_record_path": str(workspace.events_path),
-            }
-            if action_id:
-                payload["action_id"] = action_id
-            payload.update(_capture_provenance(state=state, capture_method="automatic"))
-            _record(audit, engagement_id, actor="agent", action="flag_captured", payload=payload)
-            workspace.record_event(kind="flag_captured", payload=payload)
-        return proof
-    return ""
+        if proof in state.flags:
+            continue
+        state.flags.append(proof)
+        payload = {
+            "flag": proof,
+            "evidence": evidence,
+            "flag_record_path": str(workspace.events_path),
+        }
+        if action_id:
+            payload["action_id"] = action_id
+        payload.update(_capture_provenance(state=state, capture_method="automatic"))
+        _record(audit, engagement_id, actor="agent", action="flag_captured", payload=payload)
+        workspace.record_event(kind="flag_captured", payload=payload)
+        if not first_captured:
+            first_captured = proof
+    return first_captured
+
+
+def _only_known_auto_capture_proofs(
+    text: str,
+    *,
+    enabled: bool,
+    state: AgentState,
+    recognized_proofs: Sequence[str] | None = None,
+) -> bool:
+    if not enabled:
+        return False
+    candidates = _auto_capture_proofs(text, recognized_proofs=recognized_proofs)
+    return bool(candidates) and all(proof in state.flags for proof in candidates)
 
 
 def _auto_capture_proofs(
@@ -2535,6 +2598,49 @@ def _authentication_safe_proofs(
     if authentication is None:
         return candidates
     return [proof for proof in candidates if not authentication.contains_secret(proof)]
+
+
+def _probe_recognized_proofs(
+    text: str,
+    *,
+    kind: str,
+    authentication: ManagedAttackAuthentication | None,
+    known_proofs: Sequence[str],
+) -> list[str]:
+    candidates = _authentication_safe_proofs(text, authentication=authentication)
+    if len(candidates) <= 1:
+        return candidates
+    if kind == "tool_run_probe":
+        explicit = set(_structured_finding_proofs(text))
+        if explicit:
+            return [proof for proof in candidates if proof in explicit]
+    # Broad native transcripts and PoC summaries can include incidental proof-like
+    # strings. Admit one per observation, preferring a genuinely novel target proof
+    # so an earlier known token cannot hide later evidence.
+    known = {str(proof) for proof in known_proofs}
+    return [next((proof for proof in candidates if proof not in known), candidates[0])]
+
+
+def _structured_finding_proofs(text: str) -> list[str]:
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(payload, Mapping):
+        return []
+    findings = payload.get("findings")
+    if not isinstance(findings, list):
+        return []
+    proofs: list[str] = []
+    for finding in findings:
+        if not isinstance(finding, Mapping):
+            continue
+        for key in ("proof", "proofs"):
+            value = finding.get(key)
+            for proof in recognize_proofs(json.dumps(value, sort_keys=True, default=str)):
+                if proof not in proofs:
+                    proofs.append(proof)
+    return proofs
 
 
 def _observation_digest_with_source(

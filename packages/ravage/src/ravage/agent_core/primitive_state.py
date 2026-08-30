@@ -16,6 +16,7 @@ class PrimitiveRule:
     directive: str
     markers: tuple[str, ...] = ()
     signal_keys: tuple[str, ...] = ()
+    closure_probes: tuple[str, ...] = ()
     tier: int = 0
     blockers: tuple[str, ...] = field(default=())
 
@@ -100,6 +101,7 @@ PRIMITIVE_RULES: tuple[PrimitiveRule, ...] = (
             "blind_sql_injection_boolean_signal",
             "blind_sql_injection_timing_signal",
         ),
+        closure_probes=("sqli_differential",),
     ),
     PrimitiveRule(
         name="sqli_confirmed",
@@ -120,6 +122,7 @@ PRIMITIVE_RULES: tuple[PrimitiveRule, ...] = (
             "sql_extracted_proof",
         ),
         signal_keys=("sqli_inputs",),
+        closure_probes=("sqli_differential",),
     ),
     PrimitiveRule(
         name="command_exec_confirmed",
@@ -404,7 +407,7 @@ def promote_primitives(state: AgentState) -> list[str]:
 
 
 def _live_primitive_names(state: AgentState) -> list[str]:
-    if state.flags:
+    if state.flags and state.surface.get("continue_after_proof") is not True:
         return []
     text = _evidence_text(state)
     names: list[str] = []
@@ -415,8 +418,83 @@ def _live_primitive_names(state: AgentState) -> list[str]:
         # a live lock target even though it was confirmed earlier.
         if any(blocker in text for blocker in rule.blockers):
             continue
+        # In a multi-proof run, a proof closes only the primitive whose typed
+        # specialist produced it.  A proof from an unrelated branch must not
+        # release every other confirmed exploit primitive.
+        if _primitive_branch_has_proof(state, rule):
+            continue
         names.append(rule.name)
     return names
+
+
+def _primitive_branch_has_proof(state: AgentState, rule: PrimitiveRule) -> bool:
+    promoted_turn = state.primitives.get(rule.name, state.turn)
+    accepted_probes = {rule.probe, *rule.closure_probes}
+    for index, attempt in enumerate(state.attempts):
+        if _attempt_added_branch_proof(
+            attempt,
+            preceding_attempts=state.attempts[:index],
+            promoted_turn=promoted_turn,
+            accepted_probes=accepted_probes,
+        ):
+            return True
+    return False
+
+
+def _attempt_added_branch_proof(
+    attempt: dict[str, object],
+    *,
+    preceding_attempts: list[dict[str, object]],
+    promoted_turn: int,
+    accepted_probes: set[str],
+) -> bool:
+    selected = attempt.get("selected_action")
+    delta = attempt.get("state_delta")
+    if not isinstance(selected, dict) or not isinstance(delta, dict):
+        return False
+    attempt_turn = _int_value(attempt.get("turn"))
+    if attempt_turn < promoted_turn or _int_value(delta.get("flags_delta")) <= 0:
+        return False
+    if selected.get("action") == "run_probe":
+        return str(selected.get("probe") or "") in accepted_probes
+    if selected.get("action") != "capture_flag":
+        return False
+    preceding_probe = _nearest_evidence_producing_probe(
+        preceding_attempts,
+        promoted_turn=promoted_turn,
+        capture_turn=attempt_turn,
+    )
+    return preceding_probe in accepted_probes
+
+
+def _nearest_evidence_producing_probe(
+    attempts: list[dict[str, object]],
+    *,
+    promoted_turn: int,
+    capture_turn: int,
+) -> str:
+    for attempt in reversed(attempts):
+        turn = _int_value(attempt.get("turn"))
+        if turn < promoted_turn:
+            break
+        if turn >= capture_turn:
+            continue
+        selected = attempt.get("selected_action")
+        outcome = attempt.get("outcome")
+        if not isinstance(selected, dict) or not isinstance(outcome, dict):
+            continue
+        kind = str(selected.get("action") or "")
+        if kind not in {"run_command", "run_python", "run_probe", "validate_poc"}:
+            continue
+        if outcome.get("ok") is not True:
+            continue
+        classification = str(outcome.get("classification") or "")
+        if classification in {"blocked", "same_as_before"}:
+            continue
+        if kind != "run_probe":
+            return ""
+        return str(selected.get("probe") or "")
+    return ""
 
 
 def locked_primitive(state: AgentState) -> str | None:

@@ -16,7 +16,11 @@ from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 from urllib.parse import urlparse
 from uuid import uuid4
 
-from ravage.agent_core.action_executor import ActionResult, execute_action
+from ravage.agent_core.action_executor import (
+    MAX_IDENTICAL_ACTION_EXECUTIONS,
+    ActionResult,
+    execute_action,
+)
 from ravage.agent_core.action_parser import VALID_ACTIONS, parse_action
 from ravage.agent_core.action_planner import planner_directives, ranked_strategy_cards, select_phase
 from ravage.agent_core.agent_methodology import methodology_context
@@ -29,13 +33,14 @@ from ravage.agent_core.agent_state import (
     resolve_agent_state_path,
     save_agent_state,
 )
-from ravage.agent_core.agent_strategy import action_fingerprint, observation_digest
+from ravage.agent_core.agent_strategy import observation_digest
 from ravage.agent_core.agent_tasks import (
     active_tasks_for_prompt,
     refresh_mission_board,
     update_mission_from_action,
 )
 from ravage.agent_core.attack_surface import merge_surface_state, surface_from_recon
+from ravage.agent_core.frontier_closure_obligation import pending_closure_obligation
 from ravage.agent_core.harness_trace import (
     attempt_record_payload,
     sanitize_action,
@@ -499,6 +504,11 @@ def run_ai_web_agent(
         state.surface["scope_max_rps"] = brief.roe.max_rps
         state.surface["allow_remote_target"] = settings.allow_remote_target
         state.surface["continue_after_proof"] = _brief_requests_multiple_proofs(brief)
+        expected_proof_count = _brief_expected_proof_count(brief)
+        if expected_proof_count is None:
+            state.surface.pop("expected_proof_count", None)
+        else:
+            state.surface["expected_proof_count"] = expected_proof_count
         state.surface["flag_objective"] = flag_objective
         state.surface["scoped_service_ports"] = _scoped_service_ports(
             brief.scope.in_scope,
@@ -715,6 +725,19 @@ def run_ai_web_agent(
                     max_turns=max(settings.max_turns, 1),
                     allow_premature_final=allow_premature_final,
                 )
+            if recovery is None:
+                resolved_action, resolution_reason = _resolve_same_turn_harness_action(
+                    state=state,
+                    proposed_action=proposed_action,
+                    selected_action=action,
+                    turn=turn,
+                    max_turns=max(settings.max_turns, 1),
+                    settings=settings,
+                )
+                if resolution_reason is not None:
+                    action = resolved_action
+                    shadow_action = resolved_action
+                    shadow_reason = resolution_reason
             selection_payload = selection_trace_payload(
                 turn=turn,
                 action_id=action_id,
@@ -841,6 +864,22 @@ def run_ai_web_agent(
                 action="agent_attempt_recorded",
                 payload=attempt_record,
             )
+            # Branch closure is derived from durable attempt provenance, so make
+            # the current attempt visible before deciding whether another model
+            # turn is necessary.
+            synthesized_terminal = (
+                recovery is None
+                and not outcome.stop
+                and _assessment_ready_for_terminal(
+                    state,
+                    turn=turn,
+                    max_turns=max(settings.max_turns, 1),
+                    settings=settings,
+                )
+            )
+            if synthesized_terminal:
+                state.phase = "done"
+                state.summary = summarize_state(state)
             post_state_trace = state_trace_snapshot(state)
             trace_payload = turn_trace_payload(
                 turn=turn,
@@ -863,6 +902,16 @@ def run_ai_web_agent(
                 action="harness_turn_trace",
                 payload=trace_payload,
             )
+            if synthesized_terminal:
+                _record_synthesized_terminal(
+                    turn=turn,
+                    action_id=action_id,
+                    state=state,
+                    workspace=workspace,
+                    audit=audit,
+                    engagement_id=brief.engagement_id,
+                    authentication=settings.authentication,
+                )
             recovery_turn: RecoveryTurnResult | None = None
             if recovery is not None:
                 recovery_turn = recovery.record_action_result(
@@ -884,6 +933,9 @@ def run_ai_web_agent(
                 termination_reason = (
                     "agent_final" if outcome.outcome == "final" else "objective_met"
                 )
+                break
+            if synthesized_terminal:
+                termination_reason = "agent_final"
                 break
             if spent_cost_usd >= brief.budget.max_cost_usd:
                 cost_payload = {
@@ -927,7 +979,26 @@ def run_ai_web_agent(
             termination_reason = (
                 "max_turns_reached" if state.turn >= max(settings.max_turns, 1) else "agent_final"
             )
-        if termination_reason in {"max_turns_reached", "cost_budget_exhausted"}:
+        expected_proof_count = _state_expected_proof_count(state)
+        captured_proof_count = _captured_proof_count(state)
+        required_proof_count_unmet = (
+            expected_proof_count is not None
+            and captured_proof_count < expected_proof_count
+        )
+        completion_requirements_met = (
+            not flag_objective
+            or _proof_objective_completion_met(state, settings=settings)
+        )
+        if required_proof_count_unmet and termination_reason in {
+            "agent_final",
+            "objective_met",
+        }:
+            termination_reason = "required_proof_count_unmet"
+        if termination_reason in {
+            "max_turns_reached",
+            "cost_budget_exhausted",
+            "required_proof_count_unmet",
+        } or (run_error is None and not completion_requirements_met):
             finish_status = "incomplete"
         finished_payload: dict[str, object] = {
             "status": finish_status,
@@ -941,6 +1012,10 @@ def run_ai_web_agent(
             "finding_record_path": str(workspace.events_path),
             "audit_path": str(settings.db_path or workspace.root / "audit.db"),
             "flag_objective": flag_objective,
+            "expected_proof_count": expected_proof_count,
+            "captured_proof_count": captured_proof_count,
+            "required_proof_count_unmet": required_proof_count_unmet,
+            "completion_requirements_met": completion_requirements_met,
             "turns": state.turn,
             "phase": state.phase,
             "cost_usd": round(spent_cost_usd, 6),
@@ -1074,6 +1149,295 @@ def _shadow_harness_action(
     return None, "no_shadow_route"
 
 
+_REPEAT_GUARDED_ACTIONS = frozenset({"run_command", "run_python", "run_probe", "validate_poc"})
+_ACTIVE_TASK_STATUSES = frozenset({"pending", "in_progress"})
+
+
+def _resolve_same_turn_harness_action(  # noqa: PLR0913 - explicit turn boundary contract.
+    *,
+    state: AgentState,
+    proposed_action: Mapping[str, object],
+    selected_action: Mapping[str, object],
+    turn: int,
+    max_turns: int,
+    settings: AIWebAgentSettings,
+) -> tuple[dict[str, object], str | None]:
+    """Replace a known no-op selection before it consumes the current turn."""
+    selected = dict(selected_action)
+    if selected.get("action") == "final":
+        if not _hard_final_requirement_unmet(state):
+            return selected, None
+        fallback = _deterministic_harness_fallback(
+            state=state,
+            route_basis=proposed_action,
+            settings=settings,
+        )
+        if fallback is not None:
+            return fallback, "premature_final_required_work_fallback"
+        return _premature_final_action(selected), "premature_final_required_work_guard"
+    if _assessment_ready_for_terminal(
+        state,
+        turn=turn,
+        max_turns=max_turns,
+        settings=settings,
+    ):
+        return _synthesized_final_action(), "assessment_complete_terminal"
+
+    premature_final = proposed_action.get("action") == "final" and _final_is_premature(
+        action=proposed_action,
+        state=state,
+        turn=turn,
+        max_turns=max_turns,
+    )
+    if premature_final and selected.get("action") == "invalid":
+        reason = "premature_final_open_task_fallback"
+        route_basis = proposed_action
+    elif _would_hit_repeat_guard(state, selected):
+        reason = "repeat_limit_open_task_fallback"
+        route_basis = selected
+    else:
+        return selected, None
+
+    fallback = _deterministic_harness_fallback(
+        state=state,
+        route_basis=route_basis,
+        settings=settings,
+    )
+    if fallback is None:
+        # Keep the existing guard visible when no evidence-backed executable route exists.
+        return selected, None
+    return fallback, reason
+
+
+def _deterministic_harness_fallback(  # noqa: C901 - ordered safety gates are explicit.
+    *,
+    state: AgentState,
+    route_basis: Mapping[str, object],
+    settings: AIWebAgentSettings,
+) -> dict[str, object] | None:
+    locked = _forced_primitive_probe_action(state=state, proposed_action=route_basis)
+    if locked is not None and _fallback_action_is_executable(
+        state,
+        locked,
+        settings=settings,
+    ):
+        return locked
+
+    for route in (
+        _forced_cookie_identity_idor_action,
+        _forced_authenticated_object_idor_action,
+        _forced_evidence_probe_action,
+    ):
+        candidate = route(state=state, proposed_action=route_basis)
+        if candidate is None or not _action_targets_active_task(state, candidate):
+            continue
+        if _fallback_action_is_executable(state, candidate, settings=settings):
+            return candidate
+
+    recommendations = recommended_specialists(state, limit=len(available_specialists()))
+    for task in _active_tasks_by_priority(state):
+        task_id = str(task.get("id") or "")
+        for specialist in recommendations:
+            if str(specialist.get("task_id") or "") != task_id:
+                continue
+            candidate = _recommended_specialist_action(task_id=task_id, specialist=specialist)
+            if _fallback_action_is_executable(state, candidate, settings=settings):
+                return candidate
+        if task_id == "surface-map":
+            candidate = _surface_map_fallback_action()
+            if _fallback_action_is_executable(state, candidate, settings=settings):
+                return candidate
+    return None
+
+
+def _recommended_specialist_action(
+    *,
+    task_id: str,
+    specialist: Mapping[str, object],
+) -> dict[str, object]:
+    probe = str(specialist.get("probe") or "").strip()
+    name = str(specialist.get("name") or probe).strip()
+    purpose = str(specialist.get("purpose") or "").strip()
+    return {
+        "action": "run_probe",
+        "task_id": task_id,
+        "probe": probe,
+        "strategy": f"harness_fallback_{name}",
+        "notes": "Continue the highest-priority open task with its recommended bounded specialist.",
+        "expected_signal": purpose or "new target evidence or a bounded exhausted result",
+        "fallback": "If this specialist is exhausted, move to a materially different open route.",
+        "memory_updates": [f"same-turn harness fallback selected {probe}"],
+    }
+
+
+def _surface_map_fallback_action() -> dict[str, object]:
+    return {
+        "action": "run_probe",
+        "task_id": "surface-map",
+        "probe": "surface_map",
+        "strategy": "harness_fallback_surface_map",
+        "notes": "Complete the open surface inventory with the bounded native mapper.",
+        "expected_signal": "new reachable surface or a bounded exhausted inventory",
+        "fallback": (
+            "If the surface is exhausted, close the task and continue with evidence-backed work."
+        ),
+        "memory_updates": ["same-turn harness fallback selected surface_map"],
+    }
+
+
+def _fallback_action_is_executable(
+    state: AgentState,
+    action: Mapping[str, object],
+    *,
+    settings: AIWebAgentSettings,
+) -> bool:
+    if action.get("action") != "run_probe":
+        return False
+    probe = str(action.get("probe") or "").strip()
+    if not probe or probe_recently_exhausted(state, probe):
+        return False
+    if settings.traffic_policy_mode == "low-noise" and probe_requires_external_process(probe):
+        return False
+    if settings.authentication is not None and authenticated_probe_unavailability(probe):
+        return False
+    return not _would_hit_repeat_guard(state, action)
+
+
+def _would_hit_repeat_guard(state: AgentState, action: Mapping[str, object]) -> bool:
+    if str(action.get("action") or "") not in _REPEAT_GUARDED_ACTIONS:
+        return False
+    return (
+        state.ledger.count(action, context=_repeat_context(state))
+        >= MAX_IDENTICAL_ACTION_EXECUTIONS
+    )
+
+
+def _action_targets_active_task(
+    state: AgentState,
+    action: Mapping[str, object],
+) -> bool:
+    task_id = str(action.get("task_id") or "").strip()
+    return any(
+        str(task.get("id") or "") == task_id
+        and str(task.get("status") or "pending") in _ACTIVE_TASK_STATUSES
+        for task in state.tasks
+    )
+
+
+def _active_tasks_by_priority(state: AgentState) -> list[dict[str, object]]:
+    active = [
+        task
+        for task in state.tasks
+        if str(task.get("status") or "pending") in _ACTIVE_TASK_STATUSES
+    ]
+    return sorted(
+        active,
+        key=lambda task: (
+            -_task_int(task.get("priority")),
+            0 if str(task.get("status") or "pending") == "in_progress" else 1,
+            _task_int(task.get("attempts")),
+            str(task.get("id") or ""),
+        ),
+    )
+
+
+def _task_int(value: object) -> int:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _assessment_ready_for_terminal(
+    state: AgentState,
+    *,
+    turn: int,
+    max_turns: int,
+    settings: AIWebAgentSettings | None = None,
+) -> bool:
+    if not state.tasks or _has_open_assessment_tasks(state):
+        return False
+    if pending_closure_obligation(state) is not None:
+        return False
+    if _has_executable_live_primitive_route(state, settings=settings):
+        return False
+    return not _final_is_premature(
+        action={"action": "final"},
+        state=state,
+        turn=turn,
+        max_turns=max_turns,
+        settings=settings,
+    )
+
+
+def _has_executable_live_primitive_route(
+    state: AgentState,
+    *,
+    settings: AIWebAgentSettings | None,
+) -> bool:
+    routes = routed_probes(state)
+    for probe, _score in sorted(routes.items(), key=lambda item: (-item[1], item[0])):
+        action = {"action": "run_probe", "probe": probe}
+        if settings is not None:
+            if _fallback_action_is_executable(state, action, settings=settings):
+                return True
+            continue
+        if not probe_recently_exhausted(state, probe) and not _would_hit_repeat_guard(
+            state,
+            action,
+        ):
+            return True
+    return False
+
+
+def _synthesized_final_action() -> dict[str, object]:
+    return {
+        "action": "final",
+        "summary": "All in-scope assessment tasks and closure obligations are complete.",
+        "strategy": "harness_assessment_complete",
+        "memory_updates": ["assessment task and closure queues are complete"],
+    }
+
+
+def _record_synthesized_terminal(  # noqa: PLR0913 - event boundary needs explicit owners.
+    *,
+    turn: int,
+    action_id: str,
+    state: AgentState,
+    workspace: AgentWorkspace,
+    audit: AuditStore,
+    engagement_id: UUID,
+    authentication: ManagedAttackAuthentication | None,
+) -> None:
+    task_counts = Counter(str(task.get("status") or "pending") for task in state.tasks)
+    payload = _authenticated_artifact_mapping(
+        authentication,
+        {
+            "turn": turn,
+            "action_id": action_id,
+            "reason": "assessment_tasks_and_closure_obligations_complete",
+            "task_status_counts": dict(sorted(task_counts.items())),
+            "synthesized": True,
+        },
+    )
+    _record(
+        audit,
+        engagement_id,
+        actor="agent",
+        action="harness_terminal_synthesized",
+        payload=payload,
+    )
+    workspace.record_event(kind="harness_terminal_synthesized", payload=payload)
+    workspace.record_event(
+        kind="agent_final",
+        payload={
+            "action_id": action_id,
+            "summary": "Assessment queues complete; final report synthesized by the harness.",
+            "synthesized": True,
+        },
+    )
+
+
 def _forced_primitive_probe_action(
     *,
     state: AgentState,
@@ -1102,8 +1466,7 @@ def _forced_primitive_probe_action(
         "fallback": "If the locked specialist exhausts this primitive twice, move to the next confirmed primitive or distinct evidence.",
         "memory_updates": [f"forced locked primitive probe: {primitive_name} -> {rule.probe}"],
     }
-    fingerprint = action_fingerprint(action, context=_repeat_context(state))
-    if state.ledger.fingerprints.get(fingerprint, 0) >= 2:
+    if state.ledger.count(action, context=_repeat_context(state)) >= 2:
         return None
     return action
 
@@ -1414,15 +1777,20 @@ def _forced_evidence_probe_action(
     state: AgentState,
     proposed_action: Mapping[str, object],
 ) -> dict[str, object] | None:
+    live_routed_probes = routed_probes(state)
     if state.flags:
-        return _forced_multi_finding_url_fetch_action(
+        multi_finding_action = _forced_multi_finding_url_fetch_action(
             state=state,
             proposed_action=proposed_action,
         )
+        if multi_finding_action is not None:
+            return multi_finding_action
+        if not _continue_after_proof_enabled(state) or not live_routed_probes:
+            return None
     proposed_probe = str(proposed_action.get("probe") or "")
     if (
         proposed_action.get("action") == "run_probe"
-        and proposed_probe in routed_probes(state)
+        and proposed_probe in live_routed_probes
         and not probe_recently_exhausted(state, proposed_probe)
         and not _authenticated_probe_unavailable_for_state(state, proposed_probe)
     ):
@@ -1471,7 +1839,9 @@ def _forced_evidence_probe_action(
             and not probe_recently_exhausted(state, proposed_probe)
             and not _authenticated_probe_unavailable_for_state(state, proposed_probe)
         ):
-            if (
+            if state.flags and live_routed_probes and proposed_probe not in live_routed_probes:
+                pass
+            elif (
                 _has_apache_traversal_surface(_state_evidence_text(state))
                 and not probe_recently_exhausted(state, "file_read_extract")
                 and proposed_probe != "file_read_extract"
@@ -1500,6 +1870,8 @@ def _forced_evidence_probe_action(
             else:
                 return None
     for route in _EVIDENCE_PROBE_ROUTES:
+        if state.flags and live_routed_probes and route.probe not in live_routed_probes:
+            continue
         if _authenticated_probe_unavailable_for_state(state, route.probe):
             continue
         if (
@@ -1524,8 +1896,7 @@ def _forced_evidence_probe_action(
             ),
             "memory_updates": [f"forced evidence route: {route.name} -> {route.probe}"],
         }
-        fingerprint = action_fingerprint(action, context=_repeat_context(state))
-        if state.ledger.fingerprints.get(fingerprint, 0) >= 2:
+        if state.ledger.count(action, context=_repeat_context(state)) >= 2:
             continue
         return action
     return None
@@ -1582,8 +1953,7 @@ def _forced_multi_finding_url_fetch_action(
             "preserved structured URL-fetch form requires SSRF closure after an earlier proof"
         ],
     }
-    fingerprint = action_fingerprint(action, context=_repeat_context(state))
-    if state.ledger.fingerprints.get(fingerprint, 0) >= 2:
+    if state.ledger.count(action, context=_repeat_context(state)) >= 2:
         return None
     return action
 
@@ -1909,8 +2279,7 @@ def _forced_cookie_identity_idor_action(
         "fallback": "If idor_boundary exhausts twice, resume model-driven exploration with a different primitive.",
         "memory_updates": ["forced cookie identity IDOR loop -> idor_boundary"],
     }
-    fingerprint = action_fingerprint(action, context=_repeat_context(state))
-    if state.ledger.fingerprints.get(fingerprint, 0) >= 2:
+    if state.ledger.count(action, context=_repeat_context(state)) >= 2:
         return None
     return action
 
@@ -1950,8 +2319,7 @@ def _forced_authenticated_object_idor_action(
         "fallback": "If idor_boundary exhausts twice, resume model-driven exploration with a different primitive.",
         "memory_updates": ["forced authenticated object-route IDOR loop -> idor_boundary"],
     }
-    fingerprint = action_fingerprint(action, context=_repeat_context(state))
-    if state.ledger.fingerprints.get(fingerprint, 0) >= 2:
+    if state.ledger.count(action, context=_repeat_context(state)) >= 2:
         return None
     return action
 
@@ -2080,16 +2448,60 @@ def _final_is_premature(
     state: AgentState,
     turn: int,
     max_turns: int,
+    settings: AIWebAgentSettings | None = None,
 ) -> bool:
+    del turn, max_turns
     if action.get("action") != "final":
         return False
     if state.surface.get("flag_objective") is False:
-        return _has_open_assessment_tasks(state)
-    if state.flags and not _continue_after_proof_enabled(state):
+        return (
+            _has_open_assessment_tasks(state)
+            or pending_closure_obligation(state) is not None
+            or _has_executable_live_primitive_route(state, settings=settings)
+        )
+    return not _proof_objective_completion_met(state, settings=settings)
+
+
+def _proof_objective_completion_met(
+    state: AgentState,
+    *,
+    settings: AIWebAgentSettings | None = None,
+) -> bool:
+    if (
+        _proof_count_requirement_unmet(state)
+        or _captured_proof_count(state) == 0
+        or pending_closure_obligation(state) is not None
+    ):
         return False
-    if state.flags and not _has_open_assessment_tasks(state):
-        return False
-    return turn < max_turns
+    if not _continue_after_proof_enabled(state):
+        return True
+    return (
+        not _has_open_assessment_tasks(state)
+        and not _has_executable_live_primitive_route(state, settings=settings)
+    )
+
+
+def _hard_final_requirement_unmet(state: AgentState) -> bool:
+    return (
+        _proof_count_requirement_unmet(state)
+        or pending_closure_obligation(state) is not None
+    )
+
+
+def _proof_count_requirement_unmet(state: AgentState) -> bool:
+    expected = _state_expected_proof_count(state)
+    return expected is not None and _captured_proof_count(state) < expected
+
+
+def _state_expected_proof_count(state: AgentState) -> int | None:
+    expected = state.surface.get("expected_proof_count")
+    if isinstance(expected, bool) or not isinstance(expected, int):
+        return None
+    return expected if expected > 0 else None
+
+
+def _captured_proof_count(state: AgentState) -> int:
+    return len({proof for item in state.flags if (proof := str(item).strip())})
 
 
 def _premature_final_action(action: Mapping[str, object]) -> dict[str, object]:
@@ -2106,10 +2518,9 @@ def _brief_requests_multiple_proofs(brief: EngagementBrief) -> bool:
         return True
     if context.get("stop_after_first_proof") is False:
         return True
-    expected_count = context.get("expected_proof_count")
-    if isinstance(expected_count, int) and not isinstance(expected_count, bool):
-        if expected_count > 1:
-            return True
+    expected_count = _brief_expected_proof_count(brief)
+    if expected_count is not None and expected_count > 1:
+        return True
     objectives = {str(item).strip().lower() for item in brief.objectives}
     if objectives & {
         "web_application_assessment",
@@ -2124,7 +2535,16 @@ def _brief_requests_multiple_proofs(brief: EngagementBrief) -> bool:
     return any(marker in text for marker in _MULTI_PROOF_TEXT_MARKERS)
 
 
+def _brief_expected_proof_count(brief: EngagementBrief) -> int | None:
+    expected_count = dict(brief.context or {}).get("expected_proof_count")
+    if isinstance(expected_count, bool) or not isinstance(expected_count, int):
+        return None
+    return expected_count if expected_count > 0 else None
+
+
 def _brief_has_flag_objective(brief: EngagementBrief) -> bool:
+    if _brief_expected_proof_count(brief) is not None:
+        return True
     objectives = {str(item).strip().lower().replace("-", "_") for item in brief.objectives}
     if "capture_flag" in objectives:
         return True
@@ -2870,7 +3290,16 @@ def _report_status(
 ) -> str:
     if error is not None:
         return "interrupted" if isinstance(error, KeyboardInterrupt) else "error"
-    if termination_reason in {"max_turns_reached", "cost_budget_exhausted"}:
+    if termination_reason in {
+        "max_turns_reached",
+        "cost_budget_exhausted",
+        "required_proof_count_unmet",
+    }:
+        return "incomplete"
+    if (
+        state.surface.get("flag_objective") is not False
+        and not _proof_objective_completion_met(state, settings=settings)
+    ):
         return "incomplete"
     if state.flags:
         return "completed"
