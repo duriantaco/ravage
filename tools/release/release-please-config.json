@@ -28,6 +28,14 @@
         {
           "type": "generic",
           "path": "packages/ravage/src/ravage/_version.py"
+        },
+        {
+          "type": "generic",
+          "path": "packages/ravage/pyproject.toml"
+        },
+        {
+          "type": "generic",
+          "path": "CITATION.cff"
         }
       ]
     }

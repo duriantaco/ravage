@@ -451,7 +451,7 @@ wheels = [
 
 [[package]]
 name = "pentest-agent"
-version = "0.5.0"
+version = "0.6.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -705,7 +705,7 @@ wheels = [
 
 [[package]]
 name = "ravage"
-version = "0.5.0"
+version = "0.6.0"
 source = { editable = "packages/ravage" }
 dependencies = [
     { name = "cryptography" },
@@ -731,7 +731,7 @@ provides-extras = ["browser"]
 
 [[package]]
 name = "ravage-schemas"
-version = "0.5.0"
+version = "0.6.0"
 source = { editable = "packages/schemas" }
 dependencies = [
     { name = "pydantic" },

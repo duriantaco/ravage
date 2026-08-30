@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version
 
-SOURCE_VERSION = "0.5.0"  # x-release-please-version
+SOURCE_VERSION = "0.6.0"  # x-release-please-version
 
 
 def package_version() -> str:

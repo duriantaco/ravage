@@ -279,7 +279,7 @@ if is_fake_venv:
         raise SystemExit(0)
     if args[:2] == ["-m", "ravage"]:
         if "--version" in args:
-            print("ravage 0.5.0")
+            print("ravage 0.6.0")
         raise SystemExit(0)
     if args[:2] == ["-m", "playwright"]:
         raise SystemExit(0)

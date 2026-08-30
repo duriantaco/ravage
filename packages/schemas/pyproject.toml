@@ -1,6 +1,6 @@
 [project]
 name = "ravage-schemas"
-version = "0.5.0"
+version = "0.6.0"
 description = "Strict shared schemas for Ravage runtime components"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -38,5 +38,5 @@ exclude = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"

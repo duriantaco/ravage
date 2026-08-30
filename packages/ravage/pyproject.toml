@@ -1,11 +1,11 @@
 [project]
 name = "ravage"
-version = "0.5.0"
+version = "0.6.0"
 description = "Autonomous web security research agent for controlled authorized targets"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "ravage-schemas==0.5.0",
+    "ravage-schemas==0.6.0", # x-release-please-version
     "pyyaml>=6.0",
     "cryptography>=42.0",
     "rich>=14.1",
@@ -27,6 +27,8 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Intended Audience :: Information Technology",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "License :: OSI Approved :: Apache Software License",
