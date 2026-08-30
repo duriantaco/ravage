@@ -618,7 +618,9 @@ ravage scan ravage-brief.yaml \
 Useful scan options include `--probe NAME`, `--all-probes`,
 `--timeout-seconds N`, `--report`, and `--json`. Treat probe output as evidence
 signals unless the resulting record has passed a formal confirmation gate; a
-count alone is not proof of a vulnerability.
+count alone is not proof of a vulnerability. `--all-probes` can generate
+thousands of bounded requests across the catalog; reserve it for disposable
+local or staging targets, and use focused probes for remote engagements.
 
 ### Optional: capture, inspect, and replay browser traffic
 

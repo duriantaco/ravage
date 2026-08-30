@@ -144,7 +144,10 @@ def _collect_javascript_endpoint_signals(signals: dict[str, list[str]], text: st
 
 
 def _collect_plain_url_signals(signals: dict[str, list[str]], text: str) -> None:
-    pattern = r"https?://[^\s'\"<>]+|/[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+"
+    pattern = (
+        r"https?://[^\s'\"<>]+|"
+        r"(?<![A-Za-z0-9._-])/[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+"
+    )
     for match in re.finditer(pattern, text):
         _record_plain_url(signals, match.group(0))
 

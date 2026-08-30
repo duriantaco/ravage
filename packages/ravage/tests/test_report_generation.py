@@ -129,9 +129,7 @@ def test_json_report_artifact_redacts_late_metadata_and_preserves_existing_repor
     serialized = json.dumps(report, sort_keys=True)
     assert secret_path_component not in serialized
     assert secret_termination_reason not in serialized
-    assert report["artifacts"]["json_report_path"].endswith(
-        "token=<SECRET_REDACTED>/report.json"
-    )
+    assert report["artifacts"]["json_report_path"].endswith("token=<SECRET_REDACTED>/report.json")
     assert report["artifacts"]["markdown_report_path"] == str(markdown_path)
     assert report["run"]["termination_reason"] == "token=<SECRET_REDACTED>"
 
@@ -207,13 +205,181 @@ def test_write_pentest_report_generates_redacted_markdown_and_json(tmp_path: Pat
     assert "api_key=<SECRET_REDACTED>" in markdown
 
 
+def test_report_summarizes_deterministic_scan_work_recon_and_recorded_traffic(
+    tmp_path: Path,
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    workspace.record_event(
+        kind="scan_started",
+        payload={"target_url": "http://127.0.0.1:8765/search?token=private"},
+    )
+    surface_payload = {
+        "probe": "surface_map",
+        "ok": True,
+        "summary": "received 2/3 HTTP response(s), notable=1",
+        "findings": [
+            {
+                "type": "interesting_response",
+                "url": "http://127.0.0.1:8765/admin",
+                "status": 403,
+            }
+        ],
+        "requests": [
+            {"url": "http://127.0.0.1:8765/", "status": 200},
+            {"url": "http://127.0.0.1:8765/admin", "status": 403},
+            {
+                "url": "http://127.0.0.1:8765/missing",
+                "status": None,
+                "error": "connection reset",
+            },
+        ],
+        "errors": [],
+    }
+    workspace.record_event(
+        kind="tool_run_probe",
+        payload={
+            "action_id": "scan-001-surface_map",
+            "observation_id": "scan-observation-1",
+            "ok": True,
+            "timed_out": False,
+            "result": json.dumps(surface_payload),
+        },
+    )
+    workspace.record_event(
+        kind="scan_probe",
+        payload={
+            **surface_payload,
+            "action_id": "scan-001-surface_map",
+            "source_observation_id": "scan-observation-1",
+        },
+    )
+    workspace.record_event(
+        kind="scan_probe",
+        payload={
+            "probe": "input_reflection",
+            "ok": False,
+            "summary": "checked 1 input, findings=0",
+            "findings": [],
+            "requests": [],
+            "errors": [],
+        },
+    )
+    _add_deterministic_scan_traffic(workspace.root)
+    output_path = tmp_path / "run" / "deterministic-report.md"
+
+    report = write_pentest_report(
+        brief_path=brief_path,
+        target_url="http://127.0.0.1:8765",
+        workspace_dir=workspace.root,
+        output_path=output_path,
+        status="completed",
+        completed=True,
+    )
+
+    assert report["work_performed"] == [
+        {
+            "turn": "",
+            "action": "run_probe",
+            "detail": "surface_map: received 2/3 HTTP response(s), notable=1",
+            "outcome": "ok",
+        },
+        {
+            "turn": "",
+            "action": "run_probe",
+            "detail": "input_reflection: checked 1 input, findings=0",
+            "outcome": "not confirmed",
+        },
+    ]
+    assert report["reconnaissance"] == {
+        "target_url": "http://127.0.0.1:8765/search?token=<SECRET_REDACTED>",
+        "origin": "http://127.0.0.1:8765",
+        "page_count": 2,
+        "form_count": 0,
+        "query_parameter_names": [],
+        "interesting_markers": ["interesting_response"],
+        "errors": [],
+        "source_kinds": ["scan_probe:surface_map"],
+        "surface_request_count": 3,
+        "surface_response_count": 2,
+        "surface_status_counts": {"200": 1, "403": 1},
+        "surface_finding_count": 1,
+        "surface_finding_types": ["interesting_response"],
+    }
+    assert report["traffic_accounting"] == {
+        "status": "lower_bound",
+        "provenance": "validated_workspace_traffic_store",
+        "mode": "recorded_scan_traffic",
+        "physical_request_count": 2,
+        "max_physical_requests": None,
+        "remaining_physical_requests": None,
+        "recorded_exchange_count": 2,
+        "blocked_count": 0,
+        "capture_completed": True,
+    }
+    markdown = output_path.read_text(encoding="utf-8")
+    assert "Physical target requests: 2" in markdown
+    assert "Request accounting status: lower_bound" in markdown
+    assert "Surface-map HTTP responses: 2/3 requests" in markdown
+    assert "surface_map: received 2/3 HTTP response(s)" in markdown
+
+
+def test_report_summarizes_orphan_tool_probe_without_duplicating_agent_actions(
+    tmp_path: Path,
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    workspace.record_event(
+        kind="tool_run_probe",
+        payload={
+            "ok": True,
+            "timed_out": False,
+            "result": json.dumps(
+                {
+                    "probe": "surface_map",
+                    "ok": True,
+                    "summary": "fetched 1 URL(s), notable=1",
+                    "findings": [{"type": "interesting_response"}],
+                    "requests": [{"url": "http://127.0.0.1:8765/", "status": 200}],
+                    "errors": [],
+                }
+            ),
+        },
+    )
+    output_path = tmp_path / "run" / "tool-probe-report.md"
+
+    report = write_pentest_report(
+        brief_path=brief_path,
+        target_url="http://127.0.0.1:8765",
+        workspace_dir=workspace.root,
+        output_path=output_path,
+        status="completed",
+        completed=True,
+    )
+
+    assert report["work_performed"] == [
+        {
+            "turn": "",
+            "action": "run_probe",
+            "detail": "surface_map: fetched 1 URL(s), notable=1",
+            "outcome": "ok",
+        }
+    ]
+    assert report["reconnaissance"]["source_kinds"] == ["tool_run_probe:surface_map"]
+    assert report["reconnaissance"]["page_count"] == 1
+    assert report["traffic_accounting"] == {
+        "status": "unavailable",
+        "provenance": "traffic_policy_ledger_missing",
+    }
+
+
 def test_report_links_nested_agent_http_traffic_to_identifier_only_evidence(
     tmp_path: Path,
 ) -> None:
     brief_path = _brief(tmp_path)
     workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
-    graph_workspace, request_id, evidence_ids, material_evidence_ids = (
-        _add_agent_http_provenance(workspace.root)
+    graph_workspace, request_id, evidence_ids, material_evidence_ids = _add_agent_http_provenance(
+        workspace.root
     )
     output_path = tmp_path / "run" / "agent-http-report.md"
 
@@ -300,12 +466,7 @@ def test_report_loads_confirmed_findings_from_nested_graph_events_without_audit_
 ) -> None:
     brief_path = _brief(tmp_path)
     workspace = _workspace_with_report_events(tmp_path)
-    graph_events = (
-        workspace.root
-        / "autonomous-route"
-        / "agent-graph"
-        / "events.jsonl"
-    )
+    graph_events = workspace.root / "autonomous-route" / "agent-graph" / "events.jsonl"
     graph_events.parent.mkdir(parents=True)
     workspace.events_path.replace(graph_events)
 
@@ -328,8 +489,8 @@ def test_report_fails_closed_when_new_graph_http_state_loses_traffic(
 ) -> None:
     brief_path = _brief(tmp_path)
     workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
-    graph_workspace, _request_id, _evidence_ids, _material_ids = (
-        _add_agent_http_provenance(workspace.root)
+    graph_workspace, _request_id, _evidence_ids, _material_ids = _add_agent_http_provenance(
+        workspace.root
     )
     state_path = graph_workspace / "graph-http-state.json"
     state_path.write_text('{"version":2,"target_identity":"target:marker"}\n', encoding="utf-8")
@@ -353,8 +514,8 @@ def test_report_fails_closed_when_new_graph_http_state_loses_traffic(
 def test_report_fails_closed_for_tampered_agent_http_blackboard(tmp_path: Path) -> None:
     brief_path = _brief(tmp_path)
     workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
-    graph_workspace, _request_id, _evidence_ids, _material_ids = (
-        _add_agent_http_provenance(workspace.root)
+    graph_workspace, _request_id, _evidence_ids, _material_ids = _add_agent_http_provenance(
+        workspace.root
     )
     blackboard_path = graph_workspace / "evidence-blackboard.json"
     payload = json.loads(blackboard_path.read_text(encoding="utf-8"))
@@ -380,8 +541,8 @@ def test_report_fails_closed_for_tampered_agent_http_blackboard(tmp_path: Path) 
 def test_report_fails_closed_when_agent_http_blackboard_is_missing(tmp_path: Path) -> None:
     brief_path = _brief(tmp_path)
     workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
-    graph_workspace, _request_id, _evidence_ids, _material_ids = (
-        _add_agent_http_provenance(workspace.root)
+    graph_workspace, _request_id, _evidence_ids, _material_ids = _add_agent_http_provenance(
+        workspace.root
     )
     (graph_workspace / "evidence-blackboard.json").unlink()
 
@@ -402,13 +563,11 @@ def test_report_fails_closed_when_agent_http_blackboard_is_missing(tmp_path: Pat
 def test_report_fails_closed_for_ambiguous_agent_http_provenance(tmp_path: Path) -> None:
     brief_path = _brief(tmp_path)
     workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
-    graph_workspace, _request_id, _evidence_ids, _material_ids = (
-        _add_agent_http_provenance(workspace.root)
+    graph_workspace, _request_id, _evidence_ids, _material_ids = _add_agent_http_provenance(
+        workspace.root
     )
     evidence = graph_workspace / "evidence-blackboard.json"
-    (graph_workspace / "remote-evidence-blackboard.json").write_bytes(
-        evidence.read_bytes()
-    )
+    (graph_workspace / "remote-evidence-blackboard.json").write_bytes(evidence.read_bytes())
     output_path = tmp_path / "run" / "ambiguous-agent-http-report.md"
 
     with pytest.raises(
@@ -479,8 +638,8 @@ def test_cli_report_surfaces_malformed_agent_http_store_without_traceback(
 ) -> None:
     brief_path = _brief(tmp_path)
     workspace = _workspace_with_report_events(tmp_path)
-    graph_workspace, _request_id, _evidence_ids, _material_ids = (
-        _add_agent_http_provenance(workspace.root)
+    graph_workspace, _request_id, _evidence_ids, _material_ids = _add_agent_http_provenance(
+        workspace.root
     )
     (graph_workspace / "traffic" / "exchanges.jsonl").write_text(
         f'{{"unsafe":"{_AGENT_HTTP_SECRET}"',
@@ -634,9 +793,7 @@ def test_report_ignores_same_scope_findings_from_other_engagements(
         audit_db_path=audit_path,
     )
 
-    assert [finding["finding_id"] for finding in report["findings"]] == [
-        "finding-current"
-    ]
+    assert [finding["finding_id"] for finding in report["findings"]] == ["finding-current"]
     assert report["findings"][0]["hypothesis"] == "Current engagement finding."
 
 
@@ -682,9 +839,7 @@ def test_report_only_uses_current_in_scope_workspace_findings(tmp_path: Path) ->
         completed=True,
     )
 
-    assert [finding["finding_id"] for finding in report["findings"]] == [
-        "finding-current"
-    ]
+    assert [finding["finding_id"] for finding in report["findings"]] == ["finding-current"]
     assert "parameterized queries" in report["findings"][0]["recommendation"]
 
 
@@ -906,10 +1061,7 @@ def _add_agent_http_provenance(
             source="agent_http",
             source_observation_id=_AGENT_HTTP_OBSERVATION_ID,
             method="GET",
-            url=(
-                "http://127.0.0.1:8765/proof?token="
-                f"{_AGENT_HTTP_SECRET}"
-            ),
+            url=(f"http://127.0.0.1:8765/proof?token={_AGENT_HTTP_SECRET}"),
             request_headers={"Authorization": f"Bearer {_AGENT_HTTP_SECRET}"},
             request_sent=True,
             response_status=200,
@@ -934,6 +1086,30 @@ def _add_agent_http_provenance(
         tuple(record.evidence_id for record in records),
         tuple(record.evidence_id for record in records if record.material),
     )
+
+
+def _add_deterministic_scan_traffic(workspace: Path) -> None:
+    capture_session_id = "deterministic-report-session"
+    store = TrafficStore.create(workspace)
+    manifest = TrafficRunManifest.create(
+        target_url="http://127.0.0.1:8765",
+        capture_session_id=capture_session_id,
+    )
+    write_traffic_manifest(workspace, manifest.complete())
+    for path, status in (("/", 200), ("/admin", 403)):
+        store.append_exchange(
+            build_captured_http_exchange(
+                capture_session_id=capture_session_id,
+                source="probe_session",
+                method="GET",
+                url=f"http://127.0.0.1:8765{path}",
+                request_sent=True,
+                response_status=status,
+                response_final_url=f"http://127.0.0.1:8765{path}",
+                response_body="bounded response",
+                scope_decision="allowed",
+            )
+        )
 
 
 def _confirmed_finding_payload(

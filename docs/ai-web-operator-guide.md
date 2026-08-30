@@ -134,6 +134,12 @@ ravage scan examples/labs/ravage-acme-box/brief.yaml \
 Use `--all-probes` to run the full deterministic catalog, or repeat `--probe`
 for a focused run. Inspect available probes with:
 
+`--all-probes` is intentionally broad and can generate thousands of bounded
+requests across the catalog even while respecting the brief's rate limit. Use
+it on disposable local or staging targets. For an authorized remote target,
+start with `surface_map` and add only the probes justified by the rules of
+engagement.
+
 ```bash
 ravage scan --help
 ravage tools list

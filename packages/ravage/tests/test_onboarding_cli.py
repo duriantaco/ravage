@@ -409,3 +409,181 @@ def test_scan_http_error_status_still_counts_as_reachable(
     manifest = read_manifest(run_dir)
     assert manifest is not None
     assert manifest.result_label == "completed"
+
+
+def test_scan_persists_confirmed_native_finding_without_a_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    brief = tmp_path / "brief.yaml"
+    run_dir = tmp_path / "scan-run"
+    brief.write_text(BRIEF_YAML, encoding="utf-8")
+    monkeypatch.setattr(cli, "run_builtin_probe", lambda *_args, **_kwargs: _file_read_result())
+
+    cli.main(
+        [
+            "scan",
+            str(brief),
+            "--probe",
+            "file_read_extract",
+            "--run-dir",
+            str(run_dir),
+            "--report",
+            "--json",
+        ]
+    )
+    capsys.readouterr()
+
+    summary = json.loads((run_dir / "scan-summary.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+    events = [
+        json.loads(line)
+        for line in (run_dir / "workspace" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+
+    assert "findings_count" not in summary
+    assert summary["probe_observations_count"] == 1
+    assert summary["confirmed_findings_count"] == 1
+    assert summary["flags"] == []
+    assert report["executive_summary"]["finding_count"] == 1
+    assert report["captured_proofs"]["count"] == 0
+    assert report["outcome"]["confirmed_finding_count"] == 1
+    assert report["outcome"]["stage"] == "exploit_primitive"
+    assert [finding["vuln_class"] for finding in report["findings"]] == [
+        "path_traversal"
+    ]
+    assert {event["kind"] for event in events} >= {
+        "scan_probe",
+        "tool_run_probe",
+        "outcome_evidence_observed",
+        "finding_confirmed",
+    }
+
+
+def test_scan_separates_candidates_and_exhausted_records_from_confirmed_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    brief = tmp_path / "brief.yaml"
+    run_dir = tmp_path / "scan-run"
+    brief.write_text(BRIEF_YAML, encoding="utf-8")
+    results = iter((_surface_candidate_result(), _exhausted_result()))
+    monkeypatch.setattr(cli, "run_builtin_probe", lambda *_args, **_kwargs: next(results))
+
+    cli.main(
+        [
+            "scan",
+            str(brief),
+            "--probe",
+            "surface_map",
+            "--probe",
+            "sqli_auth_transition",
+            "--run-dir",
+            str(run_dir),
+            "--report",
+            "--json",
+        ]
+    )
+    capsys.readouterr()
+
+    summary = json.loads((run_dir / "scan-summary.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+    events = [
+        json.loads(line)
+        for line in (run_dir / "workspace" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+
+    assert summary["probe_observations_count"] == 2
+    assert summary["confirmed_findings_count"] == 0
+    assert report["findings"] == []
+    assert report["outcome"]["stage"] == "suspected_vulnerability"
+    assert report["outcome"]["suspected_vulnerability_count"] == 1
+    scan_findings = [
+        finding["type"]
+        for event in events
+        if event["kind"] == "scan_probe"
+        for finding in event["payload"]["findings"]
+    ]
+    assert scan_findings == ["notable_response", "sqli_auth_transition_exhausted"]
+    assert not any(event["kind"] == "finding_confirmed" for event in events)
+
+
+def _file_read_result() -> ProbeRunResult:
+    url = "http://127.0.0.1:8765/view?file=../../../../etc/passwd"
+    return ProbeRunResult(
+        ok=True,
+        probe="file_read_extract",
+        summary="confirmed local file read without a captured proof",
+        findings=[
+            {
+                "type": "file_read_primitive",
+                "payload": "../../../../etc/passwd",
+                "signal": {"kind": "local_file_read", "matches": ["root:x:0:0"]},
+                "delta": {"body_changed": True},
+                "response": {
+                    "method": "GET",
+                    "url": url,
+                    "final_url": "http://127.0.0.1:8765/view",
+                    "status": 200,
+                    "elapsed_ms": 1,
+                    "body_len": 32,
+                    "body_sha_hint": "0123456789abcdef",
+                    "body_snippet": "root:x:0:0:root:/root:/bin/sh",
+                    "error": "",
+                },
+                "replay": {
+                    "method": "GET",
+                    "url": url,
+                    "payload_field": "file",
+                },
+            }
+        ],
+        requests=[
+            {
+                "method": "GET",
+                "url": url,
+                "status": 200,
+                "error": "",
+            }
+        ],
+    )
+
+
+def _surface_candidate_result() -> ProbeRunResult:
+    url = "http://127.0.0.1:8765/"
+    return ProbeRunResult(
+        ok=True,
+        probe="surface_map",
+        summary="fetched 1 URL, notable=1",
+        findings=[
+            {
+                "type": "notable_response",
+                "url": url,
+                "status": 200,
+                "body_markers": ["login"],
+            }
+        ],
+        requests=[{"method": "GET", "url": url, "status": 200, "error": ""}],
+    )
+
+
+def _exhausted_result() -> ProbeRunResult:
+    url = "http://127.0.0.1:8765/login"
+    return ProbeRunResult(
+        ok=False,
+        probe="sqli_auth_transition",
+        summary="terminal_reason=matrix_exhausted, authenticated=false",
+        findings=[
+            {
+                "type": "sqli_auth_transition_exhausted",
+                "attempts": [{"input": "password", "verified": False}],
+            }
+        ],
+        requests=[{"method": "POST", "url": url, "status": 401, "error": ""}],
+    )

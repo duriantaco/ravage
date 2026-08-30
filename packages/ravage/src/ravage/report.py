@@ -8,6 +8,7 @@ import stat
 from datetime import UTC, datetime
 from importlib import import_module
 from typing import TYPE_CHECKING, Any, Self, cast
+from urllib.parse import urlsplit
 
 from ravage.finding_evidence import confirmed_finding_evidence_failures
 from ravage.hosting_layer import HOSTING_LAYER_EVENT_KIND, run_configured_hosting_layer_agent
@@ -21,6 +22,7 @@ from ravage.traffic.manifest import (
 )
 from ravage.traffic.policy import TrafficPolicyError, load_traffic_policy_snapshot
 from ravage.traffic.provenance import TrafficProvenanceError, load_traffic_provenance
+from ravage.traffic.redaction import REDACTED_URL, sanitize_url
 from ravage.traffic.store import TrafficStore, TrafficStoreError
 
 if TYPE_CHECKING:
@@ -328,7 +330,7 @@ def build_pentest_report(  # noqa: PLR0913
     generated_at = datetime.now(UTC).isoformat()
     target = target_url or _target_from_events(events) or (manifest.target_url if manifest else "")
     agent_http_evidence = _agent_http_evidence_summary(workspace_dir)
-    traffic_accounting = _traffic_accounting_summary(workspace_dir)
+    traffic_accounting = _traffic_accounting_summary(workspace_dir, events=events)
     report = {
         "schema_version": REPORT_SCHEMA_VERSION,
         "generated_at": generated_at,
@@ -441,16 +443,7 @@ def render_markdown_report(report: dict[str, Any]) -> str:  # noqa: PLR0915
     ]
     lines.extend(f"- {item}" for item in _list(report.get("methodology")))
     lines.extend(["", "## Reconnaissance", ""])
-    recon = _dict(report.get("reconnaissance"))
-    lines.extend(
-        [
-            f"- Pages observed: {recon.get('page_count', 0)}",
-            f"- Forms observed: {recon.get('form_count', 0)}",
-            f"- Query parameters observed: {_join(_list(recon.get('query_parameter_names')))}",
-            f"- Interesting markers: {_join(_list(recon.get('interesting_markers')))}",
-            "",
-        ]
-    )
+    lines.extend(_recon_markdown(_dict(report.get("reconnaissance"))))
     hosting = _dict(report.get("hosting_layer"))
     if bool(hosting.get("enabled")):
         lines.extend(_hosting_layer_markdown(hosting))
@@ -524,6 +517,36 @@ def render_markdown_report(report: dict[str, Any]) -> str:  # noqa: PLR0915
     return "\n".join(lines)
 
 
+def _recon_markdown(recon: dict[str, Any]) -> list[str]:
+    lines = [
+        f"- Pages observed: {recon.get('page_count', 0)}",
+        f"- Forms observed: {recon.get('form_count', 0)}",
+        f"- Query parameters observed: {_join(_list(recon.get('query_parameter_names')))}",
+        f"- Interesting markers: {_join(_list(recon.get('interesting_markers')))}",
+    ]
+    recon_sources = _list(recon.get("source_kinds"))
+    if recon_sources:
+        lines.append(f"- Evidence sources: {_join(recon_sources)}")
+    surface_requests = recon.get("surface_request_count")
+    surface_responses = recon.get("surface_response_count")
+    if (
+        isinstance(surface_requests, int)
+        and surface_requests > 0
+        and isinstance(surface_responses, int)
+    ):
+        lines.append(
+            f"- Surface-map HTTP responses: {surface_responses}/{surface_requests} requests"
+        )
+    status_counts = _dict(recon.get("surface_status_counts"))
+    if status_counts:
+        status_summary = ", ".join(f"{status}={count}" for status, count in status_counts.items())
+        lines.append(f"- Surface-map status counts: {status_summary}")
+    finding_types = _list(recon.get("surface_finding_types"))
+    if finding_types:
+        lines.append(f"- Surface-map signals: {_join(finding_types)}")
+    return [*lines, ""]
+
+
 def redact_sensitive(value: str) -> str:
     redacted = _PROOF_RE.sub(lambda match: _mask_proof(match.group(0)), str(value))
     for pattern in _SECRET_PATTERNS:
@@ -531,9 +554,19 @@ def redact_sensitive(value: str) -> str:
     return redacted
 
 
-def _traffic_accounting_summary(workspace_dir: Path) -> dict[str, object]:
+def _traffic_accounting_summary(
+    workspace_dir: Path,
+    *,
+    events: list[dict[str, Any]],
+) -> dict[str, object]:
     ledger_path = workspace_dir / "traffic-policy.json"
     if not ledger_path.exists():
+        scan_accounting = _scan_traffic_accounting_summary(
+            workspace_dir,
+            events=events,
+        )
+        if scan_accounting is not None:
+            return scan_accounting
         return {
             "status": "unavailable",
             "provenance": "traffic_policy_ledger_missing",
@@ -551,9 +584,7 @@ def _traffic_accounting_summary(workspace_dir: Path) -> dict[str, object]:
         None
         if limit is None
         else max(
-            limit
-            - snapshot.physical_request_count
-            - snapshot.reservation_count,
+            limit - snapshot.physical_request_count - snapshot.reservation_count,
             0,
         )
     )
@@ -579,6 +610,52 @@ def _traffic_accounting_summary(workspace_dir: Path) -> dict[str, object]:
     }
 
 
+def _scan_traffic_accounting_summary(
+    workspace_dir: Path,
+    *,
+    events: list[dict[str, Any]],
+) -> dict[str, object] | None:
+    if not any(event.get("kind") == "scan_probe" for event in events):
+        return None
+    try:
+        traffic_workspace = resolve_workspace(workspace_dir)
+    except TrafficRunError as exc:
+        if _canonical_traffic_artifacts_present(workspace_dir):
+            message = "traffic artifacts are present but could not be validated"
+            raise TrafficProvenanceError(message) from exc
+        return None
+    try:
+        traffic_manifest = read_traffic_manifest(traffic_workspace)
+        exchanges = TrafficStore.open(traffic_workspace).exchanges()
+    except (TrafficRunError, TrafficStoreError) as exc:
+        message = "traffic artifacts are present but could not be validated"
+        raise TrafficProvenanceError(message) from exc
+    if any(
+        exchange.capture_session_id != traffic_manifest.capture_session_id for exchange in exchanges
+    ):
+        message = "traffic capture session does not match its run manifest"
+        raise TrafficProvenanceError(message)
+
+    scan_exchanges = tuple(exchange for exchange in exchanges if exchange.source == "probe_session")
+    if not scan_exchanges:
+        return None
+    physical_requests = sum(exchange.request_sent for exchange in scan_exchanges)
+    return {
+        # The store proves these dispatches occurred, but without the physical
+        # policy ledger it cannot prove that redirects or recorder failures did
+        # not add requests. Never promote this fallback to exact accounting.
+        "status": "lower_bound",
+        "provenance": "validated_workspace_traffic_store",
+        "mode": "recorded_scan_traffic",
+        "physical_request_count": physical_requests,
+        "max_physical_requests": None,
+        "remaining_physical_requests": None,
+        "recorded_exchange_count": len(scan_exchanges),
+        "blocked_count": sum(not exchange.request_sent for exchange in scan_exchanges),
+        "capture_completed": bool(traffic_manifest.completed_at),
+    }
+
+
 def _agent_http_evidence_summary(
     workspace_dir: Path,
 ) -> dict[str, object]:
@@ -600,8 +677,7 @@ def _agent_http_evidence_summary(
         message = "traffic artifacts are present but could not be validated"
         raise TrafficProvenanceError(message) from exc
     if any(
-        exchange.capture_session_id != traffic_manifest.capture_session_id
-        for exchange in exchanges
+        exchange.capture_session_id != traffic_manifest.capture_session_id for exchange in exchanges
     ):
         message = "traffic capture session does not match its run manifest"
         raise TrafficProvenanceError(message)
@@ -630,17 +706,11 @@ def _agent_http_evidence_summary(
         return _empty_agent_http_evidence_summary()
 
     evidence_ids = tuple(
-        dict.fromkeys(
-            evidence_id
-            for link in agent_links
-            for evidence_id in link.evidence_refs
-        )
+        dict.fromkeys(evidence_id for link in agent_links for evidence_id in link.evidence_refs)
     )
     material_evidence_ids = tuple(
         dict.fromkeys(
-            evidence_id
-            for link in agent_links
-            for evidence_id in link.material_evidence_refs
+            evidence_id for link in agent_links for evidence_id in link.material_evidence_refs
         )
     )
     links = [
@@ -708,9 +778,8 @@ def _graph_traffic_expected(workspace_dir: Path) -> bool:
             return True
 
         remote_state = _read_bounded_json_object(candidate / "remote-http-state.json")
-        if (
-            remote_state.get("version") == _PRIVATE_HTTP_STATE_VERSION
-            and remote_state.get("target_identity")
+        if remote_state.get("version") == _PRIVATE_HTTP_STATE_VERSION and remote_state.get(
+            "target_identity"
         ):
             return True
         for receipt_name in ("graph-route-receipt.json", "remote-graph-receipt.json"):
@@ -1020,10 +1089,47 @@ def _proof_observations(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _work_performed(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     work: list[dict[str, Any]] = []
     outcomes_by_action_id = _outcomes_by_action_id(events)
+    started_action_ids = {
+        action_id
+        for event in events
+        if event.get("kind") == "action_started"
+        if (action_id := str(_dict(event.get("payload")).get("action_id") or ""))
+    }
+    scan_action_ids, scan_observation_ids = _scan_probe_link_ids(events)
+    reported_scan_actions: set[str] = set()
+    reported_scan_observations: set[str] = set()
     for event in events:
-        if event.get("kind") != "action_started":
-            continue
+        kind = str(event.get("kind") or "")
         payload = _dict(event.get("payload"))
+        if kind == "scan_probe":
+            action_id = str(payload.get("action_id") or "")
+            observation_id = str(payload.get("source_observation_id") or "")
+            if (action_id and action_id in reported_scan_actions) or (
+                observation_id and observation_id in reported_scan_observations
+            ):
+                continue
+            if action_id:
+                reported_scan_actions.add(action_id)
+            if observation_id:
+                reported_scan_observations.add(observation_id)
+            work.append(_probe_work_item(payload, outcome=""))
+            continue
+        if kind == "tool_run_probe":
+            action_id = str(payload.get("action_id") or "")
+            observation_id = str(payload.get("observation_id") or "")
+            paired_scan_event = (bool(action_id) and action_id in scan_action_ids) or (
+                bool(observation_id) and observation_id in scan_observation_ids
+            )
+            if not paired_scan_event and action_id not in started_action_ids:
+                work.append(
+                    _probe_work_item(
+                        _tool_probe_result(payload),
+                        outcome=_probe_outcome(payload),
+                    )
+                )
+            continue
+        if kind != "action_started":
+            continue
         action_id = str(payload.get("action_id") or "")
         params = _dict(payload.get("params"))
         detail = str(payload.get("detail") or "")
@@ -1040,6 +1146,49 @@ def _work_performed(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return work[:80]
+
+
+def _probe_work_item(
+    payload: dict[str, Any],
+    *,
+    outcome: str,
+) -> dict[str, Any]:
+    probe = str(payload.get("probe") or "")
+    summary = str(payload.get("summary") or "")
+    detail = ": ".join(part for part in (probe, summary) if part)
+    return {
+        "turn": payload.get("turn", ""),
+        "action": "run_probe",
+        "detail": _clip(detail, 180),
+        "outcome": outcome or _probe_outcome(payload),
+    }
+
+
+def _probe_outcome(payload: dict[str, Any]) -> str:
+    if payload.get("timed_out") is True:
+        return "timed out"
+    ok = payload.get("ok")
+    if isinstance(ok, bool):
+        return "ok" if ok else "not confirmed"
+    return ""
+
+
+def _tool_probe_result(payload: dict[str, Any]) -> dict[str, Any]:
+    result = payload.get("result")
+    if not isinstance(result, str):
+        return payload
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, RecursionError):
+        return payload
+    if not isinstance(parsed, dict):
+        return payload
+    normalized = {str(key): value for key, value in parsed.items()}
+    if "ok" not in normalized and isinstance(payload.get("ok"), bool):
+        normalized["ok"] = payload["ok"]
+    if payload.get("timed_out") is True:
+        normalized["timed_out"] = True
+    return normalized
 
 
 def _outcomes_by_action_id(events: list[dict[str, Any]]) -> dict[str, str]:
@@ -1073,19 +1222,134 @@ def _recon_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
             payload = _dict(event.get("payload"))
     pages = [_dict(item) for item in _list(payload.get("pages")) if isinstance(item, dict)]
     forms = sum(len(_list(page.get("forms"))) for page in pages)
+    recon_page_urls = {str(page.get("url") or "") for page in pages if str(page.get("url") or "")}
+    additional_surface_urls: set[str] = set()
+    surface_payloads = _surface_map_payloads(events)
+    surface_requests = [
+        _dict(item)
+        for surface_payload in surface_payloads
+        for item in _list(surface_payload.get("requests"))
+        if isinstance(item, dict)
+    ]
+    surface_findings = [
+        _dict(item)
+        for surface_payload in surface_payloads
+        for item in _list(surface_payload.get("findings"))
+        if isinstance(item, dict)
+    ]
+    surface_response_count = 0
+    surface_status_counts: dict[str, int] = {}
+    for request in surface_requests:
+        status = request.get("status")
+        if not isinstance(status, int) or isinstance(status, bool):
+            continue
+        surface_response_count += 1
+        status_label = str(status)
+        surface_status_counts[status_label] = surface_status_counts.get(status_label, 0) + 1
+        url = str(request.get("final_url") or request.get("url") or "")
+        if url and url not in recon_page_urls:
+            additional_surface_urls.add(url)
+    source_kinds: list[str] = []
+    if payload:
+        source_kinds.append("recon_completed")
+    source_kinds.extend(
+        str(surface_payload.get("_report_source") or "") for surface_payload in surface_payloads
+    )
+    surface_finding_types = _dedupe_strings(
+        [str(finding.get("type") or "") for finding in surface_findings]
+    )[:20]
+    target_url = str(payload.get("target_url") or _target_from_events(events))
     return {
-        "target_url": str(payload.get("target_url") or ""),
-        "origin": str(payload.get("origin") or ""),
-        "page_count": len(pages),
+        "target_url": target_url,
+        "origin": str(payload.get("origin") or _safe_origin(target_url)),
+        "page_count": len(pages) + len(additional_surface_urls),
         "form_count": forms,
         "query_parameter_names": _dedupe_strings(
             [str(item) for item in _list(payload.get("query_parameter_names"))]
         )[:20],
         "interesting_markers": _dedupe_strings(
-            [str(item) for item in _list(payload.get("interesting_markers"))]
+            [
+                *[str(item) for item in _list(payload.get("interesting_markers"))],
+                *surface_finding_types,
+            ]
         )[:20],
-        "errors": _dedupe_strings([str(item) for item in _list(payload.get("errors"))])[:10],
+        "errors": _dedupe_strings(
+            [
+                *[str(item) for item in _list(payload.get("errors"))],
+                *[
+                    str(item)
+                    for surface_payload in surface_payloads
+                    for item in _list(surface_payload.get("errors"))
+                ],
+            ]
+        )[:10],
+        "source_kinds": _dedupe_strings(source_kinds),
+        "surface_request_count": len(surface_requests),
+        "surface_response_count": surface_response_count,
+        "surface_status_counts": dict(
+            sorted(surface_status_counts.items(), key=lambda item: int(item[0]))
+        ),
+        "surface_finding_count": len(surface_findings),
+        "surface_finding_types": surface_finding_types,
     }
+
+
+def _surface_map_payloads(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    scan_action_ids, scan_observation_ids = _scan_probe_link_ids(events)
+    seen_action_ids: set[str] = set()
+    seen_observation_ids: set[str] = set()
+    for event in events:
+        kind = str(event.get("kind") or "")
+        payload = _dict(event.get("payload"))
+        if kind == "scan_probe":
+            result = payload
+        elif kind == "tool_run_probe":
+            action_id = str(payload.get("action_id") or "")
+            observation_id = str(payload.get("observation_id") or "")
+            if (action_id and action_id in scan_action_ids) or (
+                observation_id and observation_id in scan_observation_ids
+            ):
+                continue
+            result = _tool_probe_result(payload)
+        else:
+            continue
+        if str(result.get("probe") or "") != "surface_map":
+            continue
+        action_id = str(payload.get("action_id") or "")
+        observation_id = str(
+            payload.get("source_observation_id") or payload.get("observation_id") or ""
+        )
+        if (action_id and action_id in seen_action_ids) or (
+            observation_id and observation_id in seen_observation_ids
+        ):
+            continue
+        if action_id:
+            seen_action_ids.add(action_id)
+        if observation_id:
+            seen_observation_ids.add(observation_id)
+        result = dict(result)
+        result["_report_source"] = f"{kind}:surface_map"
+        payloads.append(result)
+    return payloads
+
+
+def _scan_probe_link_ids(
+    events: list[dict[str, Any]],
+) -> tuple[set[str], set[str]]:
+    action_ids: set[str] = set()
+    observation_ids: set[str] = set()
+    for event in events:
+        if event.get("kind") != "scan_probe":
+            continue
+        payload = _dict(event.get("payload"))
+        action_id = str(payload.get("action_id") or "")
+        observation_id = str(payload.get("source_observation_id") or "")
+        if action_id:
+            action_ids.add(action_id)
+        if observation_id:
+            observation_ids.add(observation_id)
+    return action_ids, observation_ids
 
 
 def _hosting_layer_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1294,8 +1558,7 @@ def _executive_summary_text(  # noqa: PLR0913
         )
     if not completed and status != "completed":
         partial = (
-            "The assessment did not reach normal completion. "
-            "Results should be treated as partial."
+            "The assessment did not reach normal completion. Results should be treated as partial."
         )
         if finding_count:
             partial += (
@@ -1386,10 +1649,23 @@ def _title_for(vuln_class: str, endpoint: dict[str, Any]) -> str:
 
 def _target_from_events(events: list[dict[str, Any]]) -> str:
     for event in events:
-        if event.get("kind") == "agent_started":
+        if event.get("kind") in {"agent_started", "scan_started"}:
             payload = _dict(event.get("payload"))
             return str(payload.get("target_url") or "")
     return ""
+
+
+def _safe_origin(target_url: str) -> str:
+    safe_target = sanitize_url(target_url)
+    if safe_target == REDACTED_URL:
+        return ""
+    try:
+        parsed = urlsplit(safe_target)
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 def _dedupe_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:

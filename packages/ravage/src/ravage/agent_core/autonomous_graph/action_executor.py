@@ -14,10 +14,10 @@ from ravage.agent_core.action_executor import (
     _decode_probe_runner_payload,
     _probe_failure_text,
     _probe_wall_timeout,
-    _record_probe_result,
-    _record_verified_probe_finding,
     _timeout,
     execute_action,
+    record_probe_result,
+    record_verified_probe_findings,
 )
 from ravage.agent_core.autonomous_graph.effort_policy import (
     GRAPH_ROUTE_TARGET_REQUEST_LIMIT,
@@ -115,7 +115,7 @@ def execute_graph_action(
             traffic_policy.to_reference() if traffic_policy is not None else None
         ),
     )
-    result = _record_probe_result(
+    result = record_probe_result(
         probe_result.text,
         ok=probe_result.ok,
         kind="tool_run_probe",
@@ -130,7 +130,7 @@ def execute_graph_action(
         max_observation_chars=max_observation_chars,
         max_transcript_chars=max_transcript_chars,
     )
-    return _record_verified_probe_finding(
+    return record_verified_probe_findings(
         probe=probe,
         probe_text=probe_result.text,
         result=result,

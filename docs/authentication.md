@@ -55,7 +55,8 @@ and skips unavailable probes during the default or `--all-probes` selection. If
 you explicitly name an incompatible probe with `--probe`, Ravage fails closed
 before dispatch instead of silently changing its identity policy. The attack
 example assumes a paid model route; omit `--allow-paid-models` when using a
-local model.
+local model. The full catalog can generate thousands of bounded requests, so
+use focused probes unless the target and rules of engagement allow that breadth.
 
 Use `--identity user` explicitly in saved commands and automation. The public
 `ravage attack` wrapper selects the identity automatically when the brief has
