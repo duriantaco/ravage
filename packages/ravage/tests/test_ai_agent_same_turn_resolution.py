@@ -46,6 +46,27 @@ def test_premature_final_uses_open_surface_route_in_the_same_turn() -> None:
     assert selected["task_id"] == "surface-map"
 
 
+def test_injected_model_final_uses_open_surface_route_in_the_same_turn() -> None:
+    state = AgentState(turn=3)
+    state.surface["flag_objective"] = False
+    state.tasks = [_task("surface-map", priority=100)]
+    proposed = {"action": "final", "summary": "stop"}
+
+    selected, reason = _resolve_same_turn_harness_action(
+        state=state,
+        proposed_action=proposed,
+        selected_action=proposed,
+        turn=3,
+        max_turns=40,
+        settings=AIWebAgentSettings(),
+    )
+
+    assert reason == "premature_final_required_work_fallback"
+    assert selected["action"] == "run_probe"
+    assert selected["probe"] == "surface_map"
+    assert selected["task_id"] == "surface-map"
+
+
 def test_locked_primitive_precedes_a_higher_priority_open_recon_task() -> None:
     state = AgentState(turn=4)
     state.surface["flag_objective"] = False
@@ -134,6 +155,26 @@ def test_live_tier_one_primitive_prevents_synthesized_final() -> None:
 
     assert selected == proposed
     assert reason is None
+
+
+def test_injected_model_final_cannot_skip_a_live_primitive_route() -> None:
+    state = AgentState(turn=5)
+    state.surface["flag_objective"] = False
+    state.tasks = [_task("api-behavior", priority=100, status="done")]
+    state.primitives["jwt_observed"] = 5
+    proposed = {"action": "final", "summary": "stop"}
+
+    selected, reason = _resolve_same_turn_harness_action(
+        state=state,
+        proposed_action=proposed,
+        selected_action=proposed,
+        turn=5,
+        max_turns=40,
+        settings=AIWebAgentSettings(),
+    )
+
+    assert selected["action"] != "final"
+    assert reason == "premature_final_required_work_guard"
 
 
 def test_auth_unavailable_live_route_does_not_cost_an_extra_model_turn() -> None:

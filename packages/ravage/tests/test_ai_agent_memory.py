@@ -6,6 +6,7 @@ from io import StringIO
 from typing import TYPE_CHECKING
 
 from ai_agent_fixtures import BRIEF_YAML, ScriptedModelClient, VulnerableOpenApiHttpClient
+from ravage.agent_core import ai_agent
 from ravage.agent_core.ai_agent import (
     AIWebAgentSettings,
     ChatMessage,
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
+    import pytest
     from ravage.model_core.providers import ResolvedModelRoute
 
 
@@ -32,7 +34,10 @@ class _CostlyScriptedModelClient(ScriptedModelClient):
         return ModelReply(content=reply.content, cost_usd=1.0)
 
 
-def test_ai_web_memory_read_injects_only_verified_or_promoted_memories(tmp_path: Path) -> None:
+def test_ai_web_memory_read_injects_only_verified_or_promoted_memories(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     memory_db = tmp_path / "memory.db"
     store = MemoryStore(memory_db)
     try:
@@ -63,6 +68,7 @@ def test_ai_web_memory_read_injects_only_verified_or_promoted_memories(tmp_path:
     model = ScriptedModelClient(
         [{"action": "final", "args": {"summary": "done"}, "rationale": "done"}]
     )
+    monkeypatch.setattr(ai_agent, "_deterministic_harness_fallback", lambda **_kwargs: None)
 
     run_ai_web_agent(
         brief_path=brief_path,
@@ -75,6 +81,7 @@ def test_ai_web_memory_read_injects_only_verified_or_promoted_memories(tmp_path:
             stdout=StringIO(),
             memory=MemoryRunSettings(mode="read", db_path=memory_db, min_confidence=0.0),
             memory_explicit=True,
+            max_turns=1,
         ),
     )
 
@@ -89,8 +96,8 @@ def test_ai_web_memory_read_injects_only_verified_or_promoted_memories(tmp_path:
     )
     assert finished["audit_path"] == str(tmp_path / "run.db")
     assert finished["flag_objective"] is False
-    assert finished["status"] == "completed"
-    assert finished["termination_reason"] == "agent_final"
+    assert finished["status"] == "incomplete"
+    assert finished["termination_reason"] == "max_turns_reached"
     assert "report_path" not in finished
 
     first_request_text = "\n".join(message.content for message in model.messages_seen[0])
@@ -123,7 +130,6 @@ def test_ai_web_memory_write_stores_reflection_candidates_after_confirmed_eviden
                 "args": {"path": "/search", "param": "q"},
                 "rationale": "confirmed",
             },
-            {"action": "final", "args": {"summary": "done"}, "rationale": "done"},
             {
                 "memories": [
                     {
@@ -166,6 +172,7 @@ def test_ai_web_memory_write_stores_reflection_candidates_after_confirmed_eviden
             stdout=StringIO(),
             memory=MemoryRunSettings(mode="write", db_path=memory_db, min_confidence=0.0),
             memory_explicit=True,
+            max_turns=3,
         ),
     )
 
@@ -214,7 +221,6 @@ def test_retrieved_memory_cannot_bypass_evidence_gate(tmp_path: Path) -> None:
                 "args": {"path": "/search", "param": "q"},
                 "rationale": "try from memory",
             },
-            {"action": "final", "args": {"summary": "done"}, "rationale": "done"},
         ]
     )
 
@@ -229,6 +235,7 @@ def test_retrieved_memory_cannot_bypass_evidence_gate(tmp_path: Path) -> None:
             stdout=StringIO(),
             memory=MemoryRunSettings(mode="read", db_path=memory_db, min_confidence=0.0),
             memory_explicit=True,
+            max_turns=1,
         ),
     )
 
@@ -284,7 +291,6 @@ def test_ai_web_memory_records_model_provenance(tmp_path: Path) -> None:
                 "args": {"path": "/search", "param": "q"},
                 "rationale": "confirmed",
             },
-            {"action": "final", "args": {"summary": "done"}, "rationale": "done"},
             {
                 "memories": [
                     {
@@ -322,6 +328,7 @@ def test_ai_web_memory_records_model_provenance(tmp_path: Path) -> None:
             stdout=StringIO(),
             memory=MemoryRunSettings(mode="learn", db_path=memory_db, min_confidence=0.0),
             memory_explicit=True,
+            max_turns=3,
         ),
     )
 

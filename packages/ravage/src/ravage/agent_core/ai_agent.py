@@ -1165,7 +1165,13 @@ def _resolve_same_turn_harness_action(  # noqa: PLR0913 - explicit turn boundary
     """Replace a known no-op selection before it consumes the current turn."""
     selected = dict(selected_action)
     if selected.get("action") == "final":
-        if not _hard_final_requirement_unmet(state):
+        if not _final_is_premature(
+            action=selected,
+            state=state,
+            turn=turn,
+            max_turns=max_turns,
+            settings=settings,
+        ):
             return selected, None
         fallback = _deterministic_harness_fallback(
             state=state,
@@ -2478,13 +2484,6 @@ def _proof_objective_completion_met(
     return (
         not _has_open_assessment_tasks(state)
         and not _has_executable_live_primitive_route(state, settings=settings)
-    )
-
-
-def _hard_final_requirement_unmet(state: AgentState) -> bool:
-    return (
-        _proof_count_requirement_unmet(state)
-        or pending_closure_obligation(state) is not None
     )
 
 

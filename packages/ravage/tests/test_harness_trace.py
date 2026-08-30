@@ -4,6 +4,7 @@ import json
 from typing import TYPE_CHECKING
 
 from ai_agent_fixtures import BRIEF_YAML, ScriptedModelClient
+from ravage.agent_core import ai_agent
 from ravage.agent_core.agent_state import AgentState
 from ravage.agent_core.ai_agent import AIWebAgentSettings, run_ai_web_agent
 from ravage.agent_core.harness_trace import (
@@ -19,6 +20,8 @@ from ravage.agent_core.semantic_routes import semantic_action_fingerprint, seman
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import pytest
 
 
 def test_harness_trace_redacts_secret_shaped_action_values() -> None:
@@ -248,7 +251,12 @@ def test_attempt_ledger_round_trips_without_entering_baseline_prompt_memory() ->
     assert marker not in str(build_planner_memory(restored))
 
 
-def test_agent_persists_one_attempt_record_per_executed_turn(tmp_path: Path) -> None:
+def test_agent_persists_one_attempt_record_per_executed_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(ai_agent, "_seed_recon", lambda **_kwargs: None)
+    monkeypatch.setattr(ai_agent, "refresh_mission_board", lambda *_args, **_kwargs: None)
     brief_path = tmp_path / "brief.yaml"
     brief_path.write_text(BRIEF_YAML, encoding="utf-8")
     workspace_dir = tmp_path / "workspace"
