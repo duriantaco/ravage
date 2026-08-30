@@ -17,6 +17,13 @@ from ravage.report import ProFeatureRequiredError, write_pentest_report
 from ravage.report_artifact import write_json_report_artifact
 from ravage.run_data.audit import AuditStore
 from ravage.run_data.workspace import AgentWorkspace
+from ravage.scan_coverage import (
+    PlannerProbeDecision,
+    ProbeCoverageOutcome,
+    ProbeDisposition,
+    ScanCoverageRecorder,
+    write_scan_coverage_certificate,
+)
 from ravage.traffic.contracts import build_captured_http_exchange
 from ravage.traffic.manifest import TrafficRunManifest, write_traffic_manifest
 from ravage.traffic.policy import (
@@ -108,9 +115,7 @@ def test_json_report_artifact_redacts_late_metadata_and_preserves_existing_repor
     brief_path = _brief(tmp_path)
     workspace = _workspace_with_report_events(tmp_path)
     secret_path_component = "token=artifact-secret-value"  # noqa: S105 - redaction fixture.
-    secret_termination_reason = (  # noqa: S105 - redaction fixture.
-        "token=termination-secret-value"
-    )
+    secret_termination_reason = "token=termination-secret-value"  # noqa: S105 - redaction fixture.
     output_path = tmp_path / secret_path_component / "report.json"
     markdown_path = tmp_path / "human-report.md"
     markdown_path.write_text("# Existing human report\n", encoding="utf-8")
@@ -203,6 +208,59 @@ def test_write_pentest_report_generates_redacted_markdown_and_json(tmp_path: Pat
     assert "flag{unit_report_secret}" not in markdown
     assert "sk-ABCDEF1234567890ABCDEF" not in markdown
     assert "api_key=<SECRET_REDACTED>" in markdown
+
+
+def test_report_includes_path_free_scan_coverage_without_overclaiming(tmp_path: Path) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    traffic_policy = TrafficPolicyController.open(
+        workspace.root / "traffic-policy.json",
+        target_url="http://127.0.0.1:8765",
+        config=TrafficPolicyConfig(),
+    )
+    recorder = ScanCoverageRecorder()
+    private_surface = "http://127.0.0.1:8765/private/admin?token=secret"
+    recorder.record_planner_decision(
+        PlannerProbeDecision(
+            probe_id="surface_map",
+            family="discovery",
+            rank=0,
+            surface_key=private_surface,
+            reason_codes=("required_default",),
+        )
+    )
+    recorder.record_probe_outcome(
+        ProbeCoverageOutcome(
+            probe_id="surface_map",
+            disposition=ProbeDisposition.COMPLETED_NO_FINDING,
+        )
+    )
+    write_scan_coverage_certificate(
+        workspace.root.parent / "scan-coverage.json",
+        recorder.finalize(
+            planner_frontier_exhausted=True,
+            traffic_snapshot=traffic_policy.snapshot(),
+            traffic_config=traffic_policy.config,
+        ),
+    )
+
+    output_path = workspace.root.parent / "coverage-report.md"
+    report = write_pentest_report(
+        brief_path=brief_path,
+        target_url="http://127.0.0.1:8765",
+        workspace_dir=workspace.root,
+        output_path=output_path,
+        status="completed",
+        completed=True,
+    )
+
+    markdown = output_path.read_text(encoding="utf-8")
+    assert report["scan_coverage"]["status"] == "complete"
+    assert report["scan_coverage"]["completion_basis"] == "planner_frontier_exhausted"
+    assert "## Deterministic Scan Coverage" in markdown
+    assert "does not claim that the application" in markdown
+    assert private_surface not in json.dumps(report)
+    assert private_surface not in markdown
 
 
 def test_report_summarizes_deterministic_scan_work_recon_and_recorded_traffic(
