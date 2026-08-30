@@ -40,14 +40,6 @@ if TYPE_CHECKING:
 _MAX_JSON_BYTES: Final = 16 * 1024 * 1024
 _MAX_FINDINGS: Final = 10_000
 _MAX_FINDING_ID_CHARS: Final = 512
-_STAGE_RANK: Final = {
-    "suspected_vulnerability": 1,
-    "evidence_backed_vulnerability": 2,
-    "verified_vulnerability": 3,
-    "confirmed_finding": 4,
-}
-
-
 class RunReceiptAdapterError(RuntimeError):
     """Raised when a run cannot produce a trustworthy bounded receipt."""
 
@@ -100,14 +92,6 @@ def derive_run_receipt(
             "signed finding verdict does not match a nominated report finding"
         )
 
-    ranks = [_STAGE_RANK[item.stage] for item in verdicts]
-    evidence_backed = sum(
-        rank >= _STAGE_RANK["evidence_backed_vulnerability"] for rank in ranks
-    )
-    verified = sum(rank >= _STAGE_RANK["verified_vulnerability"] for rank in ranks)
-    confirmed = sum(rank >= _STAGE_RANK["confirmed_finding"] for rank in ranks)
-    suspected = sum(rank == _STAGE_RANK["suspected_vulnerability"] for rank in ranks)
-
     unsupported_confirmed = confirmed_claims - verdict_references
     accounting_mismatches = _accounting_mismatches(
         report,
@@ -122,42 +106,19 @@ def derive_run_receipt(
         or observations.request_accounting_status in {"unavailable", "unspecified", "invalid"}
     ):
         accounting_mismatches.add("external_accounting_unavailable")
+    if observations.proof_integrity_failure_count < len(unsupported_confirmed):
+        raise RunReceiptAdapterError(
+            "signed observations omit candidate proof-integrity failures"
+        )
+    if observations.request_accounting_mismatch_count < len(accounting_mismatches):
+        raise RunReceiptAdapterError(
+            "signed observations omit request-accounting mismatches"
+        )
 
-    receipt = RunReceipt(
-        case_id=binding.case_id,
-        cohort=binding.cohort,
-        repeat=binding.repeat,
-        execution_kind=binding.execution_kind,
-        status=observations.status,
-        is_control=binding.is_control,
-        case_success=observations.case_success,
-        expected_vulnerability_count=binding.expected_vulnerability_count,
-        evidence_backed_vulnerability_count=evidence_backed,
-        verified_vulnerability_count=verified,
-        confirmed_finding_count=confirmed,
-        suspected_vulnerability_count=suspected,
-        proof_integrity_failure_count=(
-            observations.proof_integrity_failure_count + len(unsupported_confirmed)
-        ),
-        false_proof_count=observations.false_proof_count,
-        request_accounting_mismatch_count=(
-            observations.request_accounting_mismatch_count + len(accounting_mismatches)
-        ),
-        loop_violation_count=observations.loop_violation_count,
-        provenance_violation_count=observations.provenance_violation_count,
-        secret_leak_violation_count=observations.secret_leak_violation_count,
-        unmetered_action_count=observations.unmetered_action_count,
-        incomplete_request_count=observations.incomplete_request_count,
-        physical_request_count=observations.physical_request_count,
-        model_request_count=observations.model_request_count,
-        cost_usd=observations.cost_usd,
-        request_accounting_status=observations.request_accounting_status,
-        run_id=binding.run_id,
-        pair_seed_digest=binding.pair_seed_digest,
-        target_snapshot_digest=binding.target_snapshot_digest,
-        model_fingerprint=binding.model_fingerprint,
-        prompt_fingerprint=binding.prompt_fingerprint,
-    )
+    # The receipt is an exact projection of the signed envelope. Candidate
+    # artifacts may invalidate that projection, but they can never add unsigned
+    # metrics that would be impossible to reproduce from retained evidence.
+    receipt = envelope.to_run_receipt()
     if freeze_output_tree(artifact_root).digest != binding.artifact_tree_digest:
         raise RunReceiptAdapterError("artifact tree changed while deriving the receipt")
     return receipt

@@ -14,6 +14,7 @@ from tools.improvement_lab.execution_attestation import (
     ExternalRunObservations,
     FindingVerdict,
     SignedExecutionEnvelope,
+    execution_envelope_digest,
     sign_execution_envelope,
 )
 from tools.improvement_lab.offline_executor import FrozenOutputTree, freeze_output_tree
@@ -84,12 +85,14 @@ def _artifact_root(
     return root.resolve()
 
 
-def _envelope(
+def _envelope(  # noqa: PLR0913 - test fixture exposes independent signed counters.
     root: Path,
     *,
     verdicts: tuple[tuple[str, str], ...] = (),
     physical_requests: int | None = 7,
     case_success: bool | None = None,
+    proof_integrity_failures: int = 0,
+    accounting_mismatches: int = 0,
 ) -> _AttestedRun:
     frozen = freeze_output_tree(root)
     binding = ExecutionBinding(
@@ -107,6 +110,7 @@ def _envelope(
         cohort="development",
         repeat=1,
         execution_kind="fixture",
+        evaluation_side="candidate",
         is_control=False,
         expected_vulnerability_count=None,
         run_id=_digest("6"),
@@ -122,9 +126,9 @@ def _envelope(
         model_request_count=2,
         cost_usd=0.25,
         request_accounting_status="exact",
-        proof_integrity_failure_count=0,
+        proof_integrity_failure_count=proof_integrity_failures,
         false_proof_count=0,
-        request_accounting_mismatch_count=0,
+        request_accounting_mismatch_count=accounting_mismatches,
         loop_violation_count=0,
         provenance_violation_count=0,
         secret_leak_violation_count=0,
@@ -178,6 +182,10 @@ def test_no_flag_confirmed_vulnerability_still_counts(tmp_path: Path) -> None:
     assert receipt.verified_vulnerability_count == 1
     assert receipt.confirmed_finding_count == 1
     assert receipt.proof_integrity_failure_count == 0
+    assert receipt.execution_attestation_digest == execution_envelope_digest(
+        envelope.envelope
+    )
+    assert receipt == envelope.envelope.to_run_receipt()
 
 
 def test_self_reported_confirmed_finding_does_not_count_without_signed_verdict(
@@ -185,12 +193,19 @@ def test_self_reported_confirmed_finding_does_not_count_without_signed_verdict(
 ) -> None:
     root = _artifact_root(tmp_path)
 
-    receipt = _derive(root, _envelope(root))
+    receipt = _derive(root, _envelope(root, proof_integrity_failures=1))
 
     assert receipt.evidence_backed_vulnerability_count == 0
     assert receipt.verified_vulnerability_count == 0
     assert receipt.confirmed_finding_count == 0
     assert receipt.proof_integrity_failure_count == 1
+
+
+def test_unaccounted_self_reported_confirmation_is_rejected(tmp_path: Path) -> None:
+    root = _artifact_root(tmp_path)
+
+    with pytest.raises(RunReceiptAdapterError, match="proof-integrity failures"):
+        _derive(root, _envelope(root))
 
 
 def test_unknown_signed_finding_verdict_is_rejected(tmp_path: Path) -> None:
@@ -229,11 +244,27 @@ def test_traffic_report_and_external_count_mismatches_are_counted(
 
     receipt = _derive(
         root,
-        _envelope(root, physical_requests=_EXTERNAL_PHYSICAL_REQUESTS),
+        _envelope(
+            root,
+            physical_requests=_EXTERNAL_PHYSICAL_REQUESTS,
+            accounting_mismatches=_EXPECTED_ACCOUNTING_MISMATCHES,
+        ),
     )
 
     assert receipt.physical_request_count == _EXTERNAL_PHYSICAL_REQUESTS
     assert receipt.request_accounting_mismatch_count == _EXPECTED_ACCOUNTING_MISMATCHES
+
+
+def test_unaccounted_traffic_mismatches_are_rejected(tmp_path: Path) -> None:
+    root = _artifact_root(
+        tmp_path,
+        finding_ids=(),
+        report_requests=4,
+        ledger_requests=3,
+    )
+
+    with pytest.raises(RunReceiptAdapterError, match="request-accounting mismatches"):
+        _derive(root, _envelope(root, physical_requests=_EXTERNAL_PHYSICAL_REQUESTS))
 
 
 def test_artifact_tampering_after_signature_is_rejected(tmp_path: Path) -> None:
@@ -253,7 +284,7 @@ def test_artifact_mutation_during_derivation_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = _artifact_root(tmp_path)
-    attested = _envelope(root)
+    attested = _envelope(root, proof_integrity_failures=1)
     original_freeze = freeze_output_tree
     freeze_calls = 0
 
@@ -278,7 +309,7 @@ def test_canonical_receipt_write_is_deterministic_private_and_non_overwriting(
     tmp_path: Path,
 ) -> None:
     root = _artifact_root(tmp_path)
-    receipt = _derive(root, _envelope(root))
+    receipt = _derive(root, _envelope(root, proof_integrity_failures=1))
     first = tmp_path / "receipts-a" / "receipt.json"
     second = tmp_path / "receipts-b" / "receipt.json"
 

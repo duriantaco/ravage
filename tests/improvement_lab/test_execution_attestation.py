@@ -20,6 +20,7 @@ from tools.improvement_lab.execution_attestation import (
     FindingVerdict,
     SignedExecutionEnvelope,
     execution_envelope_digest,
+    load_canonical_execution_envelope_bytes,
     load_signed_execution_envelope,
     sign_execution_envelope,
     verify_signed_execution_envelope,
@@ -55,6 +56,7 @@ def _binding() -> ExecutionBinding:
         cohort="sealed",
         repeat=1,
         execution_kind="live",
+        evaluation_side="candidate",
         is_control=False,
         expected_vulnerability_count=3,
         run_id=_digest("7"),
@@ -123,6 +125,16 @@ def test_round_trip_binds_every_identity_and_derives_receipt_metrics() -> None:
     assert receipt.run_id == _digest("7")
 
 
+def test_canonical_envelope_bytes_can_be_verified_without_a_file() -> None:
+    signed, _private, public = _signed()
+    content = (canonical_json(signed.to_json()) + "\n").encode()
+
+    assert load_canonical_execution_envelope_bytes(content, public_key=public) == signed
+
+    with pytest.raises(ExecutionAttestationError, match="byte-canonical"):
+        load_canonical_execution_envelope_bytes(content.rstrip(), public_key=public)
+
+
 _BINDING_TAMPERS = {
     "campaign_id": f"campaign_{'d' * 24}",
     "candidate_id": f"candidate_{'e' * 24}",
@@ -138,6 +150,7 @@ _BINDING_TAMPERS = {
     "cohort": "control",
     "repeat": 2,
     "execution_kind": "fixture",
+    "evaluation_side": "champion",
     "is_control": True,
     "expected_vulnerability_count": 4,
     "run_id": _digest("c"),
@@ -258,6 +271,13 @@ def test_artifact_case_path_must_be_normalized_relative_posix(path: str) -> None
         replace(_binding(), artifact_case_path=path)
 
     assert replace(_binding(), artifact_case_path=".").artifact_case_path == "."
+
+
+def test_evaluation_side_is_explicit_and_bounded() -> None:
+    assert replace(_binding(), evaluation_side="champion").evaluation_side == "champion"
+
+    with pytest.raises(ExecutionAttestationError, match="evaluation_side"):
+        replace(_binding(), evaluation_side="baseline")
 
 
 def test_types_bounds_accounting_and_verdict_identity_fail_closed() -> None:

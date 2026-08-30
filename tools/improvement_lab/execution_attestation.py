@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 EXECUTION_ATTESTATION_SCHEMA_VERSION: Final = (
     "ravage.improvement-execution-attestation.v1"
 )
-EXECUTION_BINDING_SCHEMA_VERSION: Final = "ravage.improvement-execution-binding.v1"
+EXECUTION_BINDING_SCHEMA_VERSION: Final = "ravage.improvement-execution-binding.v2"
 EXECUTION_OBSERVATIONS_SCHEMA_VERSION: Final = (
     "ravage.improvement-execution-observations.v1"
 )
@@ -57,6 +57,7 @@ _MAX_REPEAT: Final = 100
 _MAX_ARTIFACT_CASE_PATH_CHARS: Final = 512
 _MAX_TEXT_CHARS: Final = 1024
 _EXECUTION_KINDS: Final = frozenset({"fixture", "live"})
+_EVALUATION_SIDES: Final = frozenset({"champion", "candidate"})
 _STATUSES: Final = frozenset({"completed", "failed", "timeout", "error"})
 _ACCOUNTING_STATUSES: Final = frozenset(
     {"invalid", "unavailable", "unspecified", "lower_bound", "reported", "exact"}
@@ -95,6 +96,7 @@ class ExecutionBinding:
     cohort: str
     repeat: int
     execution_kind: str
+    evaluation_side: str
     is_control: bool
     expected_vulnerability_count: int | None
     run_id: str
@@ -138,6 +140,10 @@ class ExecutionBinding:
         _validate_int(self.repeat, "repeat", minimum=1, maximum=_MAX_REPEAT)
         if self.execution_kind not in _EXECUTION_KINDS:
             raise ExecutionAttestationError("execution kind must be fixture or live")
+        if self.evaluation_side not in _EVALUATION_SIDES:
+            raise ExecutionAttestationError(
+                "evaluation_side must be champion or candidate"
+            )
         if not isinstance(self.is_control, bool):
             raise ExecutionAttestationError("is_control must be a boolean")
         _validate_optional_int(
@@ -162,6 +168,7 @@ class ExecutionBinding:
             "cohort": self.cohort,
             "repeat": self.repeat,
             "execution_kind": self.execution_kind,
+            "evaluation_side": self.evaluation_side,
             "is_control": self.is_control,
             "expected_vulnerability_count": self.expected_vulnerability_count,
             "run_id": self.run_id,
@@ -191,6 +198,7 @@ class ExecutionBinding:
             "cohort",
             "repeat",
             "execution_kind",
+            "evaluation_side",
             "is_control",
             "expected_vulnerability_count",
             "run_id",
@@ -232,6 +240,7 @@ class ExecutionBinding:
             cohort=_text(payload["cohort"], "cohort"),
             repeat=_integer(payload["repeat"], "repeat"),
             execution_kind=_text(payload["execution_kind"], "execution_kind"),
+            evaluation_side=_text(payload["evaluation_side"], "evaluation_side"),
             is_control=_boolean(payload["is_control"], "is_control"),
             expected_vulnerability_count=_optional_integer(
                 payload["expected_vulnerability_count"],
@@ -438,6 +447,7 @@ class SignedExecutionEnvelope:
             cost_usd=self.observations.cost_usd,
             request_accounting_status=self.observations.request_accounting_status,
             run_id=self.binding.run_id,
+            execution_attestation_digest=execution_envelope_digest(self),
             pair_seed_digest=self.binding.pair_seed_digest,
             target_snapshot_digest=self.binding.target_snapshot_digest,
             model_fingerprint=self.binding.model_fingerprint,
@@ -544,7 +554,7 @@ def write_signed_execution_envelope(
         _validated_key_id(signed.signing_key_id),
         _validated_signature(signed.signature),
     )
-    encoded = (canonical_json(verified_shape.to_json()) + "\n").encode()
+    encoded = canonical_execution_envelope_bytes(verified_shape)
     if len(encoded) > _MAX_SIGNED_BYTES:
         raise ExecutionAttestationError("execution attestation exceeds the byte cap")
     _private_atomic_write(path, encoded)
@@ -557,9 +567,22 @@ def load_signed_execution_envelope(
 ) -> SignedExecutionEnvelope:
     """Read, byte-canonicalize, and verify one bounded external execution envelope."""
     raw = _read_bounded(path, label="signed execution attestation", maximum=_MAX_SIGNED_BYTES)
+    return load_canonical_execution_envelope_bytes(raw, public_key=public_key)
+
+
+def load_canonical_execution_envelope_bytes(
+    content: bytes,
+    *,
+    public_key: bytes,
+) -> SignedExecutionEnvelope:
+    """Strictly parse canonical retained bytes and verify the executor signature."""
+    if not isinstance(content, bytes) or not content or len(content) > _MAX_SIGNED_BYTES:
+        raise ExecutionAttestationError(
+            "signed execution attestation is empty or exceeds the byte cap"
+        )
     try:
         payload = json.loads(
-            raw,
+            content,
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_nonfinite_constant,
         )
@@ -571,15 +594,19 @@ def load_signed_execution_envelope(
         canonical = (canonical_json(payload) + "\n").encode()
     except (TypeError, ValueError) as exc:
         raise ExecutionAttestationError("signed execution attestation JSON is invalid") from exc
-    if raw != canonical:
+    if content != canonical:
         raise ExecutionAttestationError("signed execution attestation is not byte-canonical")
     return verify_signed_execution_envelope(payload, public_key=public_key)
 
 
 def execution_envelope_digest(signed: SignedExecutionEnvelope) -> str:
-    """Return the digest of the exact canonical signed envelope (without file newline)."""
-    encoded = canonical_json(signed.to_json()).encode()
-    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+    """Return the CAS digest of the exact canonical signed-envelope bytes."""
+    return f"sha256:{hashlib.sha256(canonical_execution_envelope_bytes(signed)).hexdigest()}"
+
+
+def canonical_execution_envelope_bytes(signed: SignedExecutionEnvelope) -> bytes:
+    """Return the byte form written to disk and retained by the archive."""
+    return (canonical_json(signed.to_json()) + "\n").encode()
 
 
 def _finding_stage_counts(verdicts: tuple[FindingVerdict, ...]) -> dict[str, int]:
@@ -846,7 +873,9 @@ __all__ = [
     "ExternalRunObservations",
     "FindingVerdict",
     "SignedExecutionEnvelope",
+    "canonical_execution_envelope_bytes",
     "execution_envelope_digest",
+    "load_canonical_execution_envelope_bytes",
     "load_signed_execution_envelope",
     "sign_execution_envelope",
     "verify_signed_execution_envelope",
