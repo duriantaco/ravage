@@ -112,6 +112,7 @@ from ravage.probe_suite import (
     probe_requires_anonymous_session,
     run_builtin_probe,
 )
+from ravage.probe_suite_parts.result import ProbeRunResult
 from ravage.report import (
     ProFeatureRequiredError,
     ensure_report_output_supported,
@@ -151,6 +152,7 @@ from ravage.traffic.manifest import (
     write_traffic_manifest,
 )
 from ravage.traffic.policy import (
+    TrafficPolicyBlocked,
     TrafficPolicyConfig,
     TrafficPolicyController,
     TrafficPolicyError,
@@ -266,6 +268,8 @@ _SCAN_PROBE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "xss_filter_constraint": ("xss_context",),
     "xxe_boundary": ("file_fetch_parser",),
 }
+
+_SCAN_UNMETERED_PROBES = frozenset({"dom_execution"})
 
 BRIEF_DESCRIPTION_TODO = (
     "TODO: describe the target, challenge text, rules, credentials, and win condition."
@@ -2369,6 +2373,36 @@ def _assert_fresh_attack_workspace(*, run_dir: Path, workspace_dir: Path, resume
     raise SystemExit(message)
 
 
+def _assert_fresh_scan_workspace(
+    *,
+    run_dir: Path,
+    workspace_dir: Path,
+    db_path: Path,
+) -> None:
+    """Reject accidental scan-state reuse until an exact resume contract exists."""
+    existing = [
+        path
+        for path in (
+            workspace_dir / "traffic-policy.json",
+            workspace_dir / "working_state.json",
+            workspace_dir / "events.jsonl",
+            workspace_dir / "transcript.jsonl",
+            db_path,
+            run_dir / "scan-summary.json",
+            run_dir / "report.json",
+            run_dir / "report.md",
+        )
+        if path.exists()
+    ]
+    if not existing:
+        return
+    details = ", ".join(str(path) for path in existing[:3])
+    raise SystemExit(
+        "scan run directory already contains prior state; use a fresh --run-dir. "
+        f"Existing files: {details}"
+    )
+
+
 class _AttackEventSink:
     def __init__(self, *, mode: DisplayMode) -> None:
         output = sys.stdout
@@ -2439,6 +2473,24 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
         help="list built-in probe names and exit",
     )
     parser.add_argument("--timeout-seconds", type=int, default=10)
+    parser.add_argument(
+        "--traffic-policy",
+        choices=["observe", "low-noise"],
+        help=(
+            "whole-run physical HTTP policy; defaults to low-noise for authorized "
+            "remote targets and observe for local targets"
+        ),
+    )
+    parser.add_argument(
+        "--max-physical-requests",
+        type=int,
+        help="whole-run physical HTTP request cap in low-noise mode (default: 300)",
+    )
+    parser.add_argument(
+        "--traffic-max-rps",
+        type=float,
+        help="strictly sub-1 whole-run HTTP dispatch rate in low-noise mode (default: 0.5)",
+    )
     parser.add_argument(
         "--identity",
         help="use one named identity from brief.authentication for eligible probes",
@@ -2520,6 +2572,12 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from None
+    _resolve_traffic_policy_args(
+        parser,
+        parsed,
+        default_mode=("observe" if is_local_url(target_url) else "low-noise"),
+        roe_max_rps=brief.roe.max_rps,
+    )
 
     selected_probes = _selected_scan_probes(parsed.probes, all_probes=parsed.all_probes)
     skipped_authenticated_probes: dict[str, str] = {}
@@ -2544,7 +2602,20 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
         _validate_report_output(parser, report_path)
 
     run_dir.mkdir(parents=True, exist_ok=True)
+    _assert_fresh_scan_workspace(
+        run_dir=run_dir,
+        workspace_dir=workspace_dir,
+        db_path=db_path,
+    )
     workspace = AgentWorkspace.open(workspace_dir)
+    try:
+        traffic_policy = TrafficPolicyController.open(
+            workspace_dir / "traffic-policy.json",
+            target_url=target_url,
+            config=_traffic_policy_config(parsed),
+        )
+    except (OSError, TrafficPolicyError, ValueError) as exc:
+        parser.error(f"cannot initialize scan traffic policy: {_concise_cli_error(exc)}")
     traffic_capture_session_id = f"scan-{uuid4().hex[:12]}"
     traffic_recorder_errors: list[str] = []
     traffic_store: TrafficStore | None = None
@@ -2597,6 +2668,7 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
     start_payload: dict[str, object] = {
         "target_url": target_url,
         "probes": selected_probes,
+        "traffic_accounting": _scan_traffic_accounting(traffic_policy),
     }
     if parsed.identity:
         start_payload["identity"] = parsed.identity
@@ -2638,6 +2710,7 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
                         traffic_store=traffic_store,
                         traffic_capture_session_id=traffic_capture_session_id,
                         traffic_recorder_errors=traffic_recorder_errors,
+                        traffic_policy=traffic_policy,
                     )
                     if not parsed.json:
                         _write_line(
@@ -2674,20 +2747,35 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
                     ) from None
             try:
                 try:
-                    result = run_builtin_probe(
+                    blocked_reason = _guard_scan_probe_traffic(
                         probe,
-                        target_url=target_url,
-                        state=state,
-                        timeout_seconds=max(1, min(parsed.timeout_seconds, 120)),
-                        allow_remote_target=parsed.allow_remote_target,
-                        in_scope=brief.scope.in_scope,
-                        out_of_scope=brief.scope.out_of_scope,
-                        max_rps=brief.roe.max_rps,
-                        session=probe_session,
-                        traffic_observer=(
-                            None if use_authenticated_session else anonymous_traffic_recorder
-                        ),
+                        traffic_policy=traffic_policy,
                     )
+                    if blocked_reason:
+                        result = ProbeRunResult(
+                            ok=False,
+                            probe=probe,
+                            summary=f"blocked by whole-run traffic policy: {blocked_reason}",
+                            errors=[blocked_reason],
+                        )
+                    else:
+                        result = run_builtin_probe(
+                            probe,
+                            target_url=target_url,
+                            state=state,
+                            timeout_seconds=max(1, min(parsed.timeout_seconds, 120)),
+                            allow_remote_target=parsed.allow_remote_target,
+                            in_scope=brief.scope.in_scope,
+                            out_of_scope=brief.scope.out_of_scope,
+                            max_rps=brief.roe.max_rps,
+                            session=probe_session,
+                            traffic_observer=(
+                                None if use_authenticated_session else anonymous_traffic_recorder
+                            ),
+                            traffic_policy=(
+                                None if use_authenticated_session else traffic_policy
+                            ),
+                        )
                 finally:
                     if probe_session is not None and auth_owner is not None:
                         auth_owner.retire_probe_session(probe_session)
@@ -2713,6 +2801,8 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
                 "findings": result.findings,
                 "requests": result.requests,
                 "errors": result.errors,
+                "http_request_count": result.http_request_count,
+                "http_request_count_status": result.http_request_count_status,
                 "session_mode": (
                     f"identity:{parsed.identity}" if use_authenticated_session else "anonymous"
                 ),
@@ -2806,10 +2896,24 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
             status="confirmed",
             engagement_id=brief.engagement_id,
         )
+        completed_payload = {
+            "probes_run": len(selected_probes),
+            "confirmed_findings_count": confirmed_findings_count,
+            "flags_count": len(state.flags),
+            "traffic_accounting": _scan_traffic_accounting(traffic_policy),
+        }
+        audit.record(
+            engagement_id=brief.engagement_id,
+            actor="scan",
+            action="scan_completed",
+            payload=completed_payload,
+        )
+        workspace.record_event(kind="scan_completed", payload=completed_payload)
     except BaseException as exc:
         failure_payload: dict[str, object] = {
             "error_type": type(exc).__name__,
             "identity": parsed.identity or "",
+            "traffic_accounting": _scan_traffic_accounting(traffic_policy),
         }
         with suppress(Exception):
             audit.record(
@@ -2888,6 +2992,7 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
         "traffic_requests": traffic_requests,
         "traffic_contracts": traffic_contracts,
         "traffic_recorder_errors": traffic_recorder_errors,
+        "traffic_accounting": _scan_traffic_accounting(traffic_policy),
         "flags": list(state.flags),
         "report": report_output,
     }
@@ -2944,6 +3049,53 @@ def _require_scan_target_reached(
     )
 
 
+def _guard_scan_probe_traffic(
+    probe: str,
+    *,
+    traffic_policy: TrafficPolicyController,
+) -> str:
+    """Account for opaque target transports and fail closed in enforced mode."""
+    if probe not in _SCAN_UNMETERED_PROBES:
+        return ""
+    try:
+        traffic_policy.record_unmetered_action()
+    except TrafficPolicyBlocked as exc:
+        return str(exc)
+    return ""
+
+
+def _scan_traffic_accounting(
+    traffic_policy: TrafficPolicyController,
+) -> dict[str, object]:
+    try:
+        snapshot = traffic_policy.snapshot()
+    except (OSError, TrafficPolicyError, ValueError):
+        return {
+            "status": "unavailable",
+            "provenance": "traffic_policy_ledger_unreadable",
+        }
+    config = traffic_policy.config
+    remaining = (
+        None
+        if config.max_physical_requests is None
+        else max(
+            config.max_physical_requests
+            - snapshot.physical_request_count
+            - snapshot.reservation_count,
+            0,
+        )
+    )
+    return {
+        "status": snapshot.accounting_status,
+        "provenance": "workspace_traffic_policy_ledger",
+        "mode": config.mode.value,
+        "max_rps": config.max_rps,
+        "max_physical_requests": config.max_physical_requests,
+        "remaining_physical_requests": remaining,
+        **snapshot.to_json(),
+    }
+
+
 def _configured_scan_session(  # noqa: PLR0913
     *,
     brief: EngagementBrief,
@@ -2951,6 +3103,7 @@ def _configured_scan_session(  # noqa: PLR0913
     identity: str,
     timeout_seconds: int,
     allow_remote_target: bool,
+    traffic_policy: TrafficPolicyController,
     secret_resolver: SecretResolver | None = None,
     traffic_store: TrafficStore | None = None,
     traffic_capture_session_id: str = "",
@@ -3004,6 +3157,7 @@ def _configured_scan_session(  # noqa: PLR0913
         out_of_scope=brief.scope.out_of_scope,
         max_rps=brief.roe.max_rps,
         traffic_observer=traffic_observer,
+        traffic_policy=traffic_policy,
     )
     manager = SessionManager(
         base_session,
@@ -3025,7 +3179,7 @@ def _configured_scan_session(  # noqa: PLR0913
         manager=manager,
         handle=handle,
         redactor=redactor,
-        traffic_policy=None,
+        traffic_policy=traffic_policy,
     )
     return owner, redactor
 
