@@ -298,6 +298,103 @@ def test_legacy_observe_resume_creates_lower_bound_ledger_before_agent(
     assert settings.traffic_policy_reference is not None
 
 
+def test_legacy_direct_remote_agent_defaults_to_canonical_low_noise(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote_url = "https://authorized.example/app"
+    brief_path = tmp_path / "remote-brief.yaml"
+    brief_path.write_text(
+        BRIEF_YAML.replace("http://127.0.0.1:8765", remote_url),
+        encoding="utf-8",
+    )
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(cli, "run_ai_web_agent", lambda **kwargs: seen.update(kwargs))
+
+    cli.main(
+        [
+            "--brief",
+            str(brief_path),
+            "--target-url",
+            remote_url,
+            "--workspace-dir",
+            str(tmp_path / "workspace"),
+            "--authorized-remote-target",
+            "--display",
+            "quiet",
+        ]
+    )
+
+    settings = seen["settings"]
+    assert settings.traffic_policy_mode == "low-noise"
+    assert settings.traffic_policy_max_physical_requests == 300
+    assert settings.traffic_policy_max_rps == 0.5
+    assert settings.tool_runtime_mode == "docker"
+
+
+def test_legacy_direct_remote_resume_never_silently_downgrades_to_observe(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    remote_url = "https://authorized.example/app"
+    brief_path = tmp_path / "remote-brief.yaml"
+    brief_path.write_text(
+        BRIEF_YAML.replace("http://127.0.0.1:8765", remote_url),
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_path = workspace / "working_state.json"
+    save_agent_state(state_path, target_url=remote_url, state=AgentState(turn=1))
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "--brief",
+                str(brief_path),
+                "--target-url",
+                remote_url,
+                "--workspace-dir",
+                str(workspace),
+                "--resume-from",
+                str(state_path),
+                "--authorized-remote-target",
+                "--display",
+                "quiet",
+            ]
+        )
+
+    assert exc_info.value.code == 2
+    assert "valid traffic policy ledger" in capsys.readouterr().err
+
+
+def test_legacy_direct_host_runtime_requires_explicit_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    brief_path = tmp_path / "brief.yaml"
+    brief_path.write_text(BRIEF_YAML, encoding="utf-8")
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(cli, "run_ai_web_agent", lambda **kwargs: seen.update(kwargs))
+
+    cli.main(
+        [
+            "--brief",
+            str(brief_path),
+            "--target-url",
+            "http://127.0.0.1:8765",
+            "--workspace-dir",
+            str(tmp_path / "workspace"),
+            "--tool-runtime",
+            "host",
+            "--display",
+            "quiet",
+        ]
+    )
+
+    assert seen["settings"].tool_runtime_mode == "host"
+
+
 def test_observe_resume_rejects_corrupt_traffic_policy_ledger(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -560,7 +657,7 @@ def test_cli_init_writes_env_and_brief(
     assert "[optional]" in output
     assert f"source {env_path}" not in output
     assert f"--env-file {env_path}" in output
-    assert "--tool-runtime host" in output
+    assert "--tool-runtime host" not in output
     assert "--model-profile hosted-openai" not in output
 
 
@@ -657,7 +754,7 @@ def test_cli_setup_check_reports_ready_setup(
     assert "[ok] model" in output
     assert "[ok] brief" in output
     assert "[next]" in output
-    assert "--tool-runtime host" in output
+    assert "--tool-runtime host" not in output
     assert "--allow-paid-models --report" in output
 
 
@@ -895,7 +992,7 @@ def test_setup_check_requires_docker_for_remote_tools(
 
     assert local["status"] == "ok"
     assert remote["status"] == "fail"
-    assert "Docker is required for remote attacks" in str(remote["detail"])
+    assert "Docker is required for the selected attack runtime" in str(remote["detail"])
 
 
 def test_setup_check_rejects_installed_but_unready_docker(
@@ -1002,7 +1099,7 @@ def test_cli_setup_check_fails_with_missing_model_key(
         *, tool_image: str, require_docker: bool = False
     ) -> dict[str, object]:
         assert tool_image
-        assert require_docker is False
+        assert require_docker is True
         return {"name": "tools", "status": "ok", "detail": "ok"}
 
     monkeypatch.setattr(
@@ -2715,6 +2812,7 @@ def test_cli_ai_web_passes_report_agent_flag(
     assert captured["target_url"] == "http://127.0.0.1:8765"
     assert isinstance(settings, cli.AIWebAgentSettings)
     assert settings.report_agent is True
+    assert settings.tool_runtime_mode == "docker"
 
 
 def test_cli_attack_forwards_report_agent_flag(
@@ -2738,6 +2836,37 @@ def test_cli_attack_forwards_report_agent_flag(
     command = calls[0]
     assert "--report" in command
     assert command[command.index("--report-path") + 1] == str(run_dir / "report.json")
+    assert command[command.index("--tool-runtime") + 1] == "docker"
+
+
+def test_cli_attack_preserves_explicit_local_host_runtime_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    brief_path = tmp_path / "brief.yaml"
+    brief_path.write_text(BRIEF_YAML, encoding="utf-8")
+    run_dir = tmp_path / "attack-run"
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], _stdout_path: Path) -> int:
+        calls.append(argv)
+        return 0
+
+    monkeypatch.setattr(cli, "_run_subprocess_tee_stdout", fake_run)
+
+    cli.main(
+        [
+            "attack",
+            str(brief_path),
+            "--run-dir",
+            str(run_dir),
+            "--tool-runtime",
+            "host",
+        ]
+    )
+
+    command = calls[0]
+    assert command[command.index("--tool-runtime") + 1] == "host"
 
 
 def test_cli_benchmark_uses_openai_compatible_stub_end_to_end(tmp_path: Path) -> None:

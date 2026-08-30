@@ -138,10 +138,8 @@ def make_shared_tool_runtime(
         "cleanup_evidence_path": os.environ.get("RAVAGE_TOOL_NETWORK_EVIDENCE_PATH"),
         "allow_remote_target": settings.allow_remote_target,
     }
-    if settings.allow_remote_target or settings.tool_runtime_mode == "docker":
+    if settings.allow_remote_target or settings.tool_runtime_mode in {"docker", "auto"}:
         inner: ToolRuntime = DockerToolRuntime(**runtime_kwargs)
-    elif settings.tool_runtime_mode == "auto":
-        inner = DockerFallbackToolRuntime(**runtime_kwargs)
     else:
         inner = ExternalToolRuntime()
     return SharedToolRuntime(

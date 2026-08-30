@@ -265,6 +265,7 @@ def test_agent_persists_one_attempt_record_per_executed_turn(
         brief_path=brief_path,
         target_url="http://127.0.0.1:8765",
         settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
             db_path=tmp_path / "audit.db",
             workspace_dir=workspace_dir,
             model_client=ScriptedModelClient([{"action": "final", "summary": "done"}]),

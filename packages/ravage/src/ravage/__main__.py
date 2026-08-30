@@ -392,7 +392,12 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
     parser.add_argument("--knowledge-pack-sha256", help=argparse.SUPPRESS)
     parser.add_argument("--knowledge-pack-limit", type=int, default=4)
     parser.add_argument("--knowledge-pack-max-chars", type=int, default=6_000)
-    parser.add_argument("--tool-runtime", choices=["host", "docker", "auto"], default="host")
+    parser.add_argument(
+        "--tool-runtime",
+        choices=["host", "docker", "auto"],
+        default="docker",
+        help="process runtime; host execution requires this explicit --tool-runtime host opt-in",
+    )
     parser.add_argument(
         "--authorized-remote-target",
         action="store_true",
@@ -470,6 +475,8 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
         requested_identity=args.identity,
     )
     remote_target = not is_local_url(args.target_url)
+    if remote_target and args.traffic_policy is None:
+        args.traffic_policy = "low-noise"
     traffic_workspace = args.workspace_dir or (
         _attack_resume_workspace(args.resume_from)
         if args.resume_from is not None
@@ -484,7 +491,7 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
     _resolve_traffic_policy_args(
         parser,
         args,
-        default_mode="observe",
+        default_mode="low-noise" if remote_target else "observe",
         roe_max_rps=brief.roe.max_rps,
     )
     if args.traffic_policy == "low-noise":
@@ -1431,6 +1438,8 @@ def _attack(  # noqa: C901, PLR0912, PLR0915 - CLI options are intentionally exp
             "Unauthenticated process-capable remote runs also require --tool-runtime docker.\n"
             "A selected managed identity uses HTTP-only execution and blocks command, Python,\n"
             "and process lanes.\n"
+            "Process tools use Docker by default. --tool-runtime host is an explicit opt-in\n"
+            "for trusted localhost targets and runs model-selected code on this machine.\n"
             "To print only a brief, use ravage brief template --target-url URL.\n"
             "Put useful target notes, challenge descriptions and success criteria in the brief."
         ),
@@ -1541,7 +1550,7 @@ def _attack(  # noqa: C901, PLR0912, PLR0915 - CLI options are intentionally exp
         choices=["host", "docker", "auto"],
         help=(
             "runtime for command/Python/process tools; authenticated attacks use the "
-            "managed HTTP-only lane instead"
+            "managed HTTP-only lane instead; defaults to Docker and host requires explicit opt-in"
         ),
     )
     parser.add_argument("--tool-image", default=DEFAULT_TOOL_IMAGE)
@@ -1643,6 +1652,8 @@ def _attack(  # noqa: C901, PLR0912, PLR0915 - CLI options are intentionally exp
         allow_paid_models=parsed.allow_paid_models,
     )
     remote_target = not is_local_url(target_url)
+    if remote_target and parsed.traffic_policy is None:
+        parsed.traffic_policy = "low-noise"
     resume_traffic_workspace = _resume_traffic_policy_workspace(parsed)
     if resume_traffic_workspace is not None:
         _inherit_resume_traffic_policy_args(
@@ -1673,9 +1684,7 @@ def _attack(  # noqa: C901, PLR0912, PLR0915 - CLI options are intentionally exp
         parser.error(
             "authorized remote autonomous routing requires --autonomous-route-engine agent-graph"
         )
-    parsed.tool_runtime = parsed.tool_runtime or (
-        "docker" if remote_target and parsed.identity is None else "host"
-    )
+    parsed.tool_runtime = parsed.tool_runtime or "docker"
     if parsed.operational_profile is not None and parsed.autonomous_route_engine != "agent-graph":
         parser.error("--operational-profile applies only to the agent-graph route")
     profile = GraphOperationalProfileName(
@@ -3091,7 +3100,7 @@ def _init(args: list[str]) -> None:
     quoted_brief = shlex.quote(str(parsed.brief))
     remote_target = not is_local_url(parsed.target_url)
     remote_flag = " --authorized-remote-target" if remote_target else ""
-    runtime_flag = "" if remote_target else " --tool-runtime host"
+    runtime_flag = ""
     if auth_result is None:
         _write_line(
             f"{badge('next', 'info')} ravage scan {quoted_brief}{remote_flag} "
@@ -3334,6 +3343,12 @@ def _run_setup_check(  # noqa: C901, PLR0912, PLR0915
             "HTTP-only low-noise mode"
         ),
     )
+    parser.add_argument(
+        "--tool-runtime",
+        choices=["host", "docker", "auto"],
+        default="docker",
+        help="attack process runtime; host execution requires an explicit opt-in",
+    )
     parser.add_argument("--tool-image", default=DEFAULT_TOOL_IMAGE)
     parser.add_argument("--run-root", type=Path, default=Path("runs"))
     parser.add_argument("--skip-tools", action="store_true")
@@ -3569,7 +3584,7 @@ def _run_setup_check(  # noqa: C901, PLR0912, PLR0915
         checks.append(
             _setup_check_tools(
                 tool_image=parsed.tool_image,
-                require_docker=remote_target,
+                require_docker=parsed.tool_runtime != "host",
             )
         )
 
@@ -3602,6 +3617,7 @@ def _run_setup_check(  # noqa: C901, PLR0912, PLR0915
                 model_tier=parsed.model_tier,
                 traffic_policy=attack_traffic_policy,
                 managed_http=bool(brief is not None and brief.authentication is not None),
+                tool_runtime=parsed.tool_runtime,
             )
     if not payload["ok"]:
         raise SystemExit(1)
@@ -3666,6 +3682,7 @@ def _write_setup_next_command(  # noqa: PLR0913
     model_tier: str,
     traffic_policy: str = "observe",
     managed_http: bool = False,
+    tool_runtime: str = "docker",
 ) -> None:
     remote_flag = (
         " --authorized-remote-target" if target_url and not is_local_url(target_url) else ""
@@ -3709,7 +3726,7 @@ def _write_setup_next_command(  # noqa: PLR0913
     elif remote_target:
         transport_options = " --traffic-policy observe --tool-runtime docker"
     else:
-        transport_options = " --tool-runtime host"
+        transport_options = " --tool-runtime host" if tool_runtime == "host" else ""
     paid = " --allow-paid-models" if model_profile.startswith("hosted-") else ""
     _write_line(
         f"{badge('next', 'info')} ravage attack {quoted_brief}{remote_flag}{env_option} "
@@ -4460,7 +4477,11 @@ def _setup_check_tools(*, tool_image: str, require_docker: bool = False) -> dict
         docker_ready = bool(docker.get("ready"))
     ready = docker_ready if require_docker else host_ready or docker_ready
     if require_docker and not docker_ready:
-        recommendation = f"Docker is required for remote attacks; {recommendation}".rstrip("; ")
+        recommendation = (
+            f"Docker is required for the selected attack runtime; {recommendation}"
+        ).rstrip(
+            "; "
+        )
     return {
         "name": "tools",
         "status": "ok" if ready else "fail",

@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass, field
 from http.cookiejar import Cookie
 from io import StringIO
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from uuid import UUID, uuid4
 
 import pytest
@@ -23,7 +23,7 @@ from pentest_schemas import (
     Scope,
     SecretReference,
 )
-from ravage.agent_core import action_executor
+from ravage.agent_core import action_executor, ai_agent
 from ravage.agent_core.action_executor import execute_action
 from ravage.agent_core.agent_state import AgentState
 from ravage.agent_core.ai_agent import (
@@ -1029,6 +1029,33 @@ def test_authenticated_runtime_does_not_construct_a_process_or_docker_lane(
     assert not blocked.ok
     assert "managed authenticated" in str(blocked.error)
     shared.shutdown()
+
+
+@pytest.mark.parametrize("runtime_mode", ["docker", "auto"])
+def test_default_and_auto_process_runtime_never_fall_back_to_host(
+    runtime_mode: Literal["docker", "auto"],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert AIWebAgentSettings().tool_runtime_mode == "docker"
+    sentinel = object()
+    observed: list[dict[str, object]] = []
+
+    def docker_runtime(**kwargs: object) -> object:
+        observed.append(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(ai_agent, "DockerToolRuntime", docker_runtime)
+    monkeypatch.setattr(
+        ai_agent,
+        "ExternalToolRuntime",
+        lambda: pytest.fail("safe process modes must not construct the host runtime"),
+    )
+    settings = AIWebAgentSettings(tool_runtime_mode=runtime_mode)
+
+    runtime = _make_tool_runtime(settings, _brief(), target_url=_TARGET)
+
+    assert runtime is sentinel
+    assert observed
 
 
 def test_authenticated_probe_is_in_process_and_redacted_before_proof_recognition(
