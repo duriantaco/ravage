@@ -6,6 +6,7 @@ import os
 import stat
 import subprocess
 import sys
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -20,9 +21,17 @@ from tools.improvement_lab.corpus import candidate_visible_export
 from tools.improvement_lab.evaluation import (
     EvaluationConfig,
     EvaluationReceipt,
+    EvaluationSuite,
+    EvaluationSuiteCase,
     RunReceipt,
     evaluate_candidate,
-    evaluation_suite_from_receipts,
+)
+from tools.improvement_lab.execution_attestation import (
+    ExecutionBinding,
+    ExternalRunObservations,
+    FindingVerdict,
+    SignedExecutionEnvelope,
+    sign_execution_envelope,
 )
 from tools.improvement_lab.lessons import build_improvement_brief
 
@@ -35,11 +44,15 @@ _CHAMPION_TREE = "b" * 40
 _STATUS_DIGEST = f"sha256:{'c' * 64}"
 _REFEREE_PRIVATE_KEY = b"r" * 32
 _REFEREE_PUBLIC_KEY = public_key_from_private(_REFEREE_PRIVATE_KEY)
+_EXECUTOR_PRIVATE_KEY = b"x" * 32
+_EXECUTOR_PUBLIC_KEY = public_key_from_private(_EXECUTOR_PRIVATE_KEY)
 _RUNNER_IMAGE = f"example.invalid/referee@sha256:{'d' * 64}"
 _TWO_CANDIDATES = 2
 _THREE_ARTIFACTS = 3
 _FIVE_LEDGER_EVENTS = 5
-_SIX_LEDGER_EVENTS = 6
+_SIGNED_EVALUATION_ARTIFACTS = 14
+_SIGNED_EVALUATION_LEDGER_EVENTS = 17
+_ACCEPTED_EVALUATION_LEDGER_EVENTS = 18
 _CONCURRENT_OBJECTS = 20
 
 
@@ -51,91 +64,33 @@ def _digest(value: str) -> str:
     return f"sha256:{hashlib.sha256(value.encode()).hexdigest()}"
 
 
-def _run_receipt(
-    *,
-    case_id: str,
-    repeat: int,
-    control: bool,
-    side: str,
-    detected: int,
-) -> RunReceipt:
-    expected = 0 if control else 1
-    return RunReceipt.from_mapping(
-        {
-            "case_id": case_id,
-            "cohort": "control" if control else "capability",
-            "repeat": repeat,
-            "execution_kind": "fixture",
-            "status": "completed",
-            "is_control": control,
-            "case_success": True if control else bool(detected),
-            "expected_vulnerability_count": expected,
-            "run_id": _digest(f"run:{side}:{case_id}:{repeat}"),
-            "pair_seed_digest": _digest(f"seed:{case_id}:{repeat}"),
-            "target_snapshot_digest": _digest(f"target:{case_id}"),
-            "model_fingerprint": _digest("model:fixed"),
-            "prompt_fingerprint": _digest(f"prompt:{side}"),
-            "metrics": {
-                "evidence_backed_vulnerability_count": detected,
-                "verified_vulnerability_count": detected,
-                "confirmed_finding_count": detected,
-                "suspected_vulnerability_count": 0,
-                "proof_integrity_failure_count": 0,
-                "false_proof_count": 0,
-                "request_accounting_mismatch_count": 0,
-                "loop_violation_count": 0,
-                "provenance_violation_count": 0,
-                "secret_leak_violation_count": 0,
-                "unmetered_action_count": 0,
-                "incomplete_request_count": 0,
-                "physical_request_count": 10,
-                "model_request_count": 2,
-                "cost_usd": 0.1,
-                "request_accounting_status": "exact",
-            },
-        }
-    )
-
-
-def _receipt_sets(*, accepted: bool) -> tuple[tuple[RunReceipt, ...], tuple[RunReceipt, ...]]:
-    champion: list[RunReceipt] = []
-    candidate: list[RunReceipt] = []
-    for repeat in range(1, 4):
-        champion.append(
-            _run_receipt(
-                case_id="capability-case",
-                repeat=repeat,
-                control=False,
-                side="champion",
-                detected=0,
-            )
-        )
-        candidate.append(
-            _run_receipt(
-                case_id="capability-case",
-                repeat=repeat,
-                control=False,
-                side="candidate",
-                detected=1 if accepted else 0,
-            )
-        )
-        for side, output in (("champion", champion), ("candidate", candidate)):
-            output.append(
-                _run_receipt(
-                    case_id="control-case",
-                    repeat=repeat,
-                    control=True,
-                    side=side,
-                    detected=0,
-                )
-            )
-    return tuple(champion), tuple(candidate)
-
-
 def _suite_bytes(tag: str = "sealed-a") -> bytes:
-    champion, _candidate = _receipt_sets(accepted=True)
-    suite = evaluation_suite_from_receipts(
-        champion,
+    suite = EvaluationSuite(
+        cases=(
+            EvaluationSuiteCase(
+                case_id="capability-case",
+                cohort="capability",
+                execution_kind="fixture",
+                repeats=3,
+                is_control=False,
+                expected_vulnerability_count=1,
+                target_snapshot_digests=tuple(
+                    _digest("target:capability-case") for _repeat in range(3)
+                ),
+            ),
+            EvaluationSuiteCase(
+                case_id="control-case",
+                cohort="control",
+                execution_kind="fixture",
+                repeats=3,
+                is_control=True,
+                expected_vulnerability_count=0,
+                target_snapshot_digests=tuple(
+                    _digest("target:control-case") for _repeat in range(3)
+                ),
+            ),
+        ),
+        model_fingerprint=_digest("model:fixed"),
         trusted_tests_digest=_digest(f"tests:{tag}"),
         runner_command=("/usr/local/bin/python", "-I", "/trusted-tests/trusted_referee.py"),
     )
@@ -167,25 +122,191 @@ def _campaign(archive: LabArchive) -> dict[str, object]:
         evaluation_suite=_suite_bytes(),
         runner_image=_RUNNER_IMAGE,
         referee_public_key=_REFEREE_PUBLIC_KEY,
+        executor_public_key=_EXECUTOR_PUBLIC_KEY,
         proposal_input_artifact_ids=_proposal_inputs(archive),
     )
 
 
+def _execution_envelope(  # noqa: PLR0913 - execution identity is deliberately explicit.
+    archive: LabArchive,
+    campaign: dict[str, object],
+    candidate: dict[str, object],
+    *,
+    case_id: str,
+    repeat: int,
+    side: str,
+    detected: int,
+    private_key: bytes = _EXECUTOR_PRIVATE_KEY,
+) -> SignedExecutionEnvelope:
+    candidate_id = str(candidate["candidate_id"])
+    suite = archive.campaign_evaluation_suite(candidate_id)
+    control = case_id == "control-case"
+    candidate_patch = str(candidate["patch_object"])
+    binding = ExecutionBinding(
+        campaign_id=str(campaign["campaign_id"]),
+        candidate_id=candidate_id,
+        candidate_tree_digest=(
+            str(campaign["champion_tree"])
+            if side == "champion"
+            else candidate_patch.removeprefix("sha256:")
+        ),
+        candidate_content_digest=(
+            str(campaign["source_status_digest"])
+            if side == "champion"
+            else candidate_patch
+        ),
+        evaluation_suite_object=str(campaign["evaluation_suite_object"]),
+        trusted_tests_digest=suite.trusted_tests_digest,
+        runner_image=str(campaign["runner_image"]),
+        job_spec_digest=_digest(f"job:{side}:{case_id}:{repeat}"),
+        artifact_tree_digest=_digest(f"artifacts:{side}:{case_id}:{repeat}"),
+        artifact_case_path=f"cases/{side}/{case_id}/repeat-{repeat}",
+        case_id=case_id,
+        cohort="control" if control else "capability",
+        repeat=repeat,
+        execution_kind="fixture",
+        evaluation_side=side,
+        is_control=control,
+        expected_vulnerability_count=0 if control else 1,
+        run_id=_digest(f"run:{side}:{case_id}:{repeat}"),
+        pair_seed_digest=_digest(f"seed:{case_id}:{repeat}"),
+        target_snapshot_digest=_digest(f"target:{case_id}"),
+        model_fingerprint=_digest("model:fixed"),
+        prompt_fingerprint=_digest(f"prompt:{side}"),
+    )
+    observations = ExternalRunObservations(
+        status="completed",
+        case_success=True if control else bool(detected),
+        physical_request_count=10,
+        model_request_count=2,
+        cost_usd=0.1,
+        request_accounting_status="exact",
+        proof_integrity_failure_count=0,
+        false_proof_count=0,
+        request_accounting_mismatch_count=0,
+        loop_violation_count=0,
+        provenance_violation_count=0,
+        secret_leak_violation_count=0,
+        unmetered_action_count=0,
+        incomplete_request_count=0,
+    )
+    verdicts = tuple(
+        sorted(
+            (
+                FindingVerdict(
+                    _digest(f"finding:{side}:{case_id}:{repeat}:{index}"),
+                    "confirmed_finding",
+                )
+                for index in range(detected)
+            ),
+            key=lambda item: item.finding_digest,
+        )
+    )
+    return sign_execution_envelope(
+        binding,
+        observations,
+        verdicts,
+        private_key=private_key,
+    )
+
+
+def _retain_execution_receipt(  # noqa: PLR0913 - mirrors the signed run identity.
+    archive: LabArchive,
+    campaign: dict[str, object],
+    candidate: dict[str, object],
+    *,
+    case_id: str,
+    repeat: int,
+    side: str,
+    detected: int,
+) -> RunReceipt:
+    signed = _execution_envelope(
+        archive,
+        campaign,
+        candidate,
+        case_id=case_id,
+        repeat=repeat,
+        side=side,
+        detected=detected,
+    )
+    retained = archive.retain_execution_envelope(
+        str(candidate["candidate_id"]),
+        signed_envelope=signed,
+    )
+    receipt = signed.to_run_receipt()
+    assert retained["content_object"] == receipt.execution_attestation_digest
+    return receipt
+
+
+def _receipt_sets(
+    archive: LabArchive,
+    campaign: dict[str, object],
+    candidate: dict[str, object],
+    *,
+    accepted: bool,
+) -> tuple[tuple[RunReceipt, ...], tuple[RunReceipt, ...]]:
+    champion: list[RunReceipt] = []
+    challenger: list[RunReceipt] = []
+    for repeat in range(1, 4):
+        champion.append(
+            _retain_execution_receipt(
+                archive,
+                campaign,
+                candidate,
+                case_id="capability-case",
+                repeat=repeat,
+                side="champion",
+                detected=0,
+            )
+        )
+        challenger.append(
+            _retain_execution_receipt(
+                archive,
+                campaign,
+                candidate,
+                case_id="capability-case",
+                repeat=repeat,
+                side="candidate",
+                detected=1 if accepted else 0,
+            )
+        )
+        for side, output in (("champion", champion), ("candidate", challenger)):
+            output.append(
+                _retain_execution_receipt(
+                    archive,
+                    campaign,
+                    candidate,
+                    case_id="control-case",
+                    repeat=repeat,
+                    side=side,
+                    detected=0,
+                )
+            )
+    return tuple(champion), tuple(challenger)
+
+
 def _signed_evaluation(
     archive: LabArchive,
-    candidate_id: str,
+    campaign: dict[str, object],
+    candidate: dict[str, object],
     *,
     accepted: bool,
 ) -> dict[str, object]:
-    champion, candidate = _receipt_sets(accepted=accepted)
+    candidate_id = str(candidate["candidate_id"])
+    champion, challenger = _receipt_sets(
+        archive,
+        campaign,
+        candidate,
+        accepted=accepted,
+    )
     binding = archive.prepare_evaluation_binding(
         candidate_id,
         champion_receipts=champion,
-        candidate_receipts=candidate,
+        candidate_receipts=challenger,
     )
     receipt = evaluate_candidate(
         champion,
-        candidate,
+        challenger,
         config=archive.campaign_evaluation_config(candidate_id),
         suite=archive.campaign_evaluation_suite(candidate_id),
     )
@@ -195,6 +316,21 @@ def _signed_evaluation(
         binding,
         private_key=_REFEREE_PRIVATE_KEY,
     ).to_json()
+
+
+def _register_test_candidate(
+    archive: LabArchive,
+    campaign: dict[str, object],
+    *,
+    patch: bytes = b"candidate",
+) -> dict[str, object]:
+    return archive.register_candidate(
+        campaign_id=str(campaign["campaign_id"]),
+        parent_ref=str(archive.current_pointer()["champion_ref"]),
+        artifact_kind="source_patch",
+        patch=patch,
+        config={},
+    )
 
 
 def test_archive_objects_are_content_addressed_and_idempotent(tmp_path: Path) -> None:
@@ -293,7 +429,8 @@ def test_human_approval_advances_only_lab_pointer_with_cas(tmp_path: Path) -> No
         candidate_id=str(candidate["candidate_id"]),
         signed_evaluation=_signed_evaluation(
             archive,
-            str(candidate["candidate_id"]),
+            campaign,
+            candidate,
             accepted=True,
         ),
     )
@@ -333,7 +470,7 @@ def test_human_approval_advances_only_lab_pointer_with_cas(tmp_path: Path) -> No
             expected_champion_ref=original_ref,
             approval=conflicting_approval,
         )
-    assert archive.verify().ledger_events == _SIX_LEDGER_EVENTS
+    assert archive.verify().ledger_events == _ACCEPTED_EVALUATION_LEDGER_EVENTS
 
 
 def test_rejected_evaluation_cannot_advance_pointer(tmp_path: Path) -> None:
@@ -351,7 +488,8 @@ def test_rejected_evaluation_cannot_advance_pointer(tmp_path: Path) -> None:
         candidate_id=str(candidate["candidate_id"]),
         signed_evaluation=_signed_evaluation(
             archive,
-            str(candidate["candidate_id"]),
+            campaign,
+            candidate,
             accepted=False,
         ),
     )
@@ -393,6 +531,144 @@ def test_archive_rejects_self_attested_evaluation_mapping(tmp_path: Path) -> Non
                 "receipt_digest": f"sha256:{'0' * 64}",
             },
         )
+
+
+def test_campaign_requires_distinct_referee_and_executor_keys(tmp_path: Path) -> None:
+    archive = _archive(tmp_path)
+
+    with pytest.raises(ArchiveError, match="executor and referee keys must be distinct"):
+        archive.create_campaign(
+            champion_commit=_CHAMPION_COMMIT,
+            champion_tree=_CHAMPION_TREE,
+            source_status_digest=_STATUS_DIGEST,
+            evaluation_config=EvaluationConfig().to_json(),
+            evaluation_suite=_suite_bytes(),
+            runner_image=_RUNNER_IMAGE,
+            referee_public_key=_REFEREE_PUBLIC_KEY,
+            executor_public_key=_REFEREE_PUBLIC_KEY,
+            proposal_input_artifact_ids=_proposal_inputs(archive),
+        )
+
+
+def test_evaluation_binding_rejects_missing_execution_envelope(tmp_path: Path) -> None:
+    archive = _archive(tmp_path)
+    campaign = _campaign(archive)
+    candidate = _register_test_candidate(archive, campaign)
+    champion = _execution_envelope(
+        archive,
+        campaign,
+        candidate,
+        case_id="capability-case",
+        repeat=1,
+        side="champion",
+        detected=0,
+    ).to_run_receipt()
+    challenger = _execution_envelope(
+        archive,
+        campaign,
+        candidate,
+        case_id="capability-case",
+        repeat=1,
+        side="candidate",
+        detected=1,
+    ).to_run_receipt()
+
+    with pytest.raises(ArchiveError, match="archive file is missing"):
+        archive.prepare_evaluation_binding(
+            str(candidate["candidate_id"]),
+            champion_receipts=(champion,),
+            candidate_receipts=(challenger,),
+        )
+
+
+def test_execution_envelope_rejects_wrong_key_and_wrong_side(tmp_path: Path) -> None:
+    archive = _archive(tmp_path)
+    campaign = _campaign(archive)
+    candidate = _register_test_candidate(archive, campaign)
+    wrong_key = _execution_envelope(
+        archive,
+        campaign,
+        candidate,
+        case_id="capability-case",
+        repeat=1,
+        side="champion",
+        detected=0,
+        private_key=b"w" * 32,
+    )
+    with pytest.raises(ArchiveError, match="valid executor attestation"):
+        archive.retain_execution_envelope(
+            str(candidate["candidate_id"]),
+            signed_envelope=wrong_key,
+        )
+
+    candidate_side = _retain_execution_receipt(
+        archive,
+        campaign,
+        candidate,
+        case_id="capability-case",
+        repeat=1,
+        side="candidate",
+        detected=1,
+    )
+    with pytest.raises(ArchiveError, match="bound to the wrong side"):
+        archive.prepare_evaluation_binding(
+            str(candidate["candidate_id"]),
+            champion_receipts=(candidate_side,),
+            candidate_receipts=(candidate_side,),
+        )
+
+
+def test_evaluation_binding_rejects_receipt_drift_and_envelope_reuse(
+    tmp_path: Path,
+) -> None:
+    archive = _archive(tmp_path)
+    campaign = _campaign(archive)
+    candidate = _register_test_candidate(archive, campaign)
+    champion = _retain_execution_receipt(
+        archive,
+        campaign,
+        candidate,
+        case_id="capability-case",
+        repeat=1,
+        side="champion",
+        detected=0,
+    )
+
+    with pytest.raises(ArchiveError, match="differs from its signed execution"):
+        archive.prepare_evaluation_binding(
+            str(candidate["candidate_id"]),
+            champion_receipts=(replace(champion, physical_request_count=11),),
+            candidate_receipts=(champion,),
+        )
+    with pytest.raises(ArchiveError, match="reused across promotion receipt sets"):
+        archive.prepare_evaluation_binding(
+            str(candidate["candidate_id"]),
+            champion_receipts=(champion,),
+            candidate_receipts=(champion,),
+        )
+
+
+def test_archive_verification_recomputes_linked_execution_evidence(tmp_path: Path) -> None:
+    archive = _archive(tmp_path)
+    campaign = _campaign(archive)
+    candidate = _register_test_candidate(archive, campaign)
+    evaluation = archive.record_evaluation(
+        candidate_id=str(candidate["candidate_id"]),
+        signed_evaluation=_signed_evaluation(
+            archive,
+            campaign,
+            candidate,
+            accepted=True,
+        ),
+    )
+
+    manifest, receipt = archive.evaluation_receipt(str(evaluation["evaluation_id"]))
+    verification = archive.verify()
+
+    assert manifest == evaluation
+    assert receipt.accepted is True
+    assert verification.artifacts == _SIGNED_EVALUATION_ARTIFACTS
+    assert verification.ledger_events == _SIGNED_EVALUATION_LEDGER_EVENTS
 
 
 def test_export_copies_patch_without_applying_or_overwriting(tmp_path: Path) -> None:
@@ -688,6 +964,7 @@ def test_archive_completed_retries_are_idempotent(tmp_path: Path) -> None:
         "evaluation_suite": _suite_bytes(),
         "runner_image": _RUNNER_IMAGE,
         "referee_public_key": _REFEREE_PUBLIC_KEY,
+        "executor_public_key": _EXECUTOR_PUBLIC_KEY,
         "proposal_input_artifact_ids": inputs,
     }
     first_campaign = archive.create_campaign(**arguments)
@@ -708,7 +985,8 @@ def test_archive_completed_retries_are_idempotent(tmp_path: Path) -> None:
     assert archive.register_candidate(**candidate_arguments) == candidate
     signed = _signed_evaluation(
         archive,
-        str(candidate["candidate_id"]),
+        first_campaign,
+        candidate,
         accepted=True,
     )
     evaluation = archive.record_evaluation(
@@ -722,7 +1000,7 @@ def test_archive_completed_retries_are_idempotent(tmp_path: Path) -> None:
         )
         == evaluation
     )
-    assert archive.verify().ledger_events == _FIVE_LEDGER_EVENTS
+    assert archive.verify().ledger_events == _SIGNED_EVALUATION_LEDGER_EVENTS
 
 
 def test_candidate_brief_must_be_strict_and_match_its_exact_corpus(tmp_path: Path) -> None:
@@ -772,6 +1050,7 @@ def test_candidate_brief_must_be_strict_and_match_its_exact_corpus(tmp_path: Pat
             evaluation_suite=_suite_bytes(),
             runner_image=_RUNNER_IMAGE,
             referee_public_key=_REFEREE_PUBLIC_KEY,
+            executor_public_key=_EXECUTOR_PUBLIC_KEY,
             proposal_input_artifact_ids=(
                 str(corpus_manifest["artifact_id"]),
                 str(brief_manifest["artifact_id"]),
@@ -798,7 +1077,8 @@ def test_stale_sibling_cannot_replace_accepted_candidate(tmp_path: Path) -> None
             candidate_id=str(candidate["candidate_id"]),
             signed_evaluation=_signed_evaluation(
                 archive,
-                str(candidate["candidate_id"]),
+                campaign,
+                candidate,
                 accepted=True,
             ),
         )
@@ -847,7 +1127,8 @@ def test_archive_rolls_to_new_reviewed_campaign_after_acceptance(tmp_path: Path)
         candidate_id=str(candidate["candidate_id"]),
         signed_evaluation=_signed_evaluation(
             archive,
-            str(candidate["candidate_id"]),
+            campaign,
+            candidate,
             accepted=True,
         ),
     )
@@ -875,6 +1156,7 @@ def test_archive_rolls_to_new_reviewed_campaign_after_acceptance(tmp_path: Path)
         evaluation_suite=_suite_bytes("sealed-b"),
         runner_image=_RUNNER_IMAGE,
         referee_public_key=_REFEREE_PUBLIC_KEY,
+        executor_public_key=_EXECUTOR_PUBLIC_KEY,
         proposal_input_artifact_ids=archive.candidate_input_artifact_ids(
             str(candidate["candidate_id"])
         ),
@@ -907,7 +1189,8 @@ def test_evaluation_signature_cannot_be_rebound_or_change_campaign_policy(tmp_pa
     )
     signed_first = _signed_evaluation(
         archive,
-        str(first["candidate_id"]),
+        campaign,
+        first,
         accepted=True,
     )
     with pytest.raises(ArchiveError, match="does not match"):
@@ -916,7 +1199,12 @@ def test_evaluation_signature_cannot_be_rebound_or_change_campaign_policy(tmp_pa
             signed_evaluation=signed_first,
         )
 
-    champion, candidate_receipts = _receipt_sets(accepted=True)
+    champion, candidate_receipts = _receipt_sets(
+        archive,
+        campaign,
+        first,
+        accepted=True,
+    )
     binding = archive.prepare_evaluation_binding(
         str(first["candidate_id"]),
         champion_receipts=champion,

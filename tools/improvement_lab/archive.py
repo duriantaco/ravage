@@ -38,6 +38,14 @@ from tools.improvement_lab.evaluation import (
     evaluate_candidate,
     load_canonical_run_receipts,
 )
+from tools.improvement_lab.execution_attestation import (
+    ExecutionAttestationError,
+    SignedExecutionEnvelope,
+    canonical_execution_envelope_bytes,
+    execution_envelope_digest,
+    load_canonical_execution_envelope_bytes,
+    verify_signed_execution_envelope,
+)
 from tools.improvement_lab.lessons import (
     ImprovementBriefError,
     build_improvement_brief,
@@ -51,7 +59,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 ARCHIVE_SCHEMA_VERSION: Final = "ravage.improvement-archive.v1"
-CAMPAIGN_SCHEMA_VERSION: Final = "ravage.improvement-campaign.v3"
+CAMPAIGN_SCHEMA_VERSION: Final = "ravage.improvement-campaign.v4"
 CANDIDATE_SCHEMA_VERSION: Final = "ravage.improvement-candidate.v2"
 EVALUATION_RECORD_SCHEMA_VERSION: Final = "ravage.improvement-evaluation-record.v3"
 APPROVAL_SCHEMA_VERSION: Final = "ravage.improvement-human-approval.v1"
@@ -257,6 +265,7 @@ class LabArchive:
         evaluation_suite: bytes,
         runner_image: str,
         referee_public_key: bytes,
+        executor_public_key: bytes,
         proposal_input_artifact_ids: Sequence[str],
         expected_previous_ref: str | None = None,
     ) -> dict[str, object]:
@@ -269,6 +278,9 @@ class LabArchive:
         try:
             validated_config = EvaluationConfig.from_mapping(evaluation_config)
             key_id = referee_key_id(referee_public_key)
+            executor_key_id = referee_key_id(executor_public_key)
+            if executor_key_id == key_id:
+                raise ArchiveError("campaign executor and referee keys must be distinct")
             EvaluationBinding(
                 campaign_id=f"campaign_{'0' * 24}",
                 candidate_id=f"candidate_{'0' * 24}",
@@ -294,6 +306,7 @@ class LabArchive:
         config_object = self.put_json(validated_config.to_json())
         suite_object = self.put_json(validated_suite.to_json())
         public_key_object = self.put_bytes(referee_public_key)
+        executor_public_key_object = self.put_bytes(executor_public_key)
         validated_inputs = self._validated_candidate_input_artifacts(proposal_input_artifact_ids)
         input_set_object = self.put_json(
             {"schema_version": 1, "artifact_ids": list(validated_inputs)}
@@ -307,6 +320,8 @@ class LabArchive:
             "runner_image": runner_image,
             "referee_public_key_object": public_key_object.digest,
             "referee_key_id": key_id,
+            "executor_public_key_object": executor_public_key_object.digest,
+            "executor_key_id": executor_key_id,
             "proposal_input_set_object": input_set_object.digest,
         }
         campaign_id = f"campaign_{_digest_json(identity)[:24]}"
@@ -384,6 +399,55 @@ class LabArchive:
             if metadata is not None and metadata != {}:
                 raise ArchiveError("candidate-visible artifact metadata must be empty")
             content = _canonicalize_candidate_artifact(kind=kind, content=content)
+        return self._record_artifact(
+            kind=kind,
+            visibility=visibility,
+            content=content,
+            metadata=metadata,
+        )
+
+    def retain_execution_envelope(
+        self,
+        candidate_id: str,
+        *,
+        signed_envelope: SignedExecutionEnvelope,
+    ) -> dict[str, object]:
+        """Verify and retain one canonical executor envelope as a sealed artifact."""
+        self.recover()
+        _archive_id(candidate_id, "candidate")
+        public_key = self.campaign_executor_public_key(candidate_id)
+        try:
+            verified = verify_signed_execution_envelope(
+                signed_envelope.to_json(),
+                public_key=public_key,
+            )
+        except (AttributeError, ExecutionAttestationError) as exc:
+            raise ArchiveError("execution envelope is not a valid executor attestation") from exc
+        self._validate_execution_envelope_binding(candidate_id, verified)
+        content = canonical_execution_envelope_bytes(verified)
+        expected_digest = execution_envelope_digest(verified)
+        manifest = self._record_artifact(
+            kind="execution_attestation",
+            visibility="sealed_evaluator",
+            content=content,
+            metadata={
+                "candidate_id": candidate_id,
+                "evaluation_side": verified.binding.evaluation_side,
+                "run_id": verified.binding.run_id,
+            },
+        )
+        if manifest.get("content_object") != expected_digest:
+            raise ArchiveError("retained execution envelope has an unexpected CAS identity")
+        return manifest
+
+    def _record_artifact(
+        self,
+        *,
+        kind: str,
+        visibility: str,
+        content: bytes,
+        metadata: object | None,
+    ) -> dict[str, object]:
         content_object = self.put_bytes(content)
         metadata_object = self.put_json(metadata or {})
         identity = {
@@ -567,6 +631,11 @@ class LabArchive:
             raise ArchiveError("evaluation binding receipt objects are invalid") from exc
         if not champion or not candidate_receipts:
             raise ArchiveError("evaluation binding receipt objects are empty")
+        self._verify_receipt_execution_envelopes(
+            candidate_id,
+            champion_receipts=champion,
+            candidate_receipts=candidate_receipts,
+        )
         try:
             return EvaluationBinding(
                 campaign_id=str(candidate["campaign_id"]),
@@ -594,6 +663,11 @@ class LabArchive:
     ) -> EvaluationBinding:
         """Retain canonical raw receipt sets before a referee signs their result."""
         self.recover()
+        self._verify_receipt_execution_envelopes(
+            candidate_id,
+            champion_receipts=champion_receipts,
+            candidate_receipts=candidate_receipts,
+        )
         champion_object = self.put_bytes(canonical_run_receipts_bytes(champion_receipts))
         candidate_object = self.put_bytes(canonical_run_receipts_bytes(candidate_receipts))
         return self.evaluation_binding(
@@ -639,6 +713,11 @@ class LabArchive:
             )
         except ValueError as exc:
             raise ArchiveError("archived evaluation receipt sets are invalid") from exc
+        self._verify_receipt_execution_envelopes(
+            binding.candidate_id,
+            champion_receipts=champion,
+            candidate_receipts=candidate,
+        )
         selected = config or self.campaign_evaluation_config(binding.candidate_id)
         suite = self.campaign_evaluation_suite(binding.candidate_id)
         return evaluate_candidate(champion, candidate, config=selected, suite=suite)
@@ -647,6 +726,82 @@ class LabArchive:
         candidate = self._load_manifest("candidates", candidate_id)
         campaign = self._load_manifest("campaigns", str(candidate["campaign_id"]))
         return self.read_object(str(campaign["referee_public_key_object"]))
+
+    def campaign_executor_public_key(self, candidate_id: str) -> bytes:
+        candidate = self._load_manifest("candidates", candidate_id)
+        campaign = self._load_manifest("campaigns", str(candidate["campaign_id"]))
+        return self.read_object(str(campaign["executor_public_key_object"]))
+
+    def _verify_receipt_execution_envelopes(
+        self,
+        candidate_id: str,
+        *,
+        champion_receipts: Sequence[RunReceipt],
+        candidate_receipts: Sequence[RunReceipt],
+    ) -> None:
+        public_key = self.campaign_executor_public_key(candidate_id)
+        seen: set[str] = set()
+        for side, receipts in (
+            ("champion", champion_receipts),
+            ("candidate", candidate_receipts),
+        ):
+            for receipt in receipts:
+                if receipt.execution_kind not in {"fixture", "live"}:
+                    continue
+                digest = receipt.execution_attestation_digest
+                if digest is None:
+                    raise ArchiveError("promotable receipt lacks an execution attestation")
+                if digest in seen:
+                    raise ArchiveError(
+                        "execution envelope is reused across promotion receipt sets"
+                    )
+                seen.add(digest)
+                content = self.read_object(digest)
+                try:
+                    signed = load_canonical_execution_envelope_bytes(
+                        content,
+                        public_key=public_key,
+                    )
+                except ExecutionAttestationError as exc:
+                    raise ArchiveError(
+                        "receipt execution envelope is not a valid executor attestation"
+                    ) from exc
+                if execution_envelope_digest(signed) != digest:
+                    raise ArchiveError("receipt execution envelope CAS identity is invalid")
+                self._validate_execution_envelope_binding(candidate_id, signed)
+                if signed.binding.evaluation_side != side:
+                    raise ArchiveError("receipt execution envelope is bound to the wrong side")
+                if signed.to_run_receipt().to_json() != receipt.to_json():
+                    raise ArchiveError(
+                        "receipt differs from its signed execution attestation"
+                    )
+
+    def _validate_execution_envelope_binding(
+        self,
+        candidate_id: str,
+        signed: SignedExecutionEnvelope,
+    ) -> None:
+        candidate = self._load_manifest("candidates", candidate_id)
+        campaign = self._load_manifest("campaigns", str(candidate["campaign_id"]))
+        suite = self.campaign_evaluation_suite(candidate_id)
+        binding = signed.binding
+        if (
+            binding.campaign_id != candidate["campaign_id"]
+            or binding.candidate_id != candidate_id
+            or binding.evaluation_suite_object != campaign["evaluation_suite_object"]
+            or binding.trusted_tests_digest != suite.trusted_tests_digest
+            or binding.runner_image != campaign["runner_image"]
+        ):
+            raise ArchiveError(
+                "execution envelope does not match the archived candidate campaign"
+            )
+        if (
+            binding.evaluation_side == "champion"
+            and binding.candidate_tree_digest != campaign["champion_tree"]
+        ):
+            raise ArchiveError(
+                "champion execution envelope does not match the campaign tree"
+            )
 
     def candidate_runner_image(self, candidate_id: str) -> str:
         candidate = self._load_manifest("candidates", candidate_id)
@@ -1549,6 +1704,8 @@ def _verify_manifest_payload(
             "runner_image",
             "referee_public_key_object",
             "referee_key_id",
+            "executor_public_key_object",
+            "executor_key_id",
             "proposal_input_set_object",
         ),
         "candidates": (
@@ -1588,6 +1745,22 @@ def _verify_manifest_payload(
     for field, value in payload.items():
         if field.endswith("_object"):
             archive.read_object(str(value or ""))
+    if kind == "campaigns":
+        try:
+            referee_id = referee_key_id(
+                archive.read_object(str(payload["referee_public_key_object"]))
+            )
+            executor_id = referee_key_id(
+                archive.read_object(str(payload["executor_public_key_object"]))
+            )
+        except AttestationError as exc:
+            raise ArchiveError("archive campaign public key is invalid") from exc
+        if (
+            payload.get("referee_key_id") != referee_id
+            or payload.get("executor_key_id") != executor_id
+            or referee_id == executor_id
+        ):
+            raise ArchiveError("archive campaign key identities are invalid")
 
 
 def _create_archive_root(path: Path) -> Path:
