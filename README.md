@@ -221,8 +221,9 @@ ravage skills validate builtin
 The [Improvement Lab](docs/improvement-lab.md) ingests sanitized prior-run
 structure, evaluates candidate patches in independent workspaces, archives
 accepted and rejected versions, and requires matched no-regression evidence
-before promotion. It is a sidecar: it does not mutate the source checkout or
-silently promote itself.
+before promotion. Promotable receipts must trace back to separately signed,
+archived execution evidence. It is a sidecar: it does not mutate the source
+checkout or silently promote itself.
 
 Passive orbital and packet artifacts can be inspected separately:
 
