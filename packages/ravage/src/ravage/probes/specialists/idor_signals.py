@@ -86,6 +86,14 @@ def _idor_access_signal(
     if _auth_cookie_identity_changed(baseline, response):
         return _auth_cookie_identity_signal(response)
 
+    if _is_pure_identifier_substitution(
+        baseline=baseline,
+        response=response,
+        original_id=original_id,
+        candidate_id=candidate_id,
+    ):
+        return {}
+
     object_delta = _object_access_delta(
         baseline=baseline,
         response=response,
@@ -99,6 +107,25 @@ def _idor_access_signal(
     if sensitive_delta:
         return sensitive_delta
     return {}
+
+
+def _is_pure_identifier_substitution(
+    *,
+    baseline: ProbeResponse,
+    response: ProbeResponse,
+    original_id: str,
+    candidate_id: str,
+) -> bool:
+    if response.status != baseline.status or not original_id or not candidate_id:
+        return False
+    if original_id == candidate_id:
+        return False
+    if original_id not in baseline.body or candidate_id not in response.body:
+        return False
+    sentinel = "<ravage-object-identifier>"
+    normalized_baseline = baseline.body.replace(original_id, sentinel)
+    normalized_response = response.body.replace(candidate_id, sentinel)
+    return normalized_baseline == normalized_response
 
 
 def _proof_or_secret_signal(response: ProbeResponse) -> dict[str, object]:

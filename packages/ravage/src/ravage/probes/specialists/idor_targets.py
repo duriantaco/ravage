@@ -9,9 +9,11 @@ from ravage.probes.specialists.shared import (
     _dedupe,
     _form_targets,
     _generic_input_targets,
+    _idor_id_format,
     _input_name_priority,
     _int_value,
     _list_of_dicts,
+    _looks_mongo_object_id,
     _name_looks_expression_context,
     _name_looks_idor,
     _string_items,
@@ -19,8 +21,6 @@ from ravage.probes.specialists.shared import (
     _target_current_value,
     _target_headers,
     _value_looks_idor_id,
-    _idor_id_format,
-    _looks_mongo_object_id,
 )
 from ravage.web_core.http_probe import form_defaults
 
@@ -78,7 +78,7 @@ def _idor_targets(state: AgentState) -> list[dict[str, object]]:
             continue
         if _looks_expression_only_idor_candidate(input_name, url):
             continue
-        if not name_looks_idor and not (current_value and _value_looks_idor_id(current_value)):
+        if not name_looks_idor and not _value_is_structured_idor_id(current_value):
             continue
         targets.append(
             target
@@ -93,7 +93,10 @@ def _idor_targets(state: AgentState) -> list[dict[str, object]]:
         for param_name, value in parse_qsl(urlsplit(endpoint).query, keep_blank_values=True):
             if _looks_expression_only_idor_candidate(param_name, endpoint):
                 continue
-            if not (_name_looks_idor(param_name, endpoint) or _value_looks_idor_id(value)):
+            if not (
+                _name_looks_idor(param_name, endpoint)
+                or _value_is_structured_idor_id(value)
+            ):
                 continue
             baseline_id = value or _baseline_value(param_name)
             targets.append(
@@ -194,7 +197,7 @@ def _idor_form_targets(state: AgentState) -> list[dict[str, object]]:
                 continue
             if _looks_expression_only_idor_candidate(name, action):
                 continue
-            if not name_looks_idor and not _value_looks_idor_id(value):
+            if not name_looks_idor and not _value_is_structured_idor_id(value):
                 continue
             baseline_id = value or _baseline_value(name)
             priority = 55 + auth_bonus + _input_name_priority(name)
@@ -221,6 +224,10 @@ def _idor_form_targets(state: AgentState) -> list[dict[str, object]]:
                 }
             )
     return targets
+
+
+def _value_is_structured_idor_id(value: str) -> bool:
+    return _idor_id_format(value) in {"numeric", "uuid", "hash", "objectid"}
 
 
 def _form_auth_bonus(form: dict[str, object]) -> int:

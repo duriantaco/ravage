@@ -267,6 +267,80 @@ def test_distinct_affected_parameters_survive_outcome_and_report_deduplication(
     } == {"alpha", "beta"}
 
 
+def test_affected_parameter_identity_ignores_unrelated_endpoint_parameters() -> None:
+    probe = "sqli_differential"
+    expected_count = 2
+    findings = [
+        {
+            "type": "sql_injection_error_signal",
+            "markers": ["database syntax error"],
+            "delta": {"new_error_markers": ["database"]},
+            "replay": {
+                "method": "GET",
+                "url": url,
+                "payload_field": "q",
+            },
+            "baseline_replay": {
+                "method": "GET",
+                "url": "http://127.0.0.1:8765/lookup?q=plain",
+                "payload_field": "q",
+            },
+            "response": {
+                "method": "GET",
+                "url": "http://127.0.0.1:8765/lookup",
+                "status": 500,
+                "body_sha_hint": "database-error",
+            },
+        }
+        for url in (
+            "http://127.0.0.1:8765/lookup?q=test",
+            "http://127.0.0.1:8765/lookup?q=test&submit=Search",
+        )
+    ]
+    qualified = qualify_probe_findings(
+        probe=probe,
+        probe_text=json.dumps(
+            {
+                "probe": probe,
+                "ok": True,
+                "findings": findings,
+                "requests": [],
+                "errors": [],
+            }
+        ),
+        target_url="http://127.0.0.1:8765/",
+    )
+
+    assert len(qualified) == expected_count
+    first, second = qualified
+    assert first.endpoint != second.endpoint
+    assert first.finding_id(_ENGAGEMENT_ID) == second.finding_id(_ENGAGEMENT_ID)
+    assert first.evidence_id(_ENGAGEMENT_ID) == second.evidence_id(_ENGAGEMENT_ID)
+    assert first.evidence_id(_ENGAGEMENT_ID) == replace(
+        second,
+        probe="alternate_detector",
+    ).evidence_id(_ENGAGEMENT_ID)
+
+    first_without_affected = replace(
+        first,
+        request={key: value for key, value in first.request.items() if key != "affected_parameter"},
+    )
+    second_without_affected = replace(
+        second,
+        request={
+            key: value
+            for key, value in second.request.items()
+            if key != "affected_parameter"
+        },
+    )
+    assert first_without_affected.finding_id(
+        _ENGAGEMENT_ID
+    ) != second_without_affected.finding_id(_ENGAGEMENT_ID)
+    assert first_without_affected.evidence_id(
+        _ENGAGEMENT_ID
+    ) != second_without_affected.evidence_id(_ENGAGEMENT_ID)
+
+
 def test_unknown_signals_are_retained_but_cannot_self_promote() -> None:
     unknown = json.dumps(
         {
@@ -1470,7 +1544,8 @@ def test_full_probe_payload_feeds_identity_aware_graph_before_clipping(
     assert operation.method == "GET"
     assert operation.route_shape == "/api/users/{int}"
     assert operation.provenance == ("probe",)
-    assert {(item.name, item.location) for item in operation.parameters} == {("expand", "query")}
+    assert operation.actionable is False
+    assert operation.parameters == ()
     [observation] = list((state.surface_graph.observations or {}).values())
     assert observation.identity_alias == "alice"
     assert observation.source_kind == "probe"
@@ -1482,7 +1557,7 @@ def test_full_probe_payload_feeds_identity_aware_graph_before_clipping(
 
     projected = json.dumps(state.surface, sort_keys=True)
     serialized_graph = json.dumps(state.surface_graph.to_json(), sort_keys=True)
-    assert "http://127.0.0.1:8765/api/users/{int}" in projected
+    assert "http://127.0.0.1:8765/api/users/{int}" not in projected
     assert observed_value not in projected
     assert observed_value not in serialized_graph
 

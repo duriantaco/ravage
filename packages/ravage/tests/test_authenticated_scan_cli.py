@@ -11,6 +11,7 @@ from ravage import __main__ as cli
 from ravage.auth import SecretValue
 from ravage.probe_suite_parts.result import ProbeRunResult
 from ravage.run_data.brief import load_engagement_brief
+from ravage.traffic.policy import TrafficPolicyConfig, TrafficPolicyController
 from ravage.web_core.http_probe import ProbeResponse, ProbeSession
 
 _TARGET_URL = "http://127.0.0.1:18742/"
@@ -409,17 +410,27 @@ def test_configured_scan_snapshots_unique_secrets_and_classifies_traffic_values(
     monkeypatch.setattr(cli, "ProbeTrafficRecorder", CapturingRecorder)
     monkeypatch.setattr(ProbeSession, "request", request)
 
+    traffic_policy = TrafficPolicyController.open(
+        tmp_path / "traffic-policy.json",
+        target_url=_TARGET_URL,
+        config=TrafficPolicyConfig(),
+    )
     owner, redactor = cli._configured_scan_session(
         brief=brief,
         target_url=_TARGET_URL,
         identity="admin",
         timeout_seconds=5,
         allow_remote_target=False,
+        traffic_policy=traffic_policy,
         secret_resolver=CountingResolver(),
         traffic_store=object(),  # type: ignore[arg-type]
         traffic_capture_session_id="scan-auth-test",
     )
     try:
+        assert owner.traffic_policy is traffic_policy
+        managed_probe_session = owner.session_for_probe(timeout_seconds=5)
+        assert managed_probe_session.traffic_policy is traffic_policy
+        owner.retire_probe_session(managed_probe_session)
         assert Counter(resolver_calls) == Counter({"ADMIN_USER": 1, "ADMIN_PASSWORD": 1})
         [recorder] = recorders
         assert recorder.known == ()  # type: ignore[attr-defined]

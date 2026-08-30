@@ -260,6 +260,11 @@ class SurfaceOperation:
     def structural_url(self) -> str:
         return f"{self.origin}{self.route_shape}"
 
+    @property
+    def actionable(self) -> bool:
+        """Whether trusted discovery, rather than attack traffic alone, found this shape."""
+        return any(source != "probe" for source in self.provenance)
+
     def to_json(self) -> dict[str, object]:
         return {
             "operation_id": self.operation_id,
@@ -557,15 +562,19 @@ class SurfaceGraphState:
         observed_at: object = "",
     ) -> SurfaceOperation:
         source = _source_kind(source_kind)
+        attack_metadata = source == "probe"
         operation = self.add_operation(
             SurfaceOperation.create(
                 url=url,
                 method=method,
                 selector=selector,
-                parameters=parameters,
-                content_types=content_types,
-                header_names=header_names,
-                hints=hints,
+                # Probe mutations remain access evidence, never discovery
+                # metadata. This also prevents a later trusted observation of
+                # the same method/route from inheriting attacker-made fields.
+                parameters=() if attack_metadata else parameters,
+                content_types=() if attack_metadata else content_types,
+                header_names=() if attack_metadata else header_names,
+                hints=() if attack_metadata else hints,
                 provenance=(source,),
             )
         )
@@ -655,7 +664,12 @@ class SurfaceGraphState:
     def to_prompt_json(self, *, limit: int = 40) -> dict[str, object]:
         assert self.operations is not None
         assert self.observations is not None
-        operations = [self.operations[key] for key in sorted(self.operations)[:limit]]
+        actionable_operations = [
+            self.operations[key]
+            for key in sorted(self.operations)
+            if self.operations[key].actionable
+        ]
+        operations = actionable_operations[:limit]
         statuses: dict[str, dict[str, list[int]]] = {}
         for observation in self.observations.values():
             if observation.response_status is None:
@@ -668,6 +682,7 @@ class SurfaceGraphState:
         return {
             "counts": {
                 "operations": len(self.operations),
+                "candidate_operations": len(actionable_operations),
                 "identity_observations": len(self.observations),
             },
             "operations": [

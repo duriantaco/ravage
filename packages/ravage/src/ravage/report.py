@@ -331,6 +331,7 @@ def build_pentest_report(  # noqa: PLR0913
     target = target_url or _target_from_events(events) or (manifest.target_url if manifest else "")
     agent_http_evidence = _agent_http_evidence_summary(workspace_dir)
     traffic_accounting = _traffic_accounting_summary(workspace_dir, events=events)
+    scan_coverage = _scan_coverage_summary(workspace_dir)
     report = {
         "schema_version": REPORT_SCHEMA_VERSION,
         "generated_at": generated_at,
@@ -374,6 +375,7 @@ def build_pentest_report(  # noqa: PLR0913
         },
         "proof_observations": proof_observations,
         "traffic_accounting": traffic_accounting,
+        "scan_coverage": scan_coverage,
         "agent_http_evidence": agent_http_evidence,
         "work_performed": work,
         "methodology": _methodology(),
@@ -442,6 +444,8 @@ def render_markdown_report(report: dict[str, Any]) -> str:  # noqa: PLR0915
         "",
     ]
     lines.extend(f"- {item}" for item in _list(report.get("methodology")))
+    lines.extend(["", "## Deterministic Scan Coverage", ""])
+    lines.extend(_scan_coverage_markdown(_dict(report.get("scan_coverage"))))
     lines.extend(["", "## Reconnaissance", ""])
     lines.extend(_recon_markdown(_dict(report.get("reconnaissance"))))
     hosting = _dict(report.get("hosting_layer"))
@@ -547,11 +551,116 @@ def _recon_markdown(recon: dict[str, Any]) -> list[str]:
     return [*lines, ""]
 
 
+def _scan_coverage_markdown(coverage: dict[str, Any]) -> list[str]:
+    status = str(coverage.get("status") or "not_available")
+    if status in {"not_available", "unavailable"}:
+        return [
+            "No validated deterministic scan coverage certificate was available.",
+            "",
+        ]
+    summary = _dict(coverage.get("summary"))
+    disposition_counts = _dict(summary.get("disposition_counts"))
+    limitations = _list(coverage.get("limitations"))
+    lines = [
+        (
+            "This certificate covers only the recorded finite planner frontier. "
+            "It does not claim that the application or any vulnerability family "
+            "was exhausted."
+        ),
+        "",
+        f"- Certificate status: {status}",
+        f"- Completion basis: {coverage.get('completion_basis', '')}",
+        f"- Planner decisions: {summary.get('planner_decision_count', 0)}",
+        f"- Completed probes: {summary.get('completed_probe_count', 0)}",
+        f"- Findings observed by probes: {summary.get('finding_count', 0)}",
+        (
+            "- Dispositions: "
+            + ", ".join(f"{name}={value}" for name, value in sorted(disposition_counts.items()))
+        ),
+        f"- Limitations: {_join(limitations) if limitations else 'none recorded'}",
+        "",
+    ]
+    probes = [_dict(item) for item in _list(coverage.get("probes"))]
+    if not probes:
+        return lines
+    lines.extend(
+        [
+            "| Probe | Family | Disposition | Findings | Physical requests | Accounting |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+    )
+    lines.extend(
+        (
+            "| "
+            + " | ".join(
+                _table_cell(value)
+                for value in (
+                    probe.get("probe_id", ""),
+                    probe.get("family", ""),
+                    probe.get("disposition", ""),
+                    probe.get("finding_count", 0),
+                    probe.get("physical_request_count", 0),
+                    probe.get("request_accounting_status", ""),
+                )
+            )
+            + " |"
+        )
+        for probe in probes
+    )
+    lines.append("")
+    return lines
+
+
 def redact_sensitive(value: str) -> str:
     redacted = _PROOF_RE.sub(lambda match: _mask_proof(match.group(0)), str(value))
     for pattern in _SECRET_PATTERNS:
         redacted = pattern.sub(_secret_replacement, redacted)
     return redacted
+
+
+def _scan_coverage_summary(workspace_dir: Path) -> dict[str, object]:
+    artifact_path = workspace_dir.parent / "scan-coverage.json"
+    if not artifact_path.exists():
+        return {"status": "not_available"}
+    payload = _read_bounded_json_object(artifact_path)
+    if (
+        payload.get("schema") != "ravage.scan-coverage"
+        or payload.get("version") != 1
+        or payload.get("status") not in {"complete", "partial"}
+        or payload.get("completion_basis")
+        not in {"planner_frontier_exhausted", "planner_frontier_open"}
+    ):
+        return {
+            "status": "unavailable",
+            "limitations": ["coverage_artifact_unreadable"],
+        }
+    summary = _dict(payload.get("summary"))
+    traffic = _dict(payload.get("traffic"))
+    probes = [
+        {
+            key: record.get(key)
+            for key in (
+                "probe_id",
+                "family",
+                "disposition",
+                "finding_count",
+                "physical_request_count",
+                "request_accounting_status",
+                "reason_codes",
+                "surface_ref",
+            )
+        }
+        for item in _list(payload.get("probes"))[:512]
+        if (record := _dict(item))
+    ]
+    return {
+        "status": payload["status"],
+        "completion_basis": payload["completion_basis"],
+        "limitations": [str(item) for item in _list(payload.get("limitations"))[:64]],
+        "summary": summary,
+        "traffic": traffic,
+        "probes": probes,
+    }
 
 
 def _traffic_accounting_summary(

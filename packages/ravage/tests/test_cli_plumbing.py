@@ -19,6 +19,7 @@ from ravage.agent_core.agent_state import AgentState, save_agent_state
 from ravage.agent_core.autonomous_graph.operational_profile import (
     GraphOperationalProfileName,
 )
+from ravage.probe_suite_parts.result import ProbeRunResult
 from ravage.setup_checks import SetupDiagnostic
 from ravage.traffic import TrafficPolicyConfig, TrafficPolicyController
 
@@ -1285,15 +1286,12 @@ def test_cli_scan_runs_explicitly_authorized_remote_target(
     )
     seen: dict[str, object] = {}
 
-    def fake_probe(_probe: str, **kwargs: object) -> SimpleNamespace:
+    def fake_probe(probe: str, **kwargs: object) -> ProbeRunResult:
         seen.update(kwargs)
-        return SimpleNamespace(
+        return ProbeRunResult(
             ok=True,
+            probe=probe,
             summary="scoped remote probe",
-            findings=[],
-            requests=[],
-            errors=[],
-            to_text=lambda: "{}",
         )
 
     monkeypatch.setattr(cli, "run_builtin_probe", fake_probe)

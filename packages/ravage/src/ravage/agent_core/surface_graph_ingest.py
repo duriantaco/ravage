@@ -545,16 +545,12 @@ def ingest_probe_result(  # noqa: C901 - typed finding adapters remain explicit.
     identity_alias: str = "anonymous",
     source_observation_id: str = "",
 ) -> int:
-    """Ingest value-free request summaries and typed API findings from a probe."""
+    """Retain probe attempts while promoting only exact typed surface findings."""
     probe_name = str(probe_payload.get("probe") or "probe")
     refs = tuple(item for item in (source_observation_id, probe_name) if item)
     added = 0
     for request in _mapping_items(probe_payload.get("requests")):
         url = str(request.get("url") or "")
-        request_headers = request.get("request_headers")
-        request_header_names = _string_items(request.get("request_header_names"))
-        if isinstance(request_headers, Mapping):
-            request_header_names = (*request_header_names, *_bounded_mapping_keys(request_headers))
         method = str(request.get("method") or "GET").upper()
         scope_decision = str(request.get("scope_decision") or "unknown")
         request_sent = request.get("request_sent") is not False
@@ -562,9 +558,13 @@ def ingest_probe_result(  # noqa: C901 - typed finding adapters remain explicit.
             graph,
             url=url,
             method=method,
-            parameters=_query_parameters(url),
-            header_names=request_header_names,
-            hints=(probe_name, str(request.get("probe_kind") or "probe")),
+            # Attack probes deliberately mutate URLs, field names, and headers.
+            # Preserve their operation/observation evidence, but do not merge
+            # those attacker-generated attributes into a trusted operation that
+            # native recon, browser capture, or a typed adapter already mapped.
+            parameters=(),
+            header_names=(),
+            hints=(),
             source_kind="probe",
             identity_alias=identity_alias,
             access_level=(
@@ -702,7 +702,7 @@ def project_surface_graph(
     for operation in (
         operations[key]
         for key in sorted(operations)
-        if _operation_is_actionable_projection(graph, operations[key])
+        if _operation_is_actionable_projection(operations[key])
     ):
         url = operation.structural_url
         structural = "{" in operation.route_shape
@@ -777,19 +777,9 @@ def project_surface_graph(
     return legacy
 
 
-def _operation_is_actionable_projection(
-    graph: SurfaceGraphState,
-    operation: SurfaceOperation,
-) -> bool:
-    """Keep negative probe history canonical without promoting it to planners."""
-    if operation.provenance != ("probe",):
-        return True
-    response_statuses = {
-        item.response_status
-        for item in (graph.observations or {}).values()
-        if item.operation_id == operation.operation_id and item.response_status is not None
-    }
-    return not response_statuses or not response_statuses <= {404, 410}
+def _operation_is_actionable_projection(operation: SurfaceOperation) -> bool:
+    """Keep all probe history canonical without promoting attack-made candidates."""
+    return operation.actionable
 
 
 def import_legacy_surface(

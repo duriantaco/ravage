@@ -361,6 +361,53 @@ def test_probe_adapter_ingests_requests_openapi_routes_and_graphql_selectors() -
         if item.operation_id == probe_operation.operation_id
     )
     assert probe_observation.scope_decision == "unknown"
+    assert probe_operation.actionable is False
+    promoted = [item for item in graph.operations.values() if item.actionable]  # type: ignore[union-attr]
+    assert {source for item in promoted for source in item.provenance} >= {
+        "openapi",
+        "graphql",
+    }
+    projected = project_surface_graph(graph)
+    assert {item["url"] for item in projected["endpoints"]} >= {  # type: ignore[index]
+        f"{TARGET}/api/items/{'{int}'}",
+        f"{TARGET}/graphql",
+    }
+
+
+def test_probe_query_fields_cannot_contaminate_an_existing_trusted_operation() -> None:
+    graph = SurfaceGraphState.for_target(TARGET)
+    trusted = graph.add(
+        url=f"{TARGET}/search?q=observed",
+        parameters=(SurfaceParameter.create(name="q", location="query"),),
+        source_kind="native_recon",
+    )
+
+    ingest_probe_result(
+        graph,
+        {
+            "probe": "browser_boundary",
+            "requests": [
+                {
+                    "method": "GET",
+                    "url": f"{TARGET}/search?q=attack&fabricated_password=attack",
+                    "status": 200,
+                    "request_header_names": ["X-Fabricated-Auth"],
+                    "probe_kind": "browser_boundary_attack",
+                }
+            ],
+        },
+        source_observation_id="obs_attack",
+    )
+
+    merged = graph.operations[trusted.operation_id]  # type: ignore[index]
+    assert merged.provenance == ("native_recon", "probe")
+    assert {item.name for item in merged.parameters} == {"q"}
+    assert merged.header_names == ()
+    assert merged.hints == ()
+    assert len(graph.observations or {}) == 2
+    projected = project_surface_graph(graph)
+    [template] = projected["request_templates"]  # type: ignore[misc]
+    assert template["fields"] == {"q": ""}
 
 
 def test_old_state_imports_legacy_surface_and_versioned_state_fails_closed() -> None:
@@ -448,14 +495,11 @@ def test_empty_projection_is_an_exact_noop_and_projection_does_not_mutate_input(
     projected = project_surface_graph(graph, legacy)
 
     assert legacy == before
-    assert projected["endpoints"][0]["sources"] == ["legacy", "probe"]  # type: ignore[index]
-    assert projected["request_templates"][0]["fields"] == {  # type: ignore[index]
-        "existing": "value",
-        "q": "",
-    }
+    assert projected["endpoints"][0]["sources"] == ["legacy"]  # type: ignore[index]
+    assert projected["request_templates"][0]["fields"] == {"existing": "value"}  # type: ignore[index]
 
 
-def test_projection_retains_negative_probe_history_without_promoting_it() -> None:
+def test_projection_retains_probe_history_without_promoting_attack_surface() -> None:
     graph = SurfaceGraphState.for_target(TARGET)
     missing = graph.add(
         url=f"{TARGET}/missing?q=example",
@@ -551,11 +595,11 @@ def test_projection_retains_negative_probe_history_without_promoting_it() -> Non
     assert f"{TARGET}/gone" not in template_urls
     assert f"{TARGET}/late-missing" not in template_urls
     assert not {"q", "gone_id", "candidate"} & parameter_names
-    assert f"{TARGET}/statusless-request" in endpoint_urls
-    assert f"{TARGET}/authenticate" in endpoint_urls
-    assert f"{TARGET}/protected" in endpoint_urls
-    assert f"{TARGET}/method-specific" in endpoint_urls
-    assert f"{TARGET}/mixed-history" in endpoint_urls
+    assert f"{TARGET}/statusless-request" not in endpoint_urls
+    assert f"{TARGET}/authenticate" not in endpoint_urls
+    assert f"{TARGET}/protected" not in endpoint_urls
+    assert f"{TARGET}/method-specific" not in endpoint_urls
+    assert f"{TARGET}/mixed-history" not in endpoint_urls
     assert f"{TARGET}/declared" in endpoint_urls
     assert f"{TARGET}/declared" in template_urls
     assert "schema_field" in parameter_names
@@ -773,7 +817,7 @@ def test_sensitive_path_values_are_structuralized_before_graph_persistence() -> 
 def test_exchange_parameter_adapter_skips_malformed_names_per_item() -> None:
     graph = SurfaceGraphState.for_target(TARGET)
     exchange = SimpleNamespace(
-        source="probe_session",
+        source="external_tool",
         request_url=f"{TARGET}/items?!!!=bad&valid=ok",
         request_method="POST",
         request_body_field_names=("!!!", "email"),

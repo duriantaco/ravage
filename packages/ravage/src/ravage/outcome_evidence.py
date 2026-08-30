@@ -81,11 +81,14 @@ class QualifiedProbeFinding:
     vuln_class_source: str = "registry"
 
     def finding_id(self, engagement_id: UUID) -> str:
+        affected_parameter = _affected_parameter(self.request)
         identity_parts: dict[str, object] = {
             "vuln_class": self.contract.vuln_class,
-            "endpoint": self.endpoint,
+            "endpoint": _finding_identity_endpoint(
+                self.endpoint,
+                affected_parameter=affected_parameter,
+            ),
         }
-        affected_parameter = _affected_parameter(self.request)
         if affected_parameter:
             identity_parts["affected_parameters"] = [affected_parameter]
         identity = json.dumps(
@@ -96,14 +99,18 @@ class QualifiedProbeFinding:
         return str(uuid5(engagement_id, identity))
 
     def evidence_id(self, engagement_id: UUID) -> str:
+        affected_parameter = _affected_parameter(self.request)
         identity_parts: dict[str, object] = {
             "finding_type": self.finding_type,
-            "probe": self.probe,
-            "endpoint": self.endpoint,
+            "endpoint": _finding_identity_endpoint(
+                self.endpoint,
+                affected_parameter=affected_parameter,
+            ),
         }
-        affected_parameter = _affected_parameter(self.request)
         if affected_parameter:
             identity_parts["affected_parameters"] = [affected_parameter]
+        else:
+            identity_parts["probe"] = self.probe
         identity = json.dumps(
             identity_parts,
             sort_keys=True,
@@ -1424,6 +1431,19 @@ def _affected_parameter(request: Mapping[str, object]) -> dict[str, str]:
         return {}
     [parameter] = _safe_parameters([raw]) or [{}]
     return parameter
+
+
+def _finding_identity_endpoint(
+    endpoint: Mapping[str, object],
+    *,
+    affected_parameter: Mapping[str, str],
+) -> dict[str, object]:
+    if not affected_parameter:
+        return dict(endpoint)
+    return {
+        "method": endpoint.get("method"),
+        "url": endpoint.get("url"),
+    }
 
 
 def _safe_parameters(value: object) -> list[dict[str, str]]:
