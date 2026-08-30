@@ -69,7 +69,7 @@ claim. The external-agent scoreboard remains a future stage.
     <tbody>
       <tr>
         <td>Test a localhost app</td>
-        <td><code>ravage attack BRIEF.yaml --tool-runtime host</code></td>
+        <td><code>ravage attack BRIEF.yaml</code></td>
         <td><a href="{{ '/how-to-use.html' | relative_url }}#path-1-test-a-localhost-development-app">Localhost path</a></td>
       </tr>
       <tr>

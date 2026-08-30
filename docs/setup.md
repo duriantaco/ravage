@@ -153,13 +153,15 @@ ravage tools check
 
 To preview the install plan without changing the machine, omit `--execute`.
 
-For the simplest localhost run, use `--tool-runtime host`; this avoids a Docker
-dependency but lets model-selected tool commands run on the development
-machine. Use a disposable environment and narrow scope. `--tool-runtime auto`
-adds Docker fallback coverage and therefore also requires a responsive Docker
-daemon. For an authorized remote run, omit the runtime in the default low-noise
-lane. Use `--traffic-policy observe --tool-runtime docker` only when the complete
-origin is authorized and the written ROE permits process/scanner execution.
+Unauthenticated process-capable attacks default to Docker. `--tool-runtime
+auto` is Docker-only and never falls back to host execution. The explicit
+`--tool-runtime host` option avoids a Docker dependency for a trusted localhost
+target but lets model-selected code read files available to your user account;
+its child environment excludes provider keys and arbitrary parent variables.
+Use that opt-in only in a disposable environment with narrow scope. For an
+authorized remote run, omit the runtime in the default low-noise lane. Use
+`--traffic-policy observe --tool-runtime docker` only when the complete origin
+is authorized and the written ROE permits process/scanner execution.
 
 ## Doctor Workflows
 

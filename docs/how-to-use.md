@@ -11,7 +11,7 @@ Choose one path:
 
 | Your target | Use this path | Required tool runtime |
 | --- | --- | --- |
-| A development app on `localhost` or `127.0.0.1` | [Path 1: localhost](#path-1-test-a-localhost-development-app) | `host` when unauthenticated; managed HTTP when authenticated |
+| A development app on `localhost` or `127.0.0.1` | [Path 1: localhost](#path-1-test-a-localhost-development-app) | Docker by default; managed HTTP when authenticated; explicit `host` opt-in available |
 | An authorized staging or remote URL | [Path 2: authorized URL](#path-2-test-an-authorized-url) | Native metered HTTP by default; Docker only for an approved process lane |
 
 If the app requires login, use the [Authentication guide](authentication.md).
@@ -50,6 +50,13 @@ them.
 The primary examples below use OpenAI's hosted route and therefore spend model
 credits. The generated `.env.ravage` file is ignored by the normal `.env*`
 gitignore rule; still treat it as a secret and never commit it.
+
+Hosted routes send the engagement brief, selected discovered state, prior
+findings, and tool observations to the provider. Tool observations may contain
+target response data. Confirm that the engagement permits this data transfer
+and review the provider's retention terms before testing sensitive customer or
+production systems. Use a local provider when evidence must remain local;
+managed-secret redaction is not a general data-loss-prevention boundary.
 
 To use Anthropic, Ollama, or another configured route, keep the same target
 steps and change only the model setup described in
@@ -158,12 +165,14 @@ multiple identities requires it.
 Ravage finds `.env.ravage` beside the brief, loads model settings directly, and
 infers the configured hosted route. Do not shell-source the file. Authentication
 secrets are resolved through a separate file-over-process overlay and remain in
-the managed HTTP owner. For localhost, the default host tool runtime avoids a
-Docker dependency. In an unauthenticated run, model-selected tool commands run
-on your development machine, so use a disposable environment and keep the
-brief narrow. Command and Python lanes are blocked when an identity is active.
-Do not add `--authorized-remote-target`; that acknowledgement is for non-local
-targets only.
+the managed HTTP owner. An unauthenticated process-capable run defaults to
+Docker and never silently falls back to the host. The explicit
+`--tool-runtime host` option runs model-selected commands on your development
+machine; it receives a minimal environment without provider keys but can still
+read files available to your user account. Use that opt-in only in a disposable
+localhost environment. Command and Python lanes are blocked when an identity
+is active. Do not add `--authorized-remote-target`; that acknowledgement is for
+non-local targets only.
 
 Continue at [Read The Result](#read-the-result).
 
@@ -807,16 +816,16 @@ ravage attack ravage-brief.yaml \
   --resume \
   --model-profile hosted-openai \
   --model-tier low \
-  --tool-runtime host \
   --allow-paid-models \
   --report
 ```
 
-When resuming an authorized remote low-noise run, add
-`--authorized-remote-target` and remove `--tool-runtime host`; the native HTTP
-lane does not require an explicit runtime. A saved observe-mode process lane
-uses `--tool-runtime docker`. An authenticated remote resume keeps the same
-`--identity` and does not need Docker. Do not reuse an old
+This resumes with the safe Docker default. Add `--tool-runtime host` only when
+the original localhost run explicitly used that host opt-in. When resuming an
+authorized remote low-noise run, add `--authorized-remote-target`; the native
+HTTP lane does not require an explicit runtime. A saved observe-mode process
+lane uses `--tool-runtime docker`. An authenticated remote resume keeps the
+same `--identity` and does not need Docker. Do not reuse an old
 run directory for a fresh attack; leave `--run-dir` unset and let Ravage create
 a timestamped one. Deterministic scans do not use this attack-resume flow.
 For an `agent-graph` resume, Ravage reopens the same traffic session and reloads

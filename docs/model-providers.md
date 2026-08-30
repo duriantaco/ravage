@@ -22,6 +22,23 @@ shell-sourced. Check readiness before spending model calls:
 ravage doctor --workflow attack --brief brief.yaml
 ```
 
+Hosted providers receive model prompts containing the engagement brief,
+selected discovered state, prior findings, and tool observations. Those
+observations may include target response data. Confirm that the engagement
+permits that transfer and review the provider's data-retention terms. Use a
+local route when target evidence must remain on your machine.
+
+XBEN does not load a brief-adjacent environment file. Enter its hosted key
+without putting the value in shell history, export it only for the benchmark,
+and unset it afterwards:
+
+```bash
+read -rsp "OpenAI API key: " OPENAI_API_KEY && printf '\n'
+export OPENAI_API_KEY
+# run the bounded preflight and benchmark commands
+unset OPENAI_API_KEY
+```
+
 The older `ravage --print-model-routes` command is not an active public entry
 point in the current CLI. Use `doctor --workflow attack` for operator
 validation and inspect `examples/model_profiles.yaml` or
@@ -132,7 +149,13 @@ export RAVAGE_LITELLM_MID_MODEL=openai/gpt-5.4
 export LITELLM_BASE_URL=http://localhost:4000/v1
 ```
 
-Use:
+The built-in `universal-litellm` profile is intentionally unpriced because a
+LiteLLM model name does not prove which upstream deployment, markup, or billing
+policy the proxy uses. It therefore reports `ready=false` until you copy the
+route into a model config and provide explicit input, cached-input, and output
+prices. Use zero only for a deployment you operate and know is nonbillable.
+
+After pricing that route, use:
 
 ```text
 --model-profile universal-litellm --model-tier mid
@@ -142,9 +165,10 @@ Use:
 
 For `hosted-openai`:
 
-```bash
-export OPENAI_API_KEY=...
-export RAVAGE_OPENAI_MID_MODEL=gpt-5.4-2026-03-05
+```dotenv
+# .env.ravage
+OPENAI_API_KEY=your_key_here
+RAVAGE_OPENAI_MID_MODEL=gpt-5.4-2026-03-05
 ```
 
 Use:
@@ -162,17 +186,18 @@ or alias names. Those prices were verified on 2026-08-15 against the
 [official API pricing table](https://developers.openai.com/api/docs/pricing).
 For GPT-5.4 requests above 272,000 input tokens, Ravage automatically applies
 the published long-context rates.
-An unknown `RAVAGE_OPENAI_*_MODEL` override remains unpriced and paid agent
-replies fail closed; use a custom model config with current input, cached-input,
-and output prices when selecting another model.
+An unknown `RAVAGE_OPENAI_*_MODEL` override remains unpriced and is not ready,
+so Ravage rejects it before a paid request. Use a custom model config with
+current input, cached-input, and output prices when selecting another model.
 
 ## Native Anthropic Routes
 
 For `hosted-anthropic`:
 
-```bash
-export ANTHROPIC_API_KEY=...
-export RAVAGE_ANTHROPIC_MID_MODEL=claude-sonnet-4-6
+```dotenv
+# .env.ravage
+ANTHROPIC_API_KEY=your_key_here
+RAVAGE_ANTHROPIC_MID_MODEL=claude-sonnet-4-6
 ```
 
 Use:
@@ -184,6 +209,18 @@ Use:
 Ravage calls Anthropic's native Messages API directly with `x-api-key`,
 `anthropic-version: 2023-06-01`, and `POST /v1/messages`. Other providers use
 OpenAI-compatible chat completions unless routed through a custom gateway.
+
+The built-in tiers use active pinned or canonical Anthropic IDs: Opus 4.7
+(`claude-opus-4-7`), Sonnet 4.6 (`claude-sonnet-4-6`), and the pinned Haiku 4.5
+snapshot (`claude-haiku-4-5-20251001`). Ravage applies the published standard
+input, cache-read, and output rates of `$5/$0.50/$25`, `$3/$0.30/$15`, and
+`$1/$0.10/$5` per million tokens, respectively. These IDs and prices were
+verified on 2026-08-30 against Anthropic's [model-ID
+reference](https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions),
+[lifecycle table](https://platform.claude.com/docs/en/about-claude/model-deprecations),
+and [pricing table](https://platform.claude.com/docs/en/about-claude/pricing).
+An unknown `RAVAGE_ANTHROPIC_*_MODEL` override is not ready until its prices are
+provided explicitly in a custom model config.
 
 ## Attack Example
 
@@ -209,12 +246,11 @@ ravage attack examples/labs/ravage-acme-box/brief.yaml \
 For hosted routes:
 
 ```bash
-OPENAI_API_KEY=... \
 ravage attack examples/labs/ravage-acme-box/brief.yaml \
   --model-profile hosted-openai \
   --model-tier low \
   --allow-paid-models \
-  --tool-runtime auto \
+  --tool-runtime docker \
   --memory off \
   --max-turns 18
 ```
@@ -225,7 +261,6 @@ Run preflight first. It writes `preflight.json` and does not call the
 model:
 
 ```bash
-OPENAI_API_KEY=... \
 ravage xben \
   --benchmarks-root /path/to/xbow-validation-benchmarks/benchmarks \
   --output-dir runs/xben/hosted-openai-preflight \
@@ -244,7 +279,6 @@ ravage xben \
 After inspecting preflight:
 
 ```bash
-OPENAI_API_KEY=... \
 ravage xben \
   --benchmarks-root /path/to/xbow-validation-benchmarks/benchmarks \
   --output-dir runs/xben/hosted-openai-canary \
@@ -263,7 +297,8 @@ ravage xben \
 To use Claude directly, swap the profile and key:
 
 ```bash
-ANTHROPIC_API_KEY=... \
+read -rsp "Anthropic API key: " ANTHROPIC_API_KEY && printf '\n'
+export ANTHROPIC_API_KEY
 ravage xben \
   --benchmarks-root /path/to/xbow-validation-benchmarks/benchmarks \
   --output-dir runs/xben/anthropic-preflight \
@@ -277,6 +312,7 @@ ravage xben \
   --max-model-requests-per-case 4 \
   --max-cost-usd 5 \
   --preflight
+unset ANTHROPIC_API_KEY
 ```
 
 ## Custom OpenAI-Compatible Endpoint
@@ -296,13 +332,15 @@ profiles:
           max_output_tokens: 1024
           output_token_limit_parameter: max_tokens
           input_cost_per_1m_tokens: 1.0
+          cached_input_cost_per_1m_tokens: 1.0
           output_cost_per_1m_tokens: 2.0
 ```
 
 Then use it:
 
 ```bash
-YOUR_API_KEY_ENV=... \
+read -rsp "Provider API key: " YOUR_API_KEY_ENV && printf '\n'
+export YOUR_API_KEY_ENV
 ravage xben \
   --benchmarks-root /path/to/xbow-validation-benchmarks/benchmarks \
   --output-dir runs/xben/remote-ci-canary \
@@ -313,38 +351,34 @@ ravage xben \
   --model-tier mid \
   --max-cost-usd 5 \
   --allow-paid-models
+unset YOUR_API_KEY_ENV
 ```
 
-Cost fields are optional, but `--max-cost-usd` can only be enforced when the
-selected paid-risk route includes both `input_cost_per_1m_tokens` and
-`output_cost_per_1m_tokens`. Use current prices from your provider dashboard.
+Paid-risk routes are ready only when `input_cost_per_1m_tokens`,
+`cached_input_cost_per_1m_tokens`, and `output_cost_per_1m_tokens` are all
+present. Use current prices from your provider dashboard. If the endpoint does
+not discount cached input, set its cached-input rate equal to its input rate.
 
 ## Supported Provider Kinds
 
-The model route config accepts these provider kinds:
+Provider kinds remain accepted by the route schema so external adapters can
+describe them, but only implemented transports can become ready for Ravage's
+built-in chat client:
 
-- `openai`
-- `anthropic`
-- `gemini`
-- `openrouter`
-- `litellm`
-- `ollama`
-- `lmstudio`
-- `llamacpp`
-- `vllm`
-- `custom_openai`
-- `azure`
-- `bedrock`
-- `vertex`
-- `groq`
-- `together`
-- `fireworks`
-- `mistral`
-- `deepseek`
+| Provider kind | Built-in direct transport | Required configuration |
+| --- | --- | --- |
+| `openai` | Yes, native OpenAI | Default native endpoint; use `custom_openai` for gateways |
+| `anthropic` | Yes, native Messages API | Default native endpoint; use LiteLLM for gateways |
+| `ollama`, `lmstudio`, `llamacpp`, `vllm` | Yes, OpenAI-compatible local | A reachable local endpoint |
+| `litellm` | Yes, OpenAI-compatible gateway | Gateway URL plus explicit pricing |
+| `custom_openai` | Yes, OpenAI-compatible gateway | Explicit `base_url` plus explicit pricing |
+| `gemini`, `openrouter`, `azure`, `bedrock`, `vertex` | No | Use a configured LiteLLM or `custom_openai` gateway |
+| `groq`, `together`, `fireworks`, `mistral`, `deepseek` | No | Use a configured LiteLLM or `custom_openai` gateway |
 
-Only providers with an implemented client can be called directly. Route
-provider-specific protocols through LiteLLM or a custom OpenAI-compatible
-gateway when direct support is not available in your checkout.
+Unsupported direct provider kinds report `ready=false`, even if credentials
+and pricing are present. The built-in client rejects them before constructing
+or sending an HTTP request, so a provider key cannot fall through to OpenAI's
+default endpoint.
 
 ## Troubleshooting
 
