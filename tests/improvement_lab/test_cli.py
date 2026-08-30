@@ -7,21 +7,36 @@ import stat
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
+import pytest
+
 from tools.improvement_lab import cli
 from tools.improvement_lab.archive import LabArchive
-from tools.improvement_lab.attestation import generate_referee_keypair, write_referee_key
+from tools.improvement_lab.attestation import (
+    generate_referee_keypair,
+    public_key_from_private,
+    write_referee_key,
+)
 from tools.improvement_lab.corpus import CorpusFormatError, candidate_visible_export
 from tools.improvement_lab.evaluation import (
     EvaluationConfig,
     RunReceipt,
+    canonical_run_receipts_bytes,
     evaluation_suite_from_receipts,
 )
+from tools.improvement_lab.execution_attestation import (
+    ExecutionBinding,
+    ExternalRunObservations,
+    FindingVerdict,
+    SignedExecutionEnvelope,
+    canonical_execution_envelope_bytes,
+    sign_execution_envelope,
+    write_signed_execution_envelope,
+)
 from tools.improvement_lab.lessons import build_improvement_brief
+from tools.improvement_lab.offline_executor import freeze_output_tree
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import pytest
 
 _PRIVATE_FILE_MODE = 0o600
 _CLI_ERROR = 2
@@ -82,6 +97,10 @@ def _write_private_key(path: Path) -> None:
     path.chmod(0o600)
 
 
+def _digest(value: str) -> str:
+    return f"sha256:{hashlib.sha256(value.encode()).hexdigest()}"
+
+
 def _run_receipt(
     *,
     case_id: str,
@@ -90,9 +109,6 @@ def _run_receipt(
     detected: int,
     side: str,
 ) -> dict[str, object]:
-    def digest(value: str) -> str:
-        return f"sha256:{hashlib.sha256(value.encode()).hexdigest()}"
-
     return {
         "case_id": case_id,
         "cohort": "control" if control else "capability",
@@ -102,11 +118,14 @@ def _run_receipt(
         "is_control": control,
         "case_success": bool(detected),
         "expected_vulnerability_count": 1,
-        "run_id": digest(f"run:{side}:{case_id}:{repeat}"),
-        "pair_seed_digest": digest(f"seed:{case_id}:{repeat}"),
-        "target_snapshot_digest": digest(f"target:{case_id}"),
-        "model_fingerprint": digest("model:fixed"),
-        "prompt_fingerprint": digest(f"prompt:{side}"),
+        "run_id": _digest(f"run:{side}:{case_id}:{repeat}"),
+        "execution_attestation_digest": _digest(
+            f"attestation:{side}:{case_id}:{repeat}"
+        ),
+        "pair_seed_digest": _digest(f"seed:{case_id}:{repeat}"),
+        "target_snapshot_digest": _digest(f"target:{case_id}"),
+        "model_fingerprint": _digest("model:fixed"),
+        "prompt_fingerprint": _digest(f"prompt:{side}"),
         "metrics": {
             "evidence_backed_vulnerability_count": detected,
             "verified_vulnerability_count": detected,
@@ -126,6 +145,79 @@ def _run_receipt(
             "request_accounting_status": "exact",
         },
     }
+
+
+def _sign_run_receipt(  # noqa: PLR0913 - fixture exposes each signed binding input.
+    receipt: RunReceipt,
+    *,
+    campaign_id: str,
+    candidate_id: str,
+    evaluation_suite_object: str,
+    trusted_tests_digest: str,
+    runner_image: str,
+    champion_tree: str,
+    executor_private_key: bytes,
+    side: str,
+) -> SignedExecutionEnvelope:
+    binding = ExecutionBinding(
+        campaign_id=campaign_id,
+        candidate_id=None if side == "champion" else candidate_id,
+        candidate_tree_digest=(champion_tree if side == "champion" else "f" * 40),
+        candidate_content_digest=_digest(
+            f"candidate-content:{side}:{receipt.case_id}:{receipt.repeat}"
+        ),
+        evaluation_suite_object=evaluation_suite_object,
+        trusted_tests_digest=trusted_tests_digest,
+        runner_image=runner_image,
+        job_spec_digest=_digest(f"job:{side}:{receipt.case_id}:{receipt.repeat}"),
+        artifact_tree_digest=_digest(
+            f"artifacts:{side}:{receipt.case_id}:{receipt.repeat}"
+        ),
+        artifact_case_path="case",
+        case_id=receipt.case_id,
+        cohort=receipt.cohort,
+        repeat=receipt.repeat,
+        execution_kind=receipt.execution_kind,
+        evaluation_side=side,
+        is_control=receipt.is_control,
+        expected_vulnerability_count=receipt.expected_vulnerability_count,
+        run_id=receipt.run_id,
+        pair_seed_digest=receipt.pair_seed_digest,
+        target_snapshot_digest=receipt.target_snapshot_digest,
+        model_fingerprint=receipt.model_fingerprint,
+        prompt_fingerprint=receipt.prompt_fingerprint,
+    )
+    observations = ExternalRunObservations(
+        status=receipt.status,
+        case_success=receipt.case_success,
+        physical_request_count=receipt.physical_request_count,
+        model_request_count=receipt.model_request_count,
+        cost_usd=receipt.cost_usd,
+        request_accounting_status=receipt.request_accounting_status,
+        proof_integrity_failure_count=receipt.proof_integrity_failure_count,
+        false_proof_count=receipt.false_proof_count,
+        request_accounting_mismatch_count=receipt.request_accounting_mismatch_count,
+        loop_violation_count=receipt.loop_violation_count,
+        provenance_violation_count=receipt.provenance_violation_count,
+        secret_leak_violation_count=receipt.secret_leak_violation_count,
+        unmetered_action_count=receipt.unmetered_action_count,
+        incomplete_request_count=receipt.incomplete_request_count,
+    )
+    verdicts = tuple(
+        FindingVerdict(
+            finding_digest=_digest(
+                f"finding:{side}:{receipt.case_id}:{receipt.repeat}:{index}"
+            ),
+            stage="confirmed_finding",
+        )
+        for index in range(receipt.confirmed_finding_count)
+    )
+    return sign_execution_envelope(
+        binding,
+        observations,
+        verdicts,
+        private_key=executor_private_key,
+    )
 
 
 def test_keygen_and_ingest_previous_log_create_private_secret_safe_corpus(
@@ -177,6 +269,51 @@ def test_keygen_and_ingest_previous_log_create_private_secret_safe_corpus(
         == _CLI_ERROR
     )
     assert "group or other" in capsys.readouterr().err
+
+
+def test_executor_keygen_creates_a_distinct_keypair_with_owner_only_private_key(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    referee_private = tmp_path / "referee.private"
+    referee_public = tmp_path / "referee.public"
+    executor_private = tmp_path / "executor.private"
+    executor_public = tmp_path / "executor.public"
+
+    assert (
+        cli.main(
+            (
+                "referee-keygen",
+                "--private-key",
+                str(referee_private),
+                "--public-key",
+                str(referee_public),
+            )
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        cli.main(
+            (
+                "executor-keygen",
+                "--private-key",
+                str(executor_private),
+                "--public-key",
+                str(executor_public),
+            )
+        )
+        == 0
+    )
+
+    assert executor_private.read_bytes() != referee_private.read_bytes()
+    assert executor_public.read_bytes() != referee_public.read_bytes()
+    assert public_key_from_private(executor_private.read_bytes()) == (
+        executor_public.read_bytes()
+    )
+    assert stat.S_IMODE(executor_private.stat().st_mode) == _PRIVATE_FILE_MODE
+    assert stat.S_IMODE(referee_private.stat().st_mode) == _PRIVATE_FILE_MODE
+    assert json.loads(capsys.readouterr().out)["created"] is True
 
 
 def test_cli_rejects_ambiguous_json_configuration(
@@ -283,16 +420,85 @@ def test_brief_cli_derives_versioned_candidate_input(
     assert stat.S_IMODE(brief_path.stat().st_mode) == _PRIVATE_FILE_MODE
 
 
+def test_campaign_create_requires_and_forwards_a_separate_executor_key(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _referee_private, referee_public = generate_referee_keypair()
+    _executor_private, executor_public = generate_referee_keypair()
+    referee_public_path = tmp_path / "referee.public"
+    executor_public_path = tmp_path / "executor.public"
+    write_referee_key(referee_public_path, referee_public, public=True)
+    write_referee_key(executor_public_path, executor_public, public=True)
+    evaluation_config = tmp_path / "evaluation-config.json"
+    evaluation_suite = tmp_path / "evaluation-suite.json"
+    evaluation_config.write_text("{}\n", encoding="utf-8")
+    evaluation_suite.write_text("{}\n", encoding="utf-8")
+    argv = (
+        "campaign-create",
+        "--archive",
+        str(tmp_path / "archive"),
+        "--source",
+        str(tmp_path / "source"),
+        "--evaluation-config",
+        str(evaluation_config),
+        "--evaluation-suite",
+        str(evaluation_suite),
+        "--runner-image",
+        f"example.invalid/referee@sha256:{'d' * 64}",
+        "--referee-public-key",
+        str(referee_public_path),
+        "--executor-public-key",
+        str(executor_public_path),
+        "--candidate-artifact-id",
+        f"artifact_{'a' * 24}",
+    )
+    executor_option = argv.index("--executor-public-key")
+    without_executor = argv[:executor_option] + argv[executor_option + 2 :]
+    with pytest.raises(SystemExit) as missing:
+        cli.build_parser().parse_args(without_executor)
+    assert missing.value.code == _CLI_ERROR
+    capsys.readouterr()
+
+    captured: dict[str, object] = {}
+
+    def create_campaign(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"campaign_id": f"campaign_{'b' * 24}"}
+
+    archive = SimpleNamespace(
+        create_campaign=create_campaign,
+        current_pointer=lambda: {"champion_ref": f"source:{'c' * 40}"},
+    )
+    monkeypatch.setattr(cli, "_verified_archive", lambda _path: archive)
+    monkeypatch.setattr(
+        cli,
+        "require_clean_champion",
+        lambda _path: SimpleNamespace(
+            head_commit="c" * 40,
+            tree_digest="d" * 40,
+            status_digest="e" * 64,
+        ),
+    )
+
+    assert cli.main(argv) == 0
+    assert captured["referee_public_key"] == referee_public
+    assert captured["executor_public_key"] == executor_public
+    assert captured["executor_public_key"] != captured["referee_public_key"]
+
+
 def test_evaluate_cli_accepts_only_repeated_matched_improvement(tmp_path: Path) -> None:
     archive_path = tmp_path / "archive"
     archive = LabArchive.initialize(archive_path)
     private_key, public_key = generate_referee_keypair()
+    executor_private_key, executor_public_key = generate_referee_keypair()
     private_key_path = tmp_path / "referee.private"
     write_referee_key(private_key_path, private_key, public=False)
-    champion: list[dict[str, object]] = []
-    candidate: list[dict[str, object]] = []
+    champion_inputs: list[dict[str, object]] = []
+    candidate_inputs: list[dict[str, object]] = []
     for repeat in range(1, 4):
-        champion.append(
+        champion_inputs.append(
             _run_receipt(
                 case_id="opaque-capability",
                 repeat=repeat,
@@ -301,7 +507,7 @@ def test_evaluate_cli_accepts_only_repeated_matched_improvement(tmp_path: Path) 
                 side="champion",
             )
         )
-        candidate.append(
+        candidate_inputs.append(
             _run_receipt(
                 case_id="opaque-capability",
                 repeat=repeat,
@@ -310,7 +516,7 @@ def test_evaluate_cli_accepts_only_repeated_matched_improvement(tmp_path: Path) 
                 side="candidate",
             )
         )
-        champion.append(
+        champion_inputs.append(
             _run_receipt(
                 case_id="opaque-control",
                 repeat=repeat,
@@ -319,7 +525,7 @@ def test_evaluate_cli_accepts_only_repeated_matched_improvement(tmp_path: Path) 
                 side="champion",
             )
         )
-        candidate.append(
+        candidate_inputs.append(
             _run_receipt(
                 case_id="opaque-control",
                 repeat=repeat,
@@ -328,7 +534,7 @@ def test_evaluate_cli_accepts_only_repeated_matched_improvement(tmp_path: Path) 
                 side="candidate",
             )
         )
-    parsed_champion = tuple(RunReceipt.from_mapping(item) for item in champion)
+    parsed_champion = tuple(RunReceipt.from_mapping(item) for item in champion_inputs)
     suite = evaluation_suite_from_receipts(
         parsed_champion,
         trusted_tests_digest=f"sha256:{'e' * 64}",
@@ -353,6 +559,7 @@ def test_evaluate_cli_accepts_only_repeated_matched_improvement(tmp_path: Path) 
         evaluation_suite=json.dumps(suite.to_json()).encode(),
         runner_image=f"example.invalid/referee@sha256:{'d' * 64}",
         referee_public_key=public_key,
+        executor_public_key=executor_public_key,
         proposal_input_artifact_ids=(
             str(corpus_manifest["artifact_id"]),
             str(brief_manifest["artifact_id"]),
@@ -366,11 +573,36 @@ def test_evaluate_cli_accepts_only_repeated_matched_improvement(tmp_path: Path) 
         config={"hypothesis": "test"},
     )
     candidate_id = str(candidate_manifest["candidate_id"])
+    signed_receipts: dict[str, list[RunReceipt]] = {
+        "champion": [],
+        "candidate": [],
+    }
+    for side, inputs in (
+        ("champion", champion_inputs),
+        ("candidate", candidate_inputs),
+    ):
+        for item in inputs:
+            envelope = _sign_run_receipt(
+                RunReceipt.from_mapping(item),
+                campaign_id=str(campaign["campaign_id"]),
+                candidate_id=candidate_id,
+                evaluation_suite_object=str(campaign["evaluation_suite_object"]),
+                trusted_tests_digest=suite.trusted_tests_digest,
+                runner_image=str(campaign["runner_image"]),
+                champion_tree=str(campaign["champion_tree"]),
+                executor_private_key=executor_private_key,
+                side=side,
+            )
+            archive.retain_execution_envelope(
+                candidate_id,
+                signed_envelope=envelope,
+            )
+            signed_receipts[side].append(envelope.to_run_receipt())
     champion_path = tmp_path / "champion.json"
     candidate_path = tmp_path / "candidate.json"
     output = tmp_path / "evaluation.json"
-    champion_path.write_text(json.dumps(champion), encoding="utf-8")
-    candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+    champion_path.write_bytes(canonical_run_receipts_bytes(signed_receipts["champion"]))
+    candidate_path.write_bytes(canonical_run_receipts_bytes(signed_receipts["candidate"]))
 
     assert (
         cli.main(
@@ -412,6 +644,182 @@ def test_evaluate_cli_accepts_only_repeated_matched_improvement(tmp_path: Path) 
         )
         == 0
     )
+
+
+def test_receipt_build_retains_signed_envelope_and_writes_canonical_receipt(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    archive_path = tmp_path / "archive"
+    archive = LabArchive.initialize(archive_path)
+    _referee_private, referee_public = generate_referee_keypair()
+    executor_private, executor_public = generate_referee_keypair()
+    suite_inputs = tuple(
+        RunReceipt.from_mapping(
+            _run_receipt(
+                case_id="receipt-case",
+                repeat=repeat,
+                control=False,
+                detected=0,
+                side="champion",
+            )
+        )
+        for repeat in range(1, 4)
+    )
+    suite = evaluation_suite_from_receipts(
+        suite_inputs,
+        trusted_tests_digest=_digest("trusted-tests"),
+        runner_command=("/usr/local/bin/python", "-I", "/trusted-tests/referee.py"),
+    )
+    corpus = candidate_visible_export([])
+    corpus_manifest = archive.record_artifact(
+        kind="development_corpus",
+        visibility="candidate",
+        content=json.dumps(corpus).encode(),
+    )
+    brief_manifest = archive.record_artifact(
+        kind="capability_brief",
+        visibility="candidate",
+        content=json.dumps(build_improvement_brief(corpus)).encode(),
+    )
+    runner_image = f"example.invalid/referee@sha256:{'d' * 64}"
+    campaign = archive.create_campaign(
+        champion_commit="a" * 40,
+        champion_tree="b" * 40,
+        source_status_digest=_digest("clean-source"),
+        evaluation_config=EvaluationConfig().to_json(),
+        evaluation_suite=json.dumps(suite.to_json()).encode(),
+        runner_image=runner_image,
+        referee_public_key=referee_public,
+        executor_public_key=executor_public,
+        proposal_input_artifact_ids=(
+            str(corpus_manifest["artifact_id"]),
+            str(brief_manifest["artifact_id"]),
+        ),
+    )
+    candidate = archive.register_candidate(
+        campaign_id=str(campaign["campaign_id"]),
+        parent_ref=str(archive.current_pointer()["champion_ref"]),
+        artifact_kind="source_patch",
+        patch=b"candidate patch",
+        config={"hypothesis": "receipt adapter"},
+    )
+    candidate_id = str(candidate["candidate_id"])
+
+    artifact_root = tmp_path / "artifacts"
+    case_root = artifact_root / "case-one"
+    traffic_root = case_root / "workspace"
+    traffic_root.mkdir(parents=True)
+    (case_root / "report.json").write_text(
+        json.dumps(
+            {
+                "findings": [],
+                "outcome": {"evidence": []},
+                "traffic_accounting": {
+                    "status": "exact",
+                    "physical_request_count": 4,
+                    "incomplete_request_count": 0,
+                    "unmetered_action_count": 0,
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    (traffic_root / "traffic-policy.json").write_text(
+        json.dumps(
+            {
+                "schema": "ravage.traffic-policy",
+                "physical_request_count": 4,
+                "incomplete_request_count": 0,
+                "unmetered_action_count": 0,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    frozen = freeze_output_tree(artifact_root)
+    suite_receipt = suite_inputs[0]
+    envelope = sign_execution_envelope(
+        ExecutionBinding(
+            campaign_id=str(campaign["campaign_id"]),
+            candidate_id=candidate_id,
+            candidate_tree_digest="f" * 40,
+            candidate_content_digest=_digest("candidate-content"),
+            evaluation_suite_object=str(campaign["evaluation_suite_object"]),
+            trusted_tests_digest=suite.trusted_tests_digest,
+            runner_image=runner_image,
+            job_spec_digest=_digest("job-spec"),
+            artifact_tree_digest=frozen.digest,
+            artifact_case_path="case-one",
+            case_id=suite_receipt.case_id,
+            cohort=suite_receipt.cohort,
+            repeat=suite_receipt.repeat,
+            execution_kind=suite_receipt.execution_kind,
+            evaluation_side="candidate",
+            is_control=suite_receipt.is_control,
+            expected_vulnerability_count=suite_receipt.expected_vulnerability_count,
+            run_id=_digest("candidate-run"),
+            pair_seed_digest=suite_receipt.pair_seed_digest,
+            target_snapshot_digest=suite_receipt.target_snapshot_digest,
+            model_fingerprint=suite_receipt.model_fingerprint,
+            prompt_fingerprint=_digest("candidate-prompt"),
+        ),
+        ExternalRunObservations(
+            status="completed",
+            case_success=False,
+            physical_request_count=4,
+            model_request_count=2,
+            cost_usd=0.1,
+            request_accounting_status="exact",
+            proof_integrity_failure_count=0,
+            false_proof_count=0,
+            request_accounting_mismatch_count=0,
+            loop_violation_count=0,
+            provenance_violation_count=0,
+            secret_leak_violation_count=0,
+            unmetered_action_count=0,
+            incomplete_request_count=0,
+        ),
+        (),
+        private_key=executor_private,
+    )
+    envelope_path = tmp_path / "execution-envelope.json"
+    receipt_path = tmp_path / "receipt.json"
+    write_signed_execution_envelope(envelope_path, envelope)
+
+    assert (
+        cli.main(
+            (
+                "receipt-build",
+                "--archive",
+                str(archive_path),
+                "--candidate-id",
+                candidate_id,
+                "--artifacts",
+                str(artifact_root),
+                "--execution-envelope",
+                str(envelope_path),
+                "--output",
+                str(receipt_path),
+            )
+        )
+        == 0
+    )
+
+    expected_receipt = envelope.to_run_receipt()
+    assert receipt_path.read_bytes() == canonical_run_receipts_bytes((expected_receipt,))
+    assert stat.S_IMODE(receipt_path.stat().st_mode) == _PRIVATE_FILE_MODE
+    assert archive.read_object(
+        str(expected_receipt.execution_attestation_digest)
+    ) == canonical_execution_envelope_bytes(envelope)
+    result = json.loads(capsys.readouterr().out)
+    assert result["case_id"] == suite_receipt.case_id
+    assert result["evaluation_side"] == "candidate"
+    assert result["execution_attestation_digest"] == (
+        expected_receipt.execution_attestation_digest
+    )
+    assert str(result["artifact_id"]).startswith("artifact_")
 
 
 def test_archive_cli_records_and_verifies_immutable_artifact(

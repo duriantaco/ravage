@@ -37,7 +37,16 @@ from tools.improvement_lab.evaluation import (
     evaluate_candidate,
     load_run_receipts,
 )
+from tools.improvement_lab.execution_attestation import (
+    ExecutionAttestationError,
+    load_signed_execution_envelope,
+)
 from tools.improvement_lab.lessons import ImprovementBriefError, build_improvement_brief
+from tools.improvement_lab.run_receipt_adapter import (
+    RunReceiptAdapterError,
+    derive_run_receipt,
+    write_run_receipt,
+)
 from tools.improvement_lab.tournament import (
     TournamentCandidate,
     TournamentError,
@@ -91,6 +100,14 @@ def build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 - explicit subco
     referee_keygen.add_argument("--public-key", type=Path, required=True)
     referee_keygen.set_defaults(handler=_referee_keygen)
 
+    executor_keygen = subparsers.add_parser(
+        "executor-keygen",
+        help="create a separate Ed25519 execution-attestation keypair",
+    )
+    executor_keygen.add_argument("--private-key", type=Path, required=True)
+    executor_keygen.add_argument("--public-key", type=Path, required=True)
+    executor_keygen.set_defaults(handler=_executor_keygen)
+
     ingest = subparsers.add_parser(
         "ingest",
         help="project prior events into secret-safe structural trajectory capsules",
@@ -136,6 +153,17 @@ def build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 - explicit subco
     evaluate.add_argument("--output", type=Path, required=True)
     evaluate.add_argument("--require-promotion", action="store_true")
     evaluate.set_defaults(handler=_evaluate)
+
+    receipt_build = subparsers.add_parser(
+        "receipt-build",
+        help="derive one receipt from frozen output and a signed executor envelope",
+    )
+    receipt_build.add_argument("--archive", type=Path, required=True)
+    receipt_build.add_argument("--candidate-id", required=True)
+    receipt_build.add_argument("--artifacts", type=Path, required=True)
+    receipt_build.add_argument("--execution-envelope", type=Path, required=True)
+    receipt_build.add_argument("--output", type=Path, required=True)
+    receipt_build.set_defaults(handler=_receipt_build)
 
     source_check = subparsers.add_parser(
         "source-check",
@@ -210,6 +238,7 @@ def build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 - explicit subco
     campaign.add_argument("--evaluation-suite", type=Path, required=True)
     campaign.add_argument("--runner-image", required=True)
     campaign.add_argument("--referee-public-key", type=Path, required=True)
+    campaign.add_argument("--executor-public-key", type=Path, required=True)
     campaign.add_argument("--candidate-artifact-id", action="append", required=True)
     campaign.add_argument("--expected-previous-ref")
     campaign.set_defaults(handler=_campaign_create)
@@ -301,8 +330,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         CandidateWorkspaceError,
         ArchiveError,
         CorpusError,
+        ExecutionAttestationError,
         ImprovementCliError,
         ImprovementBriefError,
+        RunReceiptAdapterError,
         TrustedReplayError,
         TournamentError,
         ValueError,
@@ -321,6 +352,14 @@ def _keygen(args: argparse.Namespace) -> int:
 
 
 def _referee_keygen(args: argparse.Namespace) -> int:
+    return _ed25519_keygen(args)
+
+
+def _executor_keygen(args: argparse.Namespace) -> int:
+    return _ed25519_keygen(args)
+
+
+def _ed25519_keygen(args: argparse.Namespace) -> int:
     private_key, public_key = generate_referee_keypair()
     write_referee_key(args.private_key, private_key, public=False)
     try:
@@ -432,6 +471,39 @@ def _evaluate(args: argparse.Namespace) -> int:
         }
     )
     return 3 if args.require_promotion and not receipt.accepted else 0
+
+
+def _receipt_build(args: argparse.Namespace) -> int:
+    archive = _verified_archive(args.archive)
+    public_key = archive.campaign_executor_public_key(args.candidate_id)
+    envelope = load_signed_execution_envelope(
+        args.execution_envelope,
+        public_key=public_key,
+    )
+    receipt = derive_run_receipt(
+        args.artifacts,
+        envelope=envelope,
+        executor_public_key=public_key,
+    )
+    retained = archive.retain_execution_envelope(
+        args.candidate_id,
+        signed_envelope=envelope,
+    )
+    if retained.get("content_object") != receipt.execution_attestation_digest:
+        raise ImprovementCliError(
+            "retained execution envelope does not match the derived receipt"
+        )
+    write_run_receipt(args.output, receipt)
+    _print_json(
+        {
+            "artifact_id": retained["artifact_id"],
+            "case_id": receipt.case_id,
+            "evaluation_side": envelope.binding.evaluation_side,
+            "execution_attestation_digest": receipt.execution_attestation_digest,
+            "output": str(args.output),
+        }
+    )
+    return 0
 
 
 def _brief(args: argparse.Namespace) -> int:
@@ -576,6 +648,7 @@ def _campaign_create(args: argparse.Namespace) -> int:
         evaluation_suite=suite,
         runner_image=args.runner_image,
         referee_public_key=read_public_key(args.referee_public_key),
+        executor_public_key=read_public_key(args.executor_public_key),
         proposal_input_artifact_ids=tuple(args.candidate_artifact_id),
         expected_previous_ref=args.expected_previous_ref,
     )
