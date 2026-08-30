@@ -32,6 +32,7 @@ from ravage.agent_core.action_executor import (
 )
 from ravage.agent_core.agent_state import (
     AgentState,
+    append_unique,
     load_agent_state,
     resolve_agent_state_path,
     save_agent_state,
@@ -41,6 +42,7 @@ from ravage.agent_core.ai_agent import (
     route_has_paid_transport_risk,
     run_ai_web_agent,
 )
+from ravage.agent_core.attack_surface import merge_surface_state, surface_from_recon
 from ravage.agent_core.autonomous_graph.operational_profile import (
     GraphOperationalProfileName,
 )
@@ -48,7 +50,12 @@ from ravage.agent_core.autonomous_route_selection import (
     AUTONOMOUS_ROUTE_ENGINES,
     run_selected_autonomous_route,
 )
+from ravage.agent_core.observation_analysis import merge_recon_state
 from ravage.agent_core.surface_graph import SurfaceGraphState
+from ravage.agent_core.surface_graph_ingest import (
+    ingest_recon_surface,
+    project_surface_graph,
+)
 from ravage.agent_knowledge import describe_knowledge_pack
 from ravage.agent_knowledge.cli import handle_skills_command
 from ravage.auth import (
@@ -134,6 +141,29 @@ from ravage.runtime import DEFAULT_TOOL_IMAGE
 from ravage.runtime.common import assert_http_url
 from ravage.runtime.scoped_network import ScopedNetworkError
 from ravage.satcom.cli import handle_satcom_command
+from ravage.scan_coverage import (
+    PlannerProbeDecision,
+    ProbeCoverageOutcome,
+    ProbeDisposition,
+    RequestAccountingStatus,
+    ScanCoverageCertificate,
+    ScanCoverageRecorder,
+    write_scan_coverage_certificate,
+)
+from ravage.scan_planner import (
+    DEFAULT_SCAN_PROBES,
+    SCAN_PROBE_CATALOG,
+    ScanPlan,
+    ScanPlanDecision,
+    ScanPlanStatus,
+    build_adaptive_scan_plan,
+)
+from ravage.scan_planner import (
+    DISCOVERY_SCAN_PROBES as _SCAN_DISCOVERY_PROBES,
+)
+from ravage.scan_planner import (
+    SCAN_PROBE_DEPENDENCIES as _SCAN_PROBE_DEPENDENCIES,
+)
 from ravage.self_adapter import build_ravage_competitor_result
 from ravage.setup_checks import (
     discover_brief,
@@ -163,6 +193,7 @@ from ravage.traffic.recorders import ProbeTrafficRecorder
 from ravage.traffic.store import TrafficStore, TrafficStoreError
 from ravage.web_core.http_probe import ProbeSession
 from ravage.web_core.proof_recognizer import recognize_proofs
+from ravage.web_core.recon import run_recon
 from ravage.web_core.scope_policy import assert_authorized_target, is_local_url
 from ravage.xben_parts.models import DEFAULT_BENCHMARKS_ROOT, XbenSettings
 from ravage.xben_parts.runner import run_xben
@@ -193,6 +224,7 @@ _MAX_SCAN_PROOF_VALUE_CHARS = 650_000
 _MAX_SCAN_PROOF_NODES = 20_000
 _MAX_SCAN_OBSERVATION_CHARS = 10_000
 _MAX_SCAN_TRANSCRIPT_CHARS = 80_000
+_MAX_SCAN_COVERAGE_REASON_CODES = 8
 
 _TOP_LEVEL_COMMANDS = (
     "attack",
@@ -228,46 +260,13 @@ class _AttackResultEvent:
     event: dict[str, object]
 
 
-DEFAULT_SCAN_PROBES = (
-    "surface_map",
-    "secret_sweep",
-    "direct_exposure",
-    "api_behavior",
-    "csrf_session",
-    "browser_boundary",
-)
+@dataclass(frozen=True)
+class _ScanProbeExecution:
+    probe: str
+    result: ProbeRunResult
+    policy_blocked: bool = False
+    opaque_unmetered: bool = False
 
-_SCAN_DISCOVERY_PROBES = (
-    "surface_map",
-    "secret_sweep",
-    "direct_exposure",
-    "api_behavior",
-    "browser_boundary",
-)
-
-_SCAN_PROBE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
-    "browser_boundary": ("surface_map",),
-    "captcha_form_state": ("stateful_session",),
-    "cms_exposure": ("direct_exposure",),
-    "cookie_deserialization": ("stateful_session",),
-    "csrf_session": ("stateful_session",),
-    "dom_execution": ("xss_context", "xss_filter_constraint"),
-    "file_read_extract": ("file_fetch_parser",),
-    "filtered_query_bypass": ("sqli_differential",),
-    "graphql_exploit": ("api_behavior",),
-    "idor_boundary": ("api_behavior", "stateful_session"),
-    "jwt_exploit": ("api_behavior", "stateful_session"),
-    "preg_match_subject": ("sqli_differential",),
-    "reflection_value_boundary": ("input_reflection",),
-    "sqli_auth_transition": ("sqli_exploit",),
-    "sqli_exploit": ("data_query", "sqli_differential"),
-    "ssti_deferred_context_closure": ("ssti_fingerprint",),
-    "ssti_fingerprint": ("server_rendering",),
-    "werkzeug_console": ("direct_exposure",),
-    "xss_context": ("input_reflection",),
-    "xss_filter_constraint": ("xss_context",),
-    "xxe_boundary": ("file_fetch_parser",),
-}
 
 _SCAN_UNMETERED_PROBES = frozenset({"dom_execution"})
 
@@ -2389,6 +2388,7 @@ def _assert_fresh_scan_workspace(
             workspace_dir / "transcript.jsonl",
             db_path,
             run_dir / "scan-summary.json",
+            run_dir / "scan-coverage.json",
             run_dir / "report.json",
             run_dir / "report.md",
         )
@@ -2579,9 +2579,23 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
         roe_max_rps=brief.roe.max_rps,
     )
 
-    selected_probes = _selected_scan_probes(parsed.probes, all_probes=parsed.all_probes)
+    adaptive_scan = not parsed.probes and not parsed.all_probes
+    adaptive_catalog = tuple(SCAN_PROBE_CATALOG)
     skipped_authenticated_probes: dict[str, str] = {}
-    if parsed.identity:
+    if adaptive_scan and parsed.identity:
+        eligible, skipped_authenticated_probes = _authenticated_scan_selection(
+            list(adaptive_catalog),
+            explicit=False,
+        )
+        adaptive_catalog = tuple(eligible)
+        selected_probes: list[str] = []
+    else:
+        selected_probes = (
+            []
+            if adaptive_scan
+            else _selected_scan_probes(parsed.probes, all_probes=parsed.all_probes)
+        )
+    if parsed.identity and not adaptive_scan:
         selected_probes, skipped_authenticated_probes = _authenticated_scan_selection(
             selected_probes,
             explicit=bool(parsed.probes),
@@ -2654,6 +2668,11 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
     state.surface["scope_out_of_scope"] = list(brief.scope.out_of_scope)
     state.surface["scope_max_rps"] = brief.roe.max_rps
     state.surface["allow_remote_target"] = parsed.allow_remote_target
+    state.surface["scan_planner_mode"] = "adaptive" if adaptive_scan else "fixed"
+    adaptive_plan: ScanPlan | None = None
+    if adaptive_scan:
+        adaptive_plan = build_adaptive_scan_plan(state, catalog=adaptive_catalog)
+        selected_probes = list(adaptive_plan.probes)
     write_manifest(
         run_dir,
         RunManifest(
@@ -2668,6 +2687,7 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
     start_payload: dict[str, object] = {
         "target_url": target_url,
         "probes": selected_probes,
+        "planner_mode": "adaptive" if adaptive_scan else "fixed",
         "traffic_accounting": _scan_traffic_accounting(traffic_policy),
     }
     if parsed.identity:
@@ -2680,12 +2700,26 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
         payload=start_payload,
     )
     workspace.record_event(kind="scan_started", payload=start_payload)
+    if adaptive_plan is not None:
+        _record_adaptive_scan_plan(
+            adaptive_plan,
+            iteration=0,
+            workspace=workspace,
+            audit=audit,
+            engagement_id=brief.engagement_id,
+        )
 
     probe_observations_count = 0
     confirmed_findings_count = 0
     observed_request_count = 0
     observed_http_response_count = 0
     transport_errors: list[str] = []
+    executions: list[_ScanProbeExecution] = []
+    planner_frontier_exhausted = False
+    coverage_certificate: ScanCoverageCertificate | None = None
+    planner_mode = (
+        "adaptive" if adaptive_scan else ("all_probes" if parsed.all_probes else "explicit")
+    )
     auth_owner: ManagedAttackAuthentication | None = None
     artifact_redactor = AuthArtifactRedactor()
     try:
@@ -2731,7 +2765,62 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
                 raise SystemExit(
                     f"cannot authenticate identity {parsed.identity!r}: {exc}"
                 ) from None
-        for index, probe in enumerate(selected_probes, start=1):
+        if adaptive_scan:
+            recon_payload = _seed_adaptive_scan_recon(
+                target_url=target_url,
+                brief=brief,
+                state=state,
+                workspace=workspace,
+                audit=audit,
+                traffic_policy=traffic_policy,
+                timeout_seconds=parsed.timeout_seconds,
+                allow_remote_target=parsed.allow_remote_target,
+            )
+            recon_request_count = recon_payload.get("http_request_count")
+            if isinstance(recon_request_count, int) and not isinstance(
+                recon_request_count, bool
+            ):
+                observed_request_count += recon_request_count
+            recon_pages = recon_payload.get("pages")
+            if isinstance(recon_pages, list):
+                observed_http_response_count += sum(
+                    isinstance(page, Mapping)
+                    and isinstance(page.get("status"), int)
+                    and not isinstance(page.get("status"), bool)
+                    for page in recon_pages
+                )
+            recon_errors = recon_payload.get("errors")
+            if isinstance(recon_errors, list):
+                for error in recon_errors:
+                    detail = str(error).strip()
+                    if detail and detail not in transport_errors:
+                        transport_errors.append(detail)
+            adaptive_plan = build_adaptive_scan_plan(state, catalog=adaptive_catalog)
+            _record_adaptive_scan_plan(
+                adaptive_plan,
+                iteration=1,
+                workspace=workspace,
+                audit=audit,
+                engagement_id=brief.engagement_id,
+            )
+            save_agent_state(workspace.state_path, target_url=target_url, state=state)
+        fixed_probes = tuple(selected_probes)
+        fixed_cursor = 0
+        probe_index = 0
+        while True:
+            if adaptive_scan:
+                assert adaptive_plan is not None
+                if not adaptive_plan.probes:
+                    planner_frontier_exhausted = True
+                    break
+                probe = adaptive_plan.probes[0]
+            else:
+                if fixed_cursor >= len(fixed_probes):
+                    planner_frontier_exhausted = True
+                    break
+                probe = fixed_probes[fixed_cursor]
+                fixed_cursor += 1
+            probe_index += 1
             use_authenticated_session = (
                 auth_owner is not None and not probe_requires_anonymous_session(probe)
             )
@@ -2747,6 +2836,7 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
                     ) from None
             try:
                 try:
+                    blocked_before = traffic_policy.snapshot().blocked_count
                     blocked_reason = _guard_scan_probe_traffic(
                         probe,
                         traffic_policy=traffic_policy,
@@ -2783,6 +2873,18 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
                 raise
             except Exception:  # noqa: BLE001 - target failures must not escape artifacts.
                 raise SystemExit(f"scan probe {probe!r} failed") from None
+            blocked_after = traffic_policy.snapshot().blocked_count
+            policy_blocked = bool(blocked_reason) or (
+                blocked_after > blocked_before and not _scan_result_has_http_response(result)
+            )
+            executions.append(
+                _ScanProbeExecution(
+                    probe=probe,
+                    result=result,
+                    policy_blocked=policy_blocked,
+                    opaque_unmetered=(probe in _SCAN_UNMETERED_PROBES and not blocked_reason),
+                )
+            )
             for request in result.requests:
                 if not isinstance(request, dict):
                     continue
@@ -2815,7 +2917,7 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
             payload = _require_scan_payload(artifact_redactor.redact(raw_payload))
             text = json.dumps(payload, indent=2, sort_keys=True)
             safe_summary = artifact_redactor.redact_text(result.summary)
-            action_id = f"scan-{index:03d}-{probe}"
+            action_id = f"scan-{probe_index:03d}-{probe}"
             session_mode = (
                 f"identity:{parsed.identity}" if use_authenticated_session else "anonymous"
             )
@@ -2848,7 +2950,7 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
                 payload=scan_payload,
             )
             workspace.record_event(kind="scan_probe", payload=scan_payload)
-            state.turn = index
+            state.turn = probe_index
             state.actions.append(
                 {
                     "action": "run_probe",
@@ -2886,6 +2988,19 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
                     f"{badge(f'scan:{marker}', style)} "
                     f"{badge(session_label, 'info')} {tone(probe, 'info')} {safe_summary}"
                 )
+            if adaptive_scan:
+                adaptive_plan = build_adaptive_scan_plan(
+                    state,
+                    prior_results=tuple(execution.result for execution in executions),
+                    catalog=adaptive_catalog,
+                )
+                _record_adaptive_scan_plan(
+                    adaptive_plan,
+                    iteration=probe_index + 1,
+                    workspace=workspace,
+                    audit=audit,
+                    engagement_id=brief.engagement_id,
+                )
         _require_scan_target_reached(
             observed_requests=observed_request_count,
             observed_responses=observed_http_response_count,
@@ -2896,10 +3011,28 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
             status="confirmed",
             engagement_id=brief.engagement_id,
         )
+        coverage_certificate = _build_scan_coverage_certificate(
+            target_url=target_url,
+            planner_mode=planner_mode,
+            adaptive_plan=adaptive_plan if adaptive_scan else None,
+            executions=executions,
+            skipped_probes=skipped_authenticated_probes,
+            planner_frontier_exhausted=planner_frontier_exhausted,
+            traffic_policy=traffic_policy,
+        )
+        coverage_path = write_scan_coverage_certificate(
+            run_dir / "scan-coverage.json",
+            coverage_certificate,
+        )
         completed_payload = {
-            "probes_run": len(selected_probes),
+            "probes_run": len(executions),
             "confirmed_findings_count": confirmed_findings_count,
             "flags_count": len(state.flags),
+            "planner_mode": planner_mode,
+            "coverage_status": coverage_certificate.status.value,
+            "coverage_completion_basis": coverage_certificate.completion_basis,
+            "coverage_limitations": list(coverage_certificate.limitations),
+            "coverage_artifact": coverage_path.name,
             "traffic_accounting": _scan_traffic_accounting(traffic_policy),
         }
         audit.record(
@@ -2985,7 +3118,9 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
         "audit_db": str(db_path),
         "target_url": target_url,
         "identity": parsed.identity or "",
-        "probes_run": len(selected_probes),
+        "planner_mode": planner_mode,
+        "probes_run": len(executions),
+        "probes_executed": [execution.probe for execution in executions],
         "skipped_authenticated_probes": skipped_authenticated_probes,
         "probe_observations_count": probe_observations_count,
         "confirmed_findings_count": confirmed_findings_count,
@@ -2993,6 +3128,16 @@ def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
         "traffic_contracts": traffic_contracts,
         "traffic_recorder_errors": traffic_recorder_errors,
         "traffic_accounting": _scan_traffic_accounting(traffic_policy),
+        "coverage": (
+            {
+                "artifact": str(run_dir / "scan-coverage.json"),
+                "status": coverage_certificate.status.value,
+                "completion_basis": coverage_certificate.completion_basis,
+                "limitations": list(coverage_certificate.limitations),
+            }
+            if coverage_certificate is not None
+            else {}
+        ),
         "flags": list(state.flags),
         "report": report_output,
     }
@@ -3094,6 +3239,258 @@ def _scan_traffic_accounting(
         "remaining_physical_requests": remaining,
         **snapshot.to_json(),
     }
+
+
+def _record_adaptive_scan_plan(
+    plan: ScanPlan,
+    *,
+    iteration: int,
+    workspace: AgentWorkspace,
+    audit: AuditStore,
+    engagement_id: UUID,
+) -> None:
+    payload = plan.to_json()
+    payload["iteration"] = iteration
+    audit.record(
+        engagement_id=engagement_id,
+        actor="scan",
+        action="scan_plan_updated",
+        payload=payload,
+    )
+    workspace.record_event(kind="scan_plan_updated", payload=payload)
+
+
+def _seed_adaptive_scan_recon(  # noqa: PLR0913
+    *,
+    target_url: str,
+    brief: EngagementBrief,
+    state: AgentState,
+    workspace: AgentWorkspace,
+    audit: AuditStore,
+    traffic_policy: TrafficPolicyController,
+    timeout_seconds: int,
+    allow_remote_target: bool,
+) -> dict[str, object]:
+    """Feed native HTML/JS/form discovery into the canonical surface graph."""
+    try:
+        recon = run_recon(
+            target_url,
+            max_pages=12,
+            timeout_seconds=max(1, min(timeout_seconds, 60)),
+            allow_remote_target=allow_remote_target,
+            in_scope=brief.scope.in_scope,
+            out_of_scope=brief.scope.out_of_scope,
+            max_rps=brief.roe.max_rps,
+            traffic_policy=traffic_policy,
+        )
+    except Exception as exc:  # noqa: BLE001 - recon is additive, not a run gate.
+        payload = {
+            "error_type": type(exc).__name__,
+            "error": _concise_cli_error(exc),
+        }
+        audit.record(
+            engagement_id=brief.engagement_id,
+            actor="scan",
+            action="scan_recon_failed",
+            payload=payload,
+        )
+        workspace.record_event(kind="scan_recon_failed", payload=payload)
+        append_unique(state.facts, "adaptive native recon incomplete", limit=80)
+        return {
+            "pages": [],
+            "errors": [str(payload["error"])],
+            "http_request_count": 0,
+        }
+
+    recon_payload: dict[str, object] = recon.to_json()
+    audit.record(
+        engagement_id=brief.engagement_id,
+        actor="scan",
+        action="scan_recon_completed",
+        payload=recon_payload,
+    )
+    workspace.record_event(kind="scan_recon_completed", payload=recon_payload)
+    merge_recon_state(state, recon_payload)
+    preserved_surface = dict(state.surface)
+    context = brief.context if isinstance(brief.context, Mapping) else {}
+    surface = surface_from_recon(
+        target_url=target_url,
+        description=str(context.get("description") or ""),
+        recon_payload=recon_payload,
+    )
+    ingest_recon_surface(state.surface_graph, recon_payload, identity_alias="anonymous")
+    surface = project_surface_graph(state.surface_graph, surface)
+    merge_surface_state(state, surface)
+    state.surface.update(preserved_surface)
+    graph_payload = {
+        "operations": len(state.surface_graph.operations or {}),
+        "identity_observations": len(state.surface_graph.observations or {}),
+        "sources": sorted(
+            {
+                source
+                for operation in (state.surface_graph.operations or {}).values()
+                for source in operation.provenance
+            }
+        ),
+    }
+    audit.record(
+        engagement_id=brief.engagement_id,
+        actor="scan",
+        action="scan_surface_graph_updated",
+        payload=graph_payload,
+    )
+    workspace.record_event(kind="scan_surface_graph_updated", payload=graph_payload)
+    return recon_payload
+
+
+def _build_scan_coverage_certificate(  # noqa: C901, PLR0913
+    *,
+    target_url: str,
+    planner_mode: str,
+    adaptive_plan: ScanPlan | None,
+    executions: list[_ScanProbeExecution],
+    skipped_probes: Mapping[str, str],
+    planner_frontier_exhausted: bool,
+    traffic_policy: TrafficPolicyController,
+) -> ScanCoverageCertificate:
+    recorder = ScanCoverageRecorder()
+    execution_ids: list[tuple[str, _ScanProbeExecution]] = []
+    recorded_probe_ids: set[str] = set()
+    next_rank = 0
+    if adaptive_plan is not None:
+        execution_by_probe = {execution.probe: execution for execution in executions}
+        for rank, decision in enumerate(adaptive_plan.decisions):
+            terminal_disposition = None
+            if decision.status is ScanPlanStatus.NOT_APPLICABLE:
+                terminal_disposition = ProbeDisposition.NOT_APPLICABLE
+            elif decision.status is ScanPlanStatus.BLOCKED:
+                terminal_disposition = ProbeDisposition.UNSUPPORTED
+            recorder.record_planner_decision(
+                PlannerProbeDecision(
+                    probe_id=decision.probe,
+                    family=decision.phase.value,
+                    rank=rank,
+                    surface_key=target_url,
+                    reason_codes=_coverage_reason_codes(decision),
+                    terminal_disposition=terminal_disposition,
+                )
+            )
+            recorded_probe_ids.add(decision.probe)
+            execution = execution_by_probe.get(decision.probe)
+            if execution is not None:
+                execution_ids.append((decision.probe, execution))
+        next_rank = len(adaptive_plan.decisions)
+    else:
+        occurrences: dict[str, int] = {}
+        for rank, execution in enumerate(executions):
+            occurrence = occurrences.get(execution.probe, 0) + 1
+            occurrences[execution.probe] = occurrence
+            probe_id = (
+                execution.probe if occurrence == 1 else f"{execution.probe}.{occurrence}"
+            )
+            recorder.record_planner_decision(
+                PlannerProbeDecision(
+                    probe_id=probe_id,
+                    family=planner_mode,
+                    rank=rank,
+                    surface_key=target_url,
+                    reason_codes=(
+                        "operator_selected" if planner_mode == "explicit" else "full_catalog",
+                    ),
+                )
+            )
+            recorded_probe_ids.add(probe_id)
+            execution_ids.append((probe_id, execution))
+        next_rank = len(executions)
+    for probe, _reason in sorted(skipped_probes.items()):
+        if probe in recorded_probe_ids:
+            continue
+        recorder.record_planner_decision(
+            PlannerProbeDecision(
+                probe_id=probe,
+                family="unsupported",
+                rank=next_rank,
+                surface_key=target_url,
+                reason_codes=("managed_transport_unavailable",),
+                terminal_disposition=ProbeDisposition.UNSUPPORTED,
+            )
+        )
+        next_rank += 1
+    for probe_id, execution in execution_ids:
+        recorder.record_probe_outcome(_scan_probe_coverage_outcome(probe_id, execution))
+    try:
+        traffic_snapshot = traffic_policy.snapshot()
+    except (OSError, TrafficPolicyError, ValueError):
+        traffic_snapshot = None
+    return recorder.finalize(
+        planner_frontier_exhausted=planner_frontier_exhausted,
+        traffic_snapshot=traffic_snapshot,
+        traffic_config=traffic_policy.config,
+    )
+
+
+def _coverage_reason_codes(decision: ScanPlanDecision) -> tuple[str, ...]:
+    reasons = tuple(sorted(set(decision.reasons)))
+    if len(reasons) <= _MAX_SCAN_COVERAGE_REASON_CODES:
+        return reasons
+    return (
+        *reasons[: _MAX_SCAN_COVERAGE_REASON_CODES - 1],
+        "reason_codes_truncated",
+    )
+
+
+def _scan_probe_coverage_outcome(
+    probe_id: str,
+    execution: _ScanProbeExecution,
+) -> ProbeCoverageOutcome:
+    result = execution.result
+    if execution.policy_blocked:
+        disposition = ProbeDisposition.BLOCKED_BUDGET
+        reason_codes = ("traffic_policy_blocked",)
+    elif result.findings:
+        disposition = ProbeDisposition.COMPLETED_FINDING
+        reason_codes = ()
+    elif _scan_probe_transport_incomplete(result):
+        disposition = ProbeDisposition.TRANSPORT_INCOMPLETE
+        reason_codes = ("transport_incomplete",)
+    else:
+        disposition = ProbeDisposition.COMPLETED_NO_FINDING
+        reason_codes = ()
+    if execution.opaque_unmetered:
+        accounting_status = RequestAccountingStatus.LOWER_BOUND
+        reason_codes = (*reason_codes, "opaque_transport")
+    else:
+        try:
+            accounting_status = RequestAccountingStatus(result.http_request_count_status)
+        except (TypeError, ValueError):
+            accounting_status = RequestAccountingStatus.UNAVAILABLE
+    return ProbeCoverageOutcome(
+        probe_id=probe_id,
+        disposition=disposition,
+        finding_count=len(result.findings),
+        physical_request_count=result.http_request_count,
+        request_accounting_status=accounting_status,
+        reason_codes=tuple(sorted(set(reason_codes))),
+    )
+
+
+def _scan_probe_transport_incomplete(result: ProbeRunResult) -> bool:
+    if _scan_result_has_http_response(result):
+        return False
+    request_errors = any(
+        isinstance(request, Mapping) and str(request.get("error") or "").strip()
+        for request in result.requests
+    )
+    return bool(result.errors or request_errors)
+
+
+def _scan_result_has_http_response(result: ProbeRunResult) -> bool:
+    return any(
+        isinstance(request, Mapping)
+        and isinstance(request.get("status"), int)
+        and not isinstance(request.get("status"), bool)
+        for request in result.requests
+    )
 
 
 def _configured_scan_session(  # noqa: PLR0913

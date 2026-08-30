@@ -132,6 +132,7 @@ def test_scan_low_noise_cap_matches_real_physical_dispatches(
 
     summary = json.loads(capsys.readouterr().out)
     accounting = summary["traffic_accounting"]
+    coverage = json.loads((run_dir / "scan-coverage.json").read_text(encoding="utf-8"))
     assert dispatched_paths == ["/surface_map"]
     assert accounting["physical_request_count"] == len(dispatched_paths) == 1
     assert accounting["completed_request_count"] == 1
@@ -139,6 +140,13 @@ def test_scan_low_noise_cap_matches_real_physical_dispatches(
     assert accounting["remaining_physical_requests"] == 0
     assert accounting["accounting_status"] == "exact"
     assert accounting["provenance"] == "workspace_traffic_policy_ledger"
+    assert coverage["status"] == "partial"
+    assert "budget_blocked" in coverage["limitations"]
+    assert "traffic_policy_blocked" in coverage["limitations"]
+    assert [record["disposition"] for record in coverage["probes"]] == [
+        "completed_no_finding",
+        "blocked_budget",
+    ]
 
 
 def test_scan_opaque_transport_is_accounted_or_blocked(tmp_path: Path) -> None:
@@ -153,12 +161,18 @@ def test_scan_opaque_transport_is_accounted_or_blocked(tmp_path: Path) -> None:
         config=TrafficPolicyConfig.low_noise(max_physical_requests=3, max_rps=0.9),
     )
 
-    assert cli._guard_scan_probe_traffic(  # noqa: SLF001
-        "surface_map", traffic_policy=observe
-    ) == ""
-    assert cli._guard_scan_probe_traffic(  # noqa: SLF001
-        "dom_execution", traffic_policy=observe
-    ) == ""
+    assert (
+        cli._guard_scan_probe_traffic(  # noqa: SLF001
+            "surface_map", traffic_policy=observe
+        )
+        == ""
+    )
+    assert (
+        cli._guard_scan_probe_traffic(  # noqa: SLF001
+            "dom_execution", traffic_policy=observe
+        )
+        == ""
+    )
     observed = cli._scan_traffic_accounting(observe)  # noqa: SLF001
     assert observed["unmetered_action_count"] == 1
     assert observed["accounting_status"] == "lower_bound"
