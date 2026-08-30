@@ -6,6 +6,31 @@ before an entry is described as released.
 
 ## Unreleased
 
+## 0.6.0 - 2026-08-30
+
+### Security
+
+- Removed provider keys and arbitrary parent secrets from model-selected host
+  shell, Python, and graph-process environments.
+- Made host execution an explicit localhost opt-in and kept process-capable
+  remote attacks inside scoped Docker execution without silent host fallback.
+- Blocked schema-only and unaccountable paid model routes before credential
+  access or network dispatch.
+- Pinned publishing actions to immutable commits and added main-commit,
+  changelog, version-consistency, and unused-PyPI-version release checks.
+
+### Fixed
+
+- Persisted confirmed deterministic vulnerabilities even when no CTF flag is
+  present, while keeping raw observations and unconfirmed candidates separate.
+- Prioritized breadth-first reconnaissance and constrained discovered DOM and
+  form targets to valid, same-origin, in-scope URLs.
+- Added deterministic scan work, reconnaissance, and validated lower-bound
+  request accounting to reports.
+- Bundled the Cockpit frontend, logo, and five local labs into wheels and source
+  distributions so installed commands work outside a repository checkout.
+- Added clean-install smoke coverage for all packaged labs and Cockpit assets.
+
 ### Changed
 
 - Replaced the CLI's remote HTTP-only lane with the full `ai-web` base for
@@ -16,14 +41,18 @@ before an entry is described as released.
 - Added passive API authorization inventory and loop-verification hardening.
 - Simplified public onboarding and separated current docs from archived plans.
 - Added security reporting, contribution guidance, and repository templates.
+- Added supported wheel-install guidance and a reproducible TestPyPI,
+  production release, verification, and yank runbook.
 
-## 0.5.0 Source Baseline - 2026-07-11
+## 0.5.0 PyPI Preview - 2026-07-14
 
-`0.5.0` is the current source version and Release Please manifest baseline. It
-was not published as a GitHub tag or PyPI release, so it is not presented as a
-released artifact.
+`ravage==0.5.0` and `ravage-schemas==0.5.0` were published to PyPI without a
+matching GitHub tag or release. The repository later diverged while still
+identifying itself as `0.5.0`, so those immutable artifacts do not represent
+the current source tree. They remain a historical preview and must not be
+overwritten or treated as the `0.6.0` release candidate.
 
-Notable source capabilities at this baseline include:
+Notable capabilities in the source line around that preview included:
 
 - the model-driven agent and deterministic scan paths;
 - local deliberately vulnerable labs;

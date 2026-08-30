@@ -33,7 +33,19 @@ lab, observer, agent graph, full probe set, and benchmarks remain
 
 ## Install Once
 
-Ravage currently runs from a source checkout. Install Python 3.12, then run:
+For a tagged release on macOS, Linux, or WSL, install Python 3.12. Install only
+after the matching GitHub tag and PyPI release exist; the exact pin fails
+instead of silently installing the old `0.5.0` preview:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install "ravage==0.6.0" # x-release-please-version
+ravage doctor
+```
+
+Native Windows is not supported; use WSL. For development or an unreleased
+commit, install the source checkout instead:
 
 ```bash
 git clone https://github.com/duriantaco/ravage.git
@@ -82,7 +94,7 @@ everywhere below.
 
 ### 2. Create the Ravage files
 
-From the Ravage repository root, run:
+From the directory where you want the engagement files, run:
 
 ```bash
 ravage init http://127.0.0.1:3000 \

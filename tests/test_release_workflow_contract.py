@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import tomllib
 from pathlib import Path
@@ -14,6 +15,13 @@ TEST_PYPI_PUBLISH_JOB_COUNT = 2
 PYPI_PUBLISH_ACTION = (
     "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
 )
+PUBLIC_INSTALL_DOCS = {
+    "README.md",
+    "docs/how-to-use.md",
+    "docs/index.md",
+    "docs/setup.md",
+    "packages/ravage/README.md",
+}
 
 
 def _workflow(name: str) -> str:
@@ -121,3 +129,17 @@ def test_release_please_synchronizes_and_validates_the_lockfile() -> None:
     assert "python scripts/check_release.py" in workflow
     assert "git add uv.lock" in workflow
     assert 'git push origin "HEAD:${RELEASE_PR_BRANCH}"' in workflow
+
+
+def test_release_please_updates_public_install_pins() -> None:
+    config = json.loads(
+        (ROOT / "tools/release/release-please-config.json").read_text(encoding="utf-8")
+    )
+    extra_files = config["packages"]["."]["extra-files"]
+    generic_paths = {
+        str(item["path"])
+        for item in extra_files
+        if isinstance(item, dict) and item.get("type") == "generic"
+    }
+
+    assert generic_paths >= PUBLIC_INSTALL_DOCS

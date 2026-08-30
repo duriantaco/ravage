@@ -4,9 +4,9 @@ title: Setup
 
 # Setup
 
-Ravage is source-checkout-first. Install from this repository and run the
-`ravage` CLI from the checkout virtual environment so the docs, examples, labs,
-and benchmark evidence match the code you are running.
+Tagged releases support a normal wheel install. Use a source checkout for
+development, unreleased commits, frozen benchmark evidence, or repository-only
+contributor tooling. In either case, record the exact version or commit used.
 
 ## Requirements
 
@@ -20,6 +20,31 @@ Use Ravage only on systems you own or are explicitly authorized to test.
 The active CLI is localhost-first. Any non-loopback target must be declared in
 the brief and explicitly acknowledged with `--authorized-remote-target`;
 remote command and external-scanner execution requires Docker.
+
+Native Windows is not supported; use WSL.
+
+## Wheel Install
+
+Install only after the matching GitHub tag and PyPI release exist. The exact
+pin fails instead of silently installing the old `0.5.0` preview:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install "ravage==0.6.0" # x-release-please-version
+ravage doctor
+```
+
+The base wheel includes the cockpit UI and local lab definitions. Browser-backed
+capture and probes remain optional:
+
+```bash
+python -m pip install "ravage[browser]==0.6.0" # x-release-please-version
+playwright install chromium
+```
+
+Docker images, Chromium, and external scanners are never downloaded merely by
+installing the base wheel.
 
 ## Checkout Install
 
@@ -209,14 +234,22 @@ ravage doctor --workflow lab
 ravage lab up ravage-acme-box
 ```
 
-`lab up` finds the checkout's `examples/labs` directory automatically, starts
-Docker Compose, and waits up to 60 seconds for the health endpoint. Use
-`--labs-dir` only for a custom lab collection.
+`lab up` finds the lab bundled in the installed package or source checkout,
+starts Docker Compose, and waits up to 60 seconds for the health endpoint. Use
+`--labs-dir` only for a custom lab collection. Generate a local brief for the
+running lab:
+
+```bash
+ravage init http://127.0.0.1:8088 \
+  --brief brief.yaml \
+  --env-file .env.ravage \
+  --description "Bundled local release smoke target"
+```
 
 Run a no-model deterministic scan:
 
 ```bash
-ravage scan examples/labs/ravage-acme-box/brief.yaml \
+ravage scan brief.yaml \
   --run-dir runs/quickstart-acme-scan \
   --probe surface_map \
   --report
@@ -242,11 +275,11 @@ For a local OpenAI-compatible route such as Ollama:
 
 ```bash
 ravage doctor --workflow attack \
-  --brief examples/labs/ravage-acme-box/brief.yaml \
+  --brief brief.yaml \
   --model-profile local-ollama \
   --model-tier mid
 
-ravage attack examples/labs/ravage-acme-box/brief.yaml \
+ravage attack brief.yaml \
   --model-profile local-ollama \
   --model-tier mid \
   --report

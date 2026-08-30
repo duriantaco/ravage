@@ -78,9 +78,14 @@ claim. The external-agent scoreboard remains a future stage.
         <td><a href="{{ '/how-to-use.html' | relative_url }}#path-2-test-an-authorized-url">Authorized-URL path</a></td>
       </tr>
       <tr>
-        <td>Install from source</td>
-        <td><code>scripts/bootstrap.sh</code><br><code>ravage doctor</code></td>
+        <td>Install a release</td>
+        <td><code>python -m pip install "ravage==0.6.0"</code><!-- x-release-please-version --><br><code>ravage doctor</code></td>
         <td><a href="{{ '/setup.html' | relative_url }}">Setup</a></td>
+      </tr>
+      <tr>
+        <td>Install an unreleased checkout</td>
+        <td><code>scripts/bootstrap.sh</code><br><code>ravage doctor</code></td>
+        <td><a href="{{ '/setup.html' | relative_url }}#checkout-install">Setup</a></td>
       </tr>
       <tr>
         <td>Run a localhost deterministic baseline</td>

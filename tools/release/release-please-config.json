@@ -36,6 +36,26 @@
         {
           "type": "generic",
           "path": "CITATION.cff"
+        },
+        {
+          "type": "generic",
+          "path": "README.md"
+        },
+        {
+          "type": "generic",
+          "path": "docs/how-to-use.md"
+        },
+        {
+          "type": "generic",
+          "path": "docs/index.md"
+        },
+        {
+          "type": "generic",
+          "path": "docs/setup.md"
+        },
+        {
+          "type": "generic",
+          "path": "packages/ravage/README.md"
         }
       ]
     }

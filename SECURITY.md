@@ -12,9 +12,9 @@ release, when one exists. Older releases, superseded snapshots, historical
 benchmark archives, and intentionally vulnerable lab targets are not supported
 release lines.
 
-The legacy `0.0.1` PyPI packages should not be treated as the current source
-release. Until a newer tagged release is published, use the repository checkout
-and identify the exact commit in reports.
+The untagged `0.0.1` and `0.5.0` PyPI previews are not supported release lines.
+Use the latest tagged release when one exists; otherwise use the repository
+checkout and identify the exact commit in reports.
 
 ## Report A Vulnerability Privately
 

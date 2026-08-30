@@ -1,6 +1,10 @@
 from pathlib import Path
 
-from scripts.qa.check_docs import _missing_repo_paths
+from scripts.qa.check_docs import (
+    _missing_repo_paths,
+    _missing_required_docs,
+    _public_install_errors,
+)
 
 
 def test_missing_repo_paths_accepts_existing_root_relative_path(tmp_path: Path) -> None:
@@ -65,4 +69,49 @@ def test_missing_repo_paths_rejects_path_that_leaves_repository(tmp_path: Path) 
 
     assert errors == [
         "docs/guide.md:1: repository path leaves root: docs/../../outside.md"
+    ]
+
+
+def test_missing_required_docs_reports_absent_file(tmp_path: Path) -> None:
+    required = tmp_path / "RELEASING.md"
+
+    assert _missing_required_docs((required,), root=tmp_path) == [
+        "missing required document: RELEASING.md"
+    ]
+
+
+def test_public_install_requires_exact_current_version(tmp_path: Path) -> None:
+    document = tmp_path / "README.md"
+    text = 'python -m pip install "ravage==0.5.0" # x-release-please-version\n'
+
+    assert _public_install_errors(document, text, "0.6.0", root=tmp_path) == [
+        "README.md:1: public install spec 'ravage==0.5.0' must use exact version 0.6.0"
+    ]
+
+
+def test_public_install_accepts_base_and_browser_pins(tmp_path: Path) -> None:
+    document = tmp_path / "README.md"
+    text = (
+        'python -m pip install "ravage==0.6.0" # x-release-please-version\n'
+        'python -m pip install "ravage[browser]==0.6.0" # x-release-please-version\n'
+    )
+
+    assert _public_install_errors(document, text, "0.6.0", root=tmp_path) == []
+
+
+def test_public_install_ignores_editable_source_path(tmp_path: Path) -> None:
+    document = tmp_path / "README.md"
+    text = "python -m pip install -e packages/ravage\n"
+
+    assert _public_install_errors(document, text, "0.6.0", root=tmp_path) == [
+        "README.md: missing version-pinned public install command"
+    ]
+
+
+def test_public_install_requires_release_please_marker(tmp_path: Path) -> None:
+    document = tmp_path / "README.md"
+    text = 'python -m pip install "ravage==0.6.0"\n'
+
+    assert _public_install_errors(document, text, "0.6.0", root=tmp_path) == [
+        "README.md:1: public install pin is missing the Release Please version marker"
     ]

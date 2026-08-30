@@ -4,8 +4,26 @@ Ravage is an evidence-first web security research agent for controlled,
 authorized targets. This package provides the `ravage` CLI and runtime modules.
 
 The project is a pre-1.0 research alpha. Use it only on local fixtures, isolated
-labs, or systems you own and are explicitly authorized to assess. The active
-public CLI is localhost-first.
+labs, or systems you own and are explicitly authorized to assess. Ravage
+supports Python 3.12 on macOS, Linux, and WSL; native Windows is not supported.
+The active public CLI is localhost-first.
+
+## Install
+
+Install only after the matching GitHub tag and PyPI release exist. The exact
+pin fails instead of silently installing the old `0.5.0` preview:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install "ravage==0.6.0" # x-release-please-version
+ravage doctor
+```
+
+Use `python -m pip install "ravage[browser]==0.6.0"`<!-- x-release-please-version -->
+plus `playwright install chromium` only when browser-backed capture or probes
+are required. Docker is required for unauthenticated process-capable model
+attacks and included labs; the deterministic first scan below needs neither.
 
 ## Source Checkout
 
@@ -86,9 +104,8 @@ from `curl`, Docker tools, scanners, and other external processes is not added
 to this history.
 
 External scanners such as `nmap`, `sqlmap`, `katana`, `nuclei`, and `ffuf` are
-not Python dependencies. From a source checkout, use
-`ravage tools install --method docker --execute`, then run
-`ravage tools check`.
+not Python dependencies. Use `ravage tools install --method docker --execute`,
+then run `ravage tools check`.
 
 For separate, operator-driven browser traffic capture from a source checkout, run
 `scripts/bootstrap.sh --install-browser`, reactivate `.venv`, and then run

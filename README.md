@@ -32,6 +32,23 @@ does not remediate findings or deploy fixes.
 The normal first scan needs no model key, browser, Docker daemon, or external
 scanner.
 
+## Install a release
+
+Install only after the matching GitHub tag and PyPI release exist. The exact
+pin below fails instead of silently installing the old `0.5.0` preview.
+
+~~~bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install "ravage==0.6.0" # x-release-please-version
+ravage doctor
+~~~
+
+Released wheels include the cockpit UI and local lab definitions. Install
+<code>python -m pip install "ravage[browser]==0.6.0"</code><!-- x-release-please-version -->
+and then run <code>playwright install chromium</code> only when browser-backed
+capture or probes are required.
+
 ## Install from source
 
 ~~~bash
@@ -42,7 +59,8 @@ source .venv/bin/activate
 ravage doctor
 ~~~
 
-The bootstrap creates <code>.venv</code> and installs the workspace. Use
+Use a source checkout for development or unreleased commits. The bootstrap
+creates <code>.venv</code> and installs the workspace. Use
 <code>scripts/bootstrap.sh --dev</code> for development dependencies,
 <code>--browser</code> for browser support, or
 <code>--install-browser</code> to install Chromium as well.
@@ -264,9 +282,10 @@ case results; one lucky flag is not evidence of a reliable improvement.
 - [Benchmarking](docs/benchmarking.md)
 - [Security policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
+- [Release process](RELEASING.md)
 
 Use <code>ravage --help</code> and <code>ravage COMMAND --help</code> for the
-exact options in your checkout.
+exact options in your installed version or checkout.
 
 ## License
 
