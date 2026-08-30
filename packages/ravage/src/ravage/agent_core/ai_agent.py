@@ -78,13 +78,15 @@ from ravage.agent_knowledge.selector import (
 )
 from ravage.dry_run import RouteParam, RouteProbe
 from ravage.model_core.providers import (
-    LOCAL_PROVIDERS,
     ModelTier,
     ResolvedModelRoute,
+    anthropic_standard_token_prices,
     load_model_registry,
+    model_route_transport_error,
     openai_standard_token_prices,
     ready_model_routes,
     resolve_model_routes,
+    route_is_nonbillable_local,
 )
 from ravage.probe_suite import (
     authenticated_probe_unavailability,
@@ -3226,6 +3228,14 @@ def _select_model_route(settings: AIWebAgentSettings) -> ResolvedModelRoute:
     message = "no ready model route"
     if missing:
         message += f"; missing env: {', '.join(missing)}"
+    missing_pricing = _missing_model_pricing_fields(routes)
+    if missing_pricing:
+        message += f"; missing pricing: {', '.join(missing_pricing)}"
+    transport_issues = sorted(
+        {route.transport_issue for route in routes if route.transport_issue is not None}
+    )
+    if transport_issues:
+        message += f"; transport issues: {', '.join(transport_issues)}"
     raise RuntimeError(message)
 
 
@@ -3309,6 +3319,13 @@ def _missing_model_env_vars(routes: Iterable[ResolvedModelRoute]) -> list[str]:
     for route in routes:
         for name in route.missing_env:
             missing.add(name)
+    return sorted(missing)
+
+
+def _missing_model_pricing_fields(routes: Iterable[ResolvedModelRoute]) -> list[str]:
+    missing: set[str] = set()
+    for route in routes:
+        missing.update(route.missing_pricing)
     return sorted(missing)
 
 
@@ -4073,7 +4090,7 @@ def _require_accountable_paid_reply(
     route: ResolvedModelRoute,
     reply: ModelReply,
 ) -> None:
-    if _route_is_nonbillable_local_model(route) or reply.cost_known:
+    if route_is_nonbillable_local(route) or reply.cost_known:
         return
     message = (
         "paid model response cannot be cost-accounted: "
@@ -4082,18 +4099,8 @@ def _require_accountable_paid_reply(
     )
     raise RuntimeError(message)
 
-
-def _route_is_nonbillable_local_model(route: ResolvedModelRoute) -> bool:
-    if route.provider in LOCAL_PROVIDERS:
-        return True
-    if route.provider != "custom_openai" or route.api_key_env is not None:
-        return False
-    hostname = (urlparse(route.base_url or "").hostname or "").lower()
-    return hostname in {"127.0.0.1", "::1", "localhost"}
-
-
 def route_has_paid_transport_risk(route: ResolvedModelRoute) -> bool:
-    if _route_is_nonbillable_local_model(route):
+    if route_is_nonbillable_local(route):
         return False
     if route.api_key_env is not None:
         return True
@@ -4540,6 +4547,17 @@ class ChatClient:
         self.route = route
 
     def chat(self, messages: list[dict[str, str]]) -> ModelReply:
+        transport_error = model_route_transport_error(self.route)
+        if transport_error is not None:
+            raise RuntimeError(f"model route transport is not callable: {transport_error}")
+        if not self.route.ready:
+            issues: list[str] = []
+            if self.route.missing_env:
+                issues.append(f"missing env: {', '.join(self.route.missing_env)}")
+            if self.route.missing_pricing:
+                issues.append(f"missing pricing: {', '.join(self.route.missing_pricing)}")
+            detail = "; ".join(issues) or "route readiness requirements are not met"
+            raise RuntimeError(f"model route is not ready: {detail}")
         last_error: Exception | None = None
         paid_transport_risk = route_has_paid_transport_risk(self.route)
         configured_attempts = 1 if paid_transport_risk else max(self.route.max_retries, 0) + 1
@@ -4613,26 +4631,30 @@ class ChatClient:
             "system": system,
             "messages": user_messages,
             "max_tokens": self.route.max_output_tokens,
-            "temperature": 0,
         }
+        # Newer Claude models reject non-default sampling controls; omit them for compatibility.
+        # https://platform.claude.com/docs/en/about-claude/model-deprecations
         base_url = (self.route.base_url or "https://api.anthropic.com").rstrip("/")
         data = self._post_json(f"{base_url}/v1/messages", body, anthropic=True)
         content = _anthropic_content(data)
         usage = _usage_from_data(data)
         usage_reported = _usage_was_reported(data)
+        response_model = _response_string(data, "model")
         cost_known = _response_cost_is_known(
             route=self.route,
             usage=usage,
             usage_reported=usage_reported,
+            response_model=response_model,
         )
         return ModelReply(
             content=content,
             input_tokens=_usage_token_count(usage, "input_tokens"),
+            cached_input_tokens=_usage_token_count(usage, "cache_read_input_tokens"),
             output_tokens=_usage_token_count(usage, "output_tokens"),
             cost_usd=_estimate_cost(self.route, usage) if cost_known else 0.0,
             usage_reported=usage_reported,
             cost_known=cost_known,
-            response_model=_response_string(data, "model"),
+            response_model=response_model,
             response_id=_response_string(data, "id"),
             system_fingerprint=_response_string(data, "system_fingerprint"),
             service_tier=_response_string(data, "service_tier"),
@@ -4779,6 +4801,8 @@ def _response_cost_is_known(
         return False
     if route.input_cost_per_1m_tokens is None or route.output_cost_per_1m_tokens is None:
         return False
+    if not _cache_usage_is_valid(route, usage):
+        return False
     if route.provider == "openai" and route.base_url is None:
         if service_tier != "default" or not response_model:
             return False
@@ -4801,8 +4825,44 @@ def _response_cost_is_known(
             != requested_prices
         ):
             return False
-    cached_input_tokens = _openai_cached_input_tokens(usage)
+    if route.provider == "anthropic":
+        if not response_model:
+            return False
+        requested_prices = anthropic_standard_token_prices(route.model)
+        response_prices = anthropic_standard_token_prices(response_model)
+        if requested_prices is None:
+            if response_model != route.model:
+                return False
+        elif response_prices != requested_prices:
+            return False
+        if _usage_token_count(usage, "cache_creation_input_tokens") != 0:
+            return False
+    cached_input_tokens = _cached_input_tokens(route, usage)
     return cached_input_tokens == 0 or route.cached_input_cost_per_1m_tokens is not None
+
+
+def _cached_input_tokens(
+    route: ResolvedModelRoute,
+    usage: Mapping[str, object],
+) -> int:
+    if route.provider == "anthropic":
+        return _usage_token_count(usage, "cache_read_input_tokens")
+    return _openai_cached_input_tokens(usage)
+
+
+def _cache_usage_is_valid(
+    route: ResolvedModelRoute,
+    usage: Mapping[str, object],
+) -> bool:
+    if route.provider == "anthropic":
+        for key in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+            if key in usage and not _usage_has_nonnegative_int(usage, (key,)):
+                return False
+        return True
+    details = usage.get("prompt_tokens_details")
+    if not isinstance(details, dict) or "cached_tokens" not in details:
+        return True
+    return _usage_has_nonnegative_int(details, ("cached_tokens",))
 
 
 def _usage_has_billable_token_counts(usage: Mapping[str, object]) -> bool:
@@ -4852,8 +4912,12 @@ def _estimate_cost(route: ResolvedModelRoute, usage: Mapping[str, object]) -> fl
             output_cost = standard_prices.output_per_1m
     if input_cost is None or output_cost is None:
         return 0.0
-    cached_input_tokens = min(_openai_cached_input_tokens(usage), input_tokens)
-    uncached_input_tokens = max(input_tokens - cached_input_tokens, 0)
+    cached_input_tokens = _cached_input_tokens(route, usage)
+    if route.provider == "anthropic":
+        uncached_input_tokens = input_tokens
+    else:
+        cached_input_tokens = min(cached_input_tokens, input_tokens)
+        uncached_input_tokens = max(input_tokens - cached_input_tokens, 0)
     if cached_input_cost is None:
         cached_input_cost = input_cost
     input_total = uncached_input_tokens / 1_000_000 * input_cost

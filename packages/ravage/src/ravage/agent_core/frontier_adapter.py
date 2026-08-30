@@ -38,11 +38,11 @@ from ravage.agent_core.frontier_timeout_hygiene import (
 )
 from ravage.agent_core.frontier_transition import seed_frontier_objectives
 from ravage.model_core.providers import (
-    LOCAL_PROVIDERS,
     ResolvedModelRoute,
     load_model_registry,
     ready_model_routes,
     resolve_model_routes,
+    route_is_nonbillable_local,
 )
 from ravage.run_data.audit import AuditStore
 from ravage.run_data.brief import load_engagement_brief
@@ -667,16 +667,23 @@ def _select_model_route(settings: AIWebAgentSettings) -> ResolvedModelRoute:
         return ready[0]
     missing = sorted(
         {
-            route.api_key_env
+            env_name
             for route in routes
-            if route.api_key_required
-            and route.api_key_env
-            and not os.environ.get(route.api_key_env)
+            for env_name in route.missing_env
+            if env_name and not os.environ.get(env_name)
         }
     )
     message = "no ready model route"
     if missing:
         message += f"; missing env: {', '.join(missing)}"
+    missing_pricing = sorted({field for route in routes for field in route.missing_pricing})
+    if missing_pricing:
+        message += f"; missing pricing: {', '.join(missing_pricing)}"
+    transport_issues = sorted(
+        {route.transport_issue for route in routes if route.transport_issue is not None}
+    )
+    if transport_issues:
+        message += f"; transport issues: {', '.join(transport_issues)}"
     raise RuntimeError(message)
 
 
@@ -713,8 +720,7 @@ def _require_accountable_reply(
     route: ResolvedModelRoute,
     reply: ModelReply,
 ) -> None:
-    local_custom = route.provider == "custom_openai" and route.api_key_env is None
-    if route.provider in LOCAL_PROVIDERS or local_custom or reply.cost_known:
+    if route_is_nonbillable_local(route) or reply.cost_known:
         return
     message = (
         "paid autonomous-route response cannot be cost-accounted: "

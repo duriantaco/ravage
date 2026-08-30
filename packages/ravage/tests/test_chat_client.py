@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 from ravage.agent_core.ai_agent import ChatClient
-from ravage.model_core.providers import ResolvedModelRoute
+from ravage.model_core.providers import ProviderKind, ResolvedModelRoute
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -151,6 +151,117 @@ def test_openai_compatible_chat_client_marks_missing_usage_unaccountable() -> No
     assert reply.response_id == "chatcmpl_without_usage"
 
 
+def test_native_anthropic_client_accounts_for_uncached_and_cached_input() -> None:
+    route = replace(
+        _route(
+            input_cost_per_1m_tokens=1.0,
+            cached_input_cost_per_1m_tokens=0.1,
+            output_cost_per_1m_tokens=5.0,
+        ),
+        provider="anthropic",
+        model="claude-haiku-4-5",
+        base_url="https://api.anthropic.com",
+    )
+    client = _CapturingAnthropicChatClient(route)
+
+    reply = client.chat([{"role": "user", "content": "return json"}])
+
+    assert reply.input_tokens == 100
+    assert reply.cached_input_tokens == 900
+    assert reply.output_tokens == 100
+    assert reply.response_model == "claude-haiku-4-5-20251001"
+    assert reply.cost_known is True
+    assert reply.cost_usd == pytest.approx(0.00069)
+
+
+def test_native_anthropic_client_rejects_unexpected_model_for_pricing() -> None:
+    route = replace(
+        _route(
+            input_cost_per_1m_tokens=1.0,
+            cached_input_cost_per_1m_tokens=0.1,
+            output_cost_per_1m_tokens=5.0,
+        ),
+        provider="anthropic",
+        model="claude-haiku-4-5-20251001",
+        base_url="https://api.anthropic.com",
+    )
+    client = _CapturingAnthropicChatClient(route)
+    client.response_model = "claude-sonnet-4-6"
+
+    reply = client.chat([{"role": "user", "content": "return json"}])
+
+    assert reply.cost_known is False
+    assert reply.cost_usd == 0.0
+
+
+def test_native_anthropic_client_rejects_unpriced_cache_creation() -> None:
+    route = replace(
+        _route(
+            input_cost_per_1m_tokens=1.0,
+            cached_input_cost_per_1m_tokens=0.1,
+            output_cost_per_1m_tokens=5.0,
+        ),
+        provider="anthropic",
+        model="claude-haiku-4-5-20251001",
+        base_url="https://api.anthropic.com",
+    )
+    client = _CapturingAnthropicChatClient(route)
+    client.cache_creation_input_tokens = 10
+
+    reply = client.chat([{"role": "user", "content": "return json"}])
+
+    assert reply.cost_known is False
+    assert reply.cost_usd == 0.0
+
+
+@pytest.mark.parametrize(
+    ("provider", "base_url"),
+    [
+        ("gemini", "https://generativelanguage.googleapis.com/v1beta"),
+        ("custom_openai", None),
+        ("openai", "https://gateway.example/v1"),
+        ("anthropic", "https://gateway.example"),
+    ],
+)
+def test_chat_client_rejects_unsupported_transport_before_dispatch(
+    provider: ProviderKind,
+    base_url: str | None,
+) -> None:
+    route = replace(
+        _route(
+            input_cost_per_1m_tokens=1.0,
+            cached_input_cost_per_1m_tokens=1.0,
+            output_cost_per_1m_tokens=1.0,
+        ),
+        provider=provider,
+        base_url=base_url,
+        api_key_env="PROVIDER_API_KEY",
+    )
+    client = _NeverDispatchChatClient(route)
+
+    with pytest.raises(RuntimeError, match="model route transport is not callable"):
+        client.chat([{"role": "user", "content": "must not dispatch"}])
+
+    assert client.dispatch_count == 0
+
+
+@pytest.mark.parametrize("provider", ["ollama", "custom_openai"])
+def test_chat_client_rejects_unpriced_remote_route_before_dispatch(
+    provider: ProviderKind,
+) -> None:
+    route = replace(
+        _route(),
+        provider=provider,
+        base_url="https://paid-model.example/v1",
+    )
+    client = _NeverDispatchChatClient(route)
+
+    with pytest.raises(RuntimeError, match="model route is not ready: missing pricing"):
+        client.chat([{"role": "user", "content": "must not dispatch"}])
+
+    assert client.dispatch_count == 0
+
+
 def test_chat_client_extends_retries_for_transient_url_errors(monkeypatch) -> None:
     sleeps: list[float] = []
     monkeypatch.setattr("ravage.agent_core.ai_agent.time.sleep", sleeps.append)
@@ -166,14 +277,16 @@ def test_chat_client_extends_retries_for_transient_url_errors(monkeypatch) -> No
 def test_chat_client_does_not_retry_paid_transport_failures(monkeypatch) -> None:
     sleeps: list[float] = []
     monkeypatch.setattr("ravage.agent_core.ai_agent.time.sleep", sleeps.append)
-    client = _TransientFailureChatClient(
+    route = replace(
         _route(
             max_retries=5,
             input_cost_per_1m_tokens=2.5,
+            cached_input_cost_per_1m_tokens=0.25,
             output_cost_per_1m_tokens=15.0,
         ),
-        failures=1,
+        base_url="https://paid-model.example/v1",
     )
+    client = _TransientFailureChatClient(route, failures=1)
 
     with pytest.raises(RuntimeError, match="model route failed"):
         client.chat([{"role": "user", "content": "return json"}])
@@ -221,7 +334,7 @@ class _MissingUsageChatClient(_CapturingChatClient):
         *,
         anthropic: bool = False,
     ) -> dict[str, object]:
-        assert url == "http://model.test/v1/chat/completions"
+        assert url == "http://127.0.0.1:9999/v1/chat/completions"
         assert anthropic is False
         self.request_body = body
         return {
@@ -229,6 +342,50 @@ class _MissingUsageChatClient(_CapturingChatClient):
             "model": "stub-returned-model",
             "choices": [{"message": {"content": '{"action":"final","summary":"done"}'}}],
         }
+
+
+class _CapturingAnthropicChatClient(ChatClient):
+    response_model = "claude-haiku-4-5-20251001"
+    cache_creation_input_tokens = 0
+
+    def _post_json(
+        self,
+        url: str,
+        body: Mapping[str, object],
+        *,
+        anthropic: bool = False,
+    ) -> dict[str, object]:
+        assert url == "https://api.anthropic.com/v1/messages"
+        assert anthropic is True
+        assert body["model"] == self.route.model
+        return {
+            "id": "msg_test",
+            "model": self.response_model,
+            "content": [{"type": "text", "text": '{"action":"final"}'}],
+            "usage": {
+                "input_tokens": 100,
+                "cache_read_input_tokens": 900,
+                "cache_creation_input_tokens": self.cache_creation_input_tokens,
+                "output_tokens": 100,
+            },
+        }
+
+
+class _NeverDispatchChatClient(ChatClient):
+    def __init__(self, route: ResolvedModelRoute) -> None:
+        super().__init__(route)
+        self.dispatch_count = 0
+
+    def _post_json(
+        self,
+        url: str,
+        body: Mapping[str, object],
+        *,
+        anthropic: bool = False,
+    ) -> dict[str, object]:
+        del url, body, anthropic
+        self.dispatch_count += 1
+        return {}
 
 
 class _TransientFailureChatClient(_CapturingChatClient):
@@ -261,9 +418,9 @@ def _route(
         requested_tier="mid",
         selected_tier="mid",
         ordinal=0,
-        provider="custom_openai",
+        provider="ollama",
         model="stub",
-        base_url="http://model.test/v1",
+        base_url="http://127.0.0.1:9999/v1",
         api_key_env=None,
         missing_env=(),
         reasoning_effort=None,

@@ -12,6 +12,7 @@ from typing import cast
 
 import pytest
 import yaml  # type: ignore[import-untyped]
+from ravage.model_core.providers import load_model_registry, resolve_model_routes
 from ravage.run_data.brief import load_engagement_brief
 from ravage.traffic import (
     RequestIntent,
@@ -57,6 +58,7 @@ from ravage.xben_parts.runner import (
     _case_run_identity,
     _CasePaths,
     _CaseRunIdentity,
+    _has_paid_model_risk,
     _remaining_cost_budget,
     _require_autonomous_runtime_cleanup,
     _require_scoped_tool_network_evidence,
@@ -97,6 +99,19 @@ def _healthy_docker_image_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
             "error": None,
         },
     )
+
+
+def test_xben_treats_remote_endpoint_under_local_provider_label_as_paid_risk() -> None:
+    env = {"OLLAMA_BASE_URL": "https://paid-model.example/v1"}
+    registry = load_model_registry(env=env)
+    route = resolve_model_routes(
+        registry,
+        profile_name="local-ollama",
+        tier="mid",
+        env=env,
+    )[0]
+
+    assert _has_paid_model_risk((route,))
 
 
 def _write_case(
@@ -1215,6 +1230,7 @@ profiles:
           model: gpt-test
           api_key_required: false
           input_cost_per_1m_tokens: 1.0
+          cached_input_cost_per_1m_tokens: 1.0
           output_cost_per_1m_tokens: 2.0
           output_token_limit_parameter: max_completion_tokens
 """.lstrip(),
@@ -1298,6 +1314,7 @@ profiles:
           model: gpt-test
           api_key_required: false
           input_cost_per_1m_tokens: 1.0
+          cached_input_cost_per_1m_tokens: 1.0
           output_cost_per_1m_tokens: 2.0
 """.lstrip(),
         encoding="utf-8",

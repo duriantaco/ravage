@@ -336,6 +336,35 @@ async def test_paid_unknown_cost_reply_is_recorded_as_non_retryable_failure() ->
     assert events[1]["payload"] == failure_payload
 
 
+@pytest.mark.parametrize("provider", ["ollama", "custom_openai"])
+@pytest.mark.asyncio
+async def test_credentialless_remote_route_cannot_bypass_graph_cost_accounting(
+    provider: str,
+) -> None:
+    client = RecordingClient(cost_known=False)
+    route = replace(
+        _route(provider=provider),
+        base_url="https://paid-model.example/v1",
+        input_cost_per_1m_tokens=1.0,
+        cached_input_cost_per_1m_tokens=1.0,
+        output_cost_per_1m_tokens=2.0,
+    )
+    model = AccountedGraphModel(
+        client=client,
+        route=route,
+        audit=RecordingAudit(),
+        engagement_id=ENGAGEMENT_ID,
+    )
+
+    with pytest.raises(RuntimeError, match="cannot be cost-accounted"):
+        await model(
+            "node-001",
+            [{"role": "user", "content": "return one action"}],
+        )
+
+    assert len(client.calls) == 1
+
+
 @pytest.mark.asyncio
 async def test_local_model_may_report_unknown_cost_without_hiding_request() -> None:
     client = RecordingClient(cost_known=False)

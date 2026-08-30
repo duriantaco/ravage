@@ -646,6 +646,7 @@ def test_cli_init_writes_env_and_brief(
     output = capsys.readouterr().out
     assert "OPENAI_API_KEY=" in env_text
     assert "RAVAGE_OPENAI_LOW_MODEL=gpt-5.4-mini-2026-03-17" in env_text
+    assert "RAVAGE_ANTHROPIC_LOW_MODEL=claude-haiku-4-5-20251001" in env_text
     assert payload["scope"]["in_scope"] == ["http://127.0.0.1:8080"]
     assert payload["objectives"] == ["web_application_assessment"]
     assert payload["context"]["description"].startswith("TODO:")
@@ -1175,6 +1176,51 @@ def test_setup_check_probes_ready_local_model_route(
             "required": True,
         }
     ]
+
+
+def test_setup_check_explains_unpriced_paid_route() -> None:
+    diagnostic = cli._setup_model_check(  # noqa: SLF001
+        model_config=None,
+        model_profile="universal-litellm",
+        model_tier="mid",
+        env_file=None,
+    )
+
+    assert diagnostic["status"] == "fail"
+    assert "missing pricing" in str(diagnostic["detail"])
+    assert "cached_input_cost_per_1m_tokens" in str(diagnostic["detail"])
+    assert "explicit current token prices" in str(diagnostic["fix"])
+
+
+def test_setup_check_explains_unsupported_direct_provider(tmp_path: Path) -> None:
+    model_config = tmp_path / "models.yaml"
+    model_config.write_text(
+        """
+profiles:
+  unsupported:
+    routes:
+      mid:
+        - provider: gemini
+          model: gemini-model
+          base_url: https://generativelanguage.googleapis.com/v1beta
+          api_key_required: false
+          input_cost_per_1m_tokens: 1.0
+          cached_input_cost_per_1m_tokens: 1.0
+          output_cost_per_1m_tokens: 2.0
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    diagnostic = cli._setup_model_check(  # noqa: SLF001
+        model_config=model_config,
+        model_profile="unsupported",
+        model_tier="mid",
+        env_file=None,
+    )
+
+    assert diagnostic["status"] == "fail"
+    assert "unsupported model transport" in str(diagnostic["detail"])
+    assert "custom_openai/LiteLLM" in str(diagnostic["fix"])
 
 
 def test_cli_setup_check_detects_stale_entrypoint(tmp_path: Path) -> None:
@@ -2930,6 +2976,9 @@ profiles:
           model: cli-stub-model
           base_url: {server.base_url}
           api_key_required: false
+          input_cost_per_1m_tokens: 0.0
+          cached_input_cost_per_1m_tokens: 0.0
+          output_cost_per_1m_tokens: 0.0
 """.lstrip(),
             encoding="utf-8",
         )
@@ -3037,6 +3086,9 @@ profiles:
           model: cli-stub-model
           base_url: {server.base_url}
           api_key_required: false
+          input_cost_per_1m_tokens: 0.0
+          cached_input_cost_per_1m_tokens: 0.0
+          output_cost_per_1m_tokens: 0.0
 """.lstrip(),
             encoding="utf-8",
         )
