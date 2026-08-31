@@ -18,7 +18,12 @@ from ravage.probe_suite import (
     _probe_handlers,
 )
 from ravage.probe_suite_parts.result import ProbeRunResult
-from ravage.web_core.http_probe import MAX_BODY_BYTES, ProbeResponse, ProbeSession
+from ravage.web_core.http_probe import (
+    MAX_BODY_BYTES,
+    ProbeNetworkContext,
+    ProbeResponse,
+    ProbeSession,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -74,6 +79,7 @@ class BoundedGraphProbeSession(ProbeSession):
         out_of_scope: Sequence[str] = (),
         max_rps: float | None = None,
         resolver: Callable[[str, int], Sequence[str]] | None = None,
+        network_context: ProbeNetworkContext | None = None,
         _request_pacer: object | None = None,
         _dns_pins: dict[tuple[str, int], tuple[str, ...]] | None = None,
         _dns_pin_lock: threading.Lock | None = None,
@@ -89,10 +95,11 @@ class BoundedGraphProbeSession(ProbeSession):
             in_scope=in_scope,
             out_of_scope=out_of_scope,
             max_rps=max_rps,
-            resolver=resolver,
+            resolver=None if network_context is not None else resolver,
+            network_context=network_context,
             _request_pacer=_request_pacer,  # type: ignore[arg-type]
-            _dns_pins=_dns_pins,
-            _dns_pin_lock=_dns_pin_lock,
+            _dns_pins=None if network_context is not None else _dns_pins,
+            _dns_pin_lock=None if network_context is not None else _dns_pin_lock,
             traffic_observer=traffic_observer,
             traffic_policy_reference=traffic_policy_reference,
             max_body_bytes=max_body_bytes,
@@ -116,10 +123,8 @@ class BoundedGraphProbeSession(ProbeSession):
             in_scope=self.scope_in_scope,
             out_of_scope=self.scope_out_of_scope,
             max_rps=self.max_rps,
-            resolver=self._resolver,
+            network_context=self.network_context,
             _request_pacer=self._request_pacer,
-            _dns_pins=self._dns_pins,
-            _dns_pin_lock=self._dns_pin_lock,
             traffic_observer=self._traffic_observer,
             traffic_policy_reference=self.traffic_policy_reference(),
             max_body_bytes=self.max_body_bytes if max_body_bytes is None else max_body_bytes,

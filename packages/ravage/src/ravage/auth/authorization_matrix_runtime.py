@@ -7,7 +7,7 @@ from contextlib import suppress
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Never, Self, SupportsIndex
 
-from ravage.web_core.http_probe import ProbeResponse, ProbeSession
+from ravage.web_core.http_probe import ProbeNetworkContext, ProbeResponse, ProbeSession
 
 from .authorization_matrix import ANONYMOUS_ACTOR, AuthorizationMatrixRuntimeError
 from .configured import ConfiguredAuthenticationError
@@ -36,6 +36,7 @@ class ManagedAuthorizationMatrix:
         "__closed",
         "__identities",
         "__initial_traffic_snapshot",
+        "__network_context",
         "__owners",
         "__roles",
         "__traffic_policy",
@@ -49,7 +50,9 @@ class ManagedAuthorizationMatrix:
         anonymous_session: ProbeSession,
         traffic_policy: TrafficPolicyController,
         initial_traffic_snapshot: TrafficPolicySnapshot,
+        network_context: ProbeNetworkContext | None = None,
     ) -> None:
+        shared_network_context = network_context or anonymous_session.network_context
         normalized_owners = dict(owners)
         identities = tuple(sorted(normalized_owners))
         if len(identities) < 2:
@@ -68,6 +71,10 @@ class ManagedAuthorizationMatrix:
             raise AuthorizationMatrixRuntimeError(
                 "anonymous matrix traffic is not bound to the shared policy"
             )
+        if anonymous_session.network_context is not shared_network_context:
+            raise AuthorizationMatrixRuntimeError(
+                "anonymous matrix traffic is not bound to the shared network context"
+            )
         for alias, owner in normalized_owners.items():
             if owner.identity != alias:
                 raise AuthorizationMatrixRuntimeError(
@@ -79,6 +86,10 @@ class ManagedAuthorizationMatrix:
                 raise AuthorizationMatrixRuntimeError(
                     "authorization matrix identities do not share one traffic policy"
                 ) from exc
+            if owner.network_context is not shared_network_context:
+                raise AuthorizationMatrixRuntimeError(
+                    "authorization matrix identities do not share one network context"
+                )
 
         self.__owners = MappingProxyType(normalized_owners)
         self.__roles = MappingProxyType(
@@ -88,6 +99,7 @@ class ManagedAuthorizationMatrix:
         self.__anonymous_session = anonymous_session
         self.__traffic_policy = traffic_policy
         self.__initial_traffic_snapshot = initial_traffic_snapshot
+        self.__network_context = shared_network_context
         self.__closed = False
 
     @property
@@ -105,6 +117,21 @@ class ManagedAuthorizationMatrix:
             return self.__roles[identity_alias]
         except KeyError:
             raise AuthorizationMatrixRuntimeError("unknown authorization matrix identity") from None
+
+    def identity_generation(self, identity_alias: str | None) -> int:
+        """Return non-secret generation metadata for stability checks."""
+        self._require_open()
+        if identity_alias is None or identity_alias == _ANONYMOUS_IDENTITY:
+            return 0
+        try:
+            return self.__owners[identity_alias].identity_generation
+        except KeyError:
+            raise AuthorizationMatrixRuntimeError("unknown authorization matrix identity") from None
+
+    def in_scope(self, url: str) -> bool:
+        """Apply the exact shared session scope without exposing credentials."""
+        self._require_open()
+        return self.__anonymous_session.in_scope(url)
 
     def request(self, identity_alias: str | None, method: str, url: str) -> ProbeResponse:
         """Issue one GET without exposing or accepting authentication material."""
@@ -173,6 +200,7 @@ def build_managed_authorization_matrix(  # noqa: PLR0913
     max_rps: float | None,
     secret_resolver: SecretResolver,
     traffic_policy: TrafficPolicyController,
+    network_context: ProbeNetworkContext | None = None,
 ) -> ManagedAuthorizationMatrix:
     """Authenticate selected identities while retaining one global request ledger."""
     selected = tuple(sorted({str(alias).strip() for alias in identities if str(alias).strip()}))
@@ -194,6 +222,7 @@ def build_managed_authorization_matrix(  # noqa: PLR0913
         )
 
     initial_snapshot = traffic_policy.snapshot()
+    shared_network_context = network_context or ProbeNetworkContext()
     owners: dict[str, ManagedAttackAuthentication] = {}
     anonymous_session: ProbeSession | None = None
     try:
@@ -209,6 +238,7 @@ def build_managed_authorization_matrix(  # noqa: PLR0913
                 max_rps=max_rps,
                 secret_resolver=secret_resolver,
                 traffic_policy=traffic_policy,
+                network_context=shared_network_context,
             )
         anonymous_session = ProbeSession(
             target_url,
@@ -218,6 +248,7 @@ def build_managed_authorization_matrix(  # noqa: PLR0913
             out_of_scope=out_of_scope,
             max_rps=max_rps,
             traffic_policy=traffic_policy,
+            network_context=shared_network_context,
         )
         return ManagedAuthorizationMatrix(
             owners=owners,
@@ -225,6 +256,7 @@ def build_managed_authorization_matrix(  # noqa: PLR0913
             anonymous_session=anonymous_session,
             traffic_policy=traffic_policy,
             initial_traffic_snapshot=initial_snapshot,
+            network_context=shared_network_context,
         )
     except Exception:
         for owner in owners.values():
