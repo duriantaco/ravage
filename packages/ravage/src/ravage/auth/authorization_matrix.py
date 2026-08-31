@@ -899,6 +899,30 @@ def _snapshot_delta(
     )
 
 
+def traffic_policy_halted(
+    runtime: AuthorizationMatrixRuntime,
+    initial: TrafficPolicySnapshot,
+) -> bool:
+    """Return whether a shared authorization traffic policy stopped dispatch."""
+    return _traffic_policy_halted(runtime, initial)
+
+
+def traffic_policy_reason_codes(
+    initial: TrafficPolicySnapshot,
+    current: TrafficPolicySnapshot,
+) -> tuple[str, ...]:
+    """Return stable fail-closed reasons for unusable authorization traffic."""
+    return _traffic_policy_reason_codes(initial, current)
+
+
+def traffic_snapshot_delta(
+    initial: TrafficPolicySnapshot,
+    current: TrafficPolicySnapshot,
+) -> TrafficSnapshotDelta:
+    """Return the whole-run traffic counters added after ``initial``."""
+    return _snapshot_delta(initial, current)
+
+
 def _aggregate_verdict(results: Sequence[AuthorizationCaseResult]) -> AuthorizationVerdict:
     if any(result.verdict is AuthorizationVerdict.CONFIRMED_VIOLATION for result in results):
         return AuthorizationVerdict.CONFIRMED_VIOLATION
@@ -1003,4 +1027,7 @@ __all__ = [
     "load_authorization_matrix_plan",
     "parse_authorization_matrix_plan",
     "run_authorization_matrix",
+    "traffic_policy_halted",
+    "traffic_policy_reason_codes",
+    "traffic_snapshot_delta",
 ]

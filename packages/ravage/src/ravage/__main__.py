@@ -87,6 +87,7 @@ from ravage.auth import (
     read_environment_file,
     run_auth_preflight,
     run_authorization_matrix,
+    run_authorization_surface_map,
     scaffold_auth_identity,
 )
 from ravage.benchmark import BenchmarkOverrides, run_benchmark
@@ -813,7 +814,7 @@ def _top_level_help() -> None:
                 "  ravage code-bug BRIEF.yaml --skills PATH [attack/options]",
                 "  ravage code-bug xben --skills PATH [selection/options]",
                 "  ravage scan BRIEF.yaml [options]",
-                "  ravage auth {add,list,check,matrix} BRIEF.yaml",
+                "  ravage auth {add,list,check,map,matrix} BRIEF.yaml",
                 "  ravage traffic {capture,list,show,replay,diff}",
                 "  ravage xben [selection/options]",
                 "  ravage authbench [--json]",
@@ -1029,6 +1030,77 @@ def _auth(args: list[str]) -> None:
     )
     matrix.add_argument("--json", action="store_true", help="print the sanitized receipt")
 
+    surface_map = subparsers.add_parser(
+        "map",
+        help="compare discovered routes across isolated identities",
+        description=(
+            "Build a read-only, role-aware surface map. Differences are review "
+            "candidates, not confirmed vulnerabilities."
+        ),
+        epilog=(
+            "Example:\n"
+            "  ravage auth map ravage-brief.yaml --identity alice --identity bob "
+            "--env-file .env.ravage"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    surface_map.add_argument("brief", type=Path, help="engagement brief YAML")
+    surface_map.add_argument(
+        "--identity",
+        action="append",
+        dest="identities",
+        default=[],
+        help="configured identity to compare; repeatable; defaults to all",
+    )
+    surface_map.add_argument(
+        "--include-anonymous",
+        action="store_true",
+        help="also compare a separate anonymous actor",
+    )
+    surface_map.add_argument(
+        "--env-file",
+        type=Path,
+        help="secrets file; auto-detects .env.ravage when omitted",
+    )
+    surface_map.add_argument("--target-url", help="override the first HTTP(S) scoped target")
+    surface_map.add_argument(
+        "--run-dir",
+        type=Path,
+        help="fresh private output directory; defaults below runs/",
+    )
+    surface_map.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=10,
+        help="1-60 seconds per request; defaults to 10",
+    )
+    surface_map.add_argument(
+        "--max-urls",
+        type=int,
+        default=8,
+        help="bounded union frontier; 1-50, defaults to 8",
+    )
+    surface_map.add_argument(
+        "--max-physical-requests",
+        type=int,
+        default=200,
+        help="whole-run cap including login and health checks; defaults to 200",
+    )
+    surface_map.add_argument(
+        "--traffic-max-rps",
+        type=float,
+        default=0.5,
+        help="whole-run dispatch rate below 1 RPS; defaults to 0.5",
+    )
+    surface_map.add_argument(
+        "--allow-remote-target",
+        "--authorized-remote-target",
+        dest="allow_remote_target",
+        action="store_true",
+        help="confirm explicit authorization to map a remote target",
+    )
+    surface_map.add_argument("--json", action="store_true", help="print the sanitized receipt")
+
     parsed = parser.parse_args(args)
     if parsed.command == "add":
         _auth_add(add, parsed)
@@ -1038,6 +1110,9 @@ def _auth(args: list[str]) -> None:
         return
     if parsed.command == "check":
         _auth_check(check, parsed)
+        return
+    if parsed.command == "map":
+        _auth_map(surface_map, parsed)
         return
     _auth_matrix(matrix, parsed)
 
@@ -1229,6 +1304,150 @@ def _auth_check(parser: argparse.ArgumentParser, parsed: argparse.Namespace) -> 
                 include_check=False,
             )
     if not result.passed:
+        raise SystemExit(1)
+
+
+def _auth_map(parser: argparse.ArgumentParser, parsed: argparse.Namespace) -> None:
+    brief = _load_engagement_brief_for_cli(parser, parsed.brief)
+    authentication = brief.authentication
+    if authentication is None or len(authentication.identities) < 2:
+        parser.error("authorization surface map requires at least two configured identities")
+    configured_identities = tuple(
+        identity.alias for identity in authentication.identities
+    )
+    selected_identities = tuple(
+        sorted(
+            {
+                str(alias).strip()
+                for alias in (parsed.identities or configured_identities)
+                if str(alias).strip()
+            }
+        )
+    )
+    if len(selected_identities) < 2:
+        parser.error("authorization surface map requires at least two configured identities")
+    unknown_identities = tuple(
+        alias for alias in selected_identities if alias not in configured_identities
+    )
+    if unknown_identities:
+        parser.error("authorization surface map contains an unknown configured identity")
+
+    target_url = _target_url_from_brief(parsed.brief, explicit=parsed.target_url)
+    if not is_local_url(target_url) and not parsed.allow_remote_target:
+        parser.error("remote targets require --authorized-remote-target")
+    try:
+        assert_authorized_target(
+            target_url,
+            scope=brief.scope,
+            allow_remote_target=parsed.allow_remote_target,
+            agent_name="authorization surface map",
+        )
+    except ValueError:
+        parser.error("authorization surface target is invalid or outside engagement scope")
+
+    if not 1 <= parsed.timeout_seconds <= 60:
+        parser.error("--timeout-seconds must be between 1 and 60")
+    if not 1 <= parsed.max_urls <= 50:
+        parser.error("--max-urls must be between 1 and 50")
+    parsed.traffic_policy = "low-noise"
+    _resolve_traffic_policy_args(
+        parser,
+        parsed,
+        default_mode="low-noise",
+        roe_max_rps=brief.roe.max_rps,
+    )
+
+    env_file = parsed.env_file or _discover_auth_env_file(parsed.brief)
+    try:
+        secret_resolver = environment_secret_resolver(env_file=env_file)
+    except EnvironmentFileError as exc:
+        parser.error(f"cannot load authentication secrets: {_concise_cli_error(exc)}")
+
+    run_dir = parsed.run_dir or _default_run_dir(parsed.brief, "auth-surface-map")
+    if run_dir.exists() or run_dir.is_symlink():
+        parser.error("authorization surface run directory must be new and empty")
+    try:
+        run_dir.mkdir(parents=True, mode=0o700)
+        run_dir.chmod(0o700)
+        traffic_policy = TrafficPolicyController.open(
+            run_dir / "traffic-policy.json",
+            target_url=target_url,
+            config=_traffic_policy_config(parsed),
+        )
+    except (OSError, TrafficPolicyError, ValueError) as exc:
+        parser.error(f"cannot initialize authorization surface map: {_concise_cli_error(exc)}")
+
+    try:
+        with build_managed_authorization_matrix(
+            config=authentication,
+            target_url=target_url,
+            identities=selected_identities,
+            timeout_seconds=parsed.timeout_seconds,
+            allow_remote_target=parsed.allow_remote_target,
+            in_scope=brief.scope.in_scope,
+            out_of_scope=brief.scope.out_of_scope,
+            max_rps=float(parsed.traffic_max_rps),
+            secret_resolver=secret_resolver,
+            traffic_policy=traffic_policy,
+        ) as runtime:
+            result = run_authorization_surface_map(
+                target_url,
+                runtime=runtime,
+                include_anonymous=parsed.include_anonymous,
+                max_urls=parsed.max_urls,
+            )
+    except (
+        AuthorizationMatrixRuntimeError,
+        ConfiguredAuthenticationError,
+        SecretResolutionError,
+        SessionError,
+        ValueError,
+    ) as exc:
+        parser.error(f"authorization surface map could not run: {_concise_cli_error(exc)}")
+
+    receipt_path = run_dir / "authorization-surface-map.json"
+    try:
+        _atomic_write_cli_text(
+            receipt_path,
+            json.dumps(result.to_json(), indent=2, sort_keys=True) + "\n",
+            mode=0o600,
+        )
+    except OSError as exc:
+        parser.error(f"cannot write authorization surface receipt: {_concise_cli_error(exc)}")
+
+    if parsed.json:
+        _write_line(json.dumps(result.to_json(), indent=2, sort_keys=True))
+    else:
+        _write_line(banner("AUTH SURFACE MAP", "role-aware read-only discovery"))
+        _write_line(f"{'target':<12}{redacted_target_url(target_url)}")
+        state = badge("complete", "ok") if result.complete else badge("incomplete", "warn")
+        _write_line(f"{state} {len(result.candidates)} review candidates")
+        for actor in result.actors:
+            _write_line(
+                f"{'actor':<12}{actor.actor} · {actor.mapped_url_count} URLs · "
+                f"{actor.observation_count} observations"
+            )
+        for candidate in result.candidates:
+            reasons = ", ".join(candidate.reason_codes)
+            _write_line(
+                f"{badge('candidate', 'warn')} {candidate.method} "
+                f"{candidate.route_shape} · {reasons}"
+            )
+        if result.coverage_limited:
+            coverage = ", ".join(result.coverage_reason_codes)
+            _write_line(f"{badge('coverage limited', 'warn')} {coverage}")
+        traffic = result.traffic_delta
+        _write_line(
+            f"{'traffic':<12}{traffic.physical_request_count} physical requests · "
+            f"accounting={traffic.current_accounting_status}"
+        )
+        _write_line(f"{badge('receipt', 'info')} {receipt_path} · mode=0600")
+        _write_line(
+            f"{badge('next', 'info')} Candidates are not vulnerabilities. "
+            "Confirm a known resource with `ravage auth matrix`."
+        )
+
+    if not result.complete:
         raise SystemExit(1)
 
 

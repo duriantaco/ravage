@@ -11,7 +11,7 @@ from http.cookiejar import Cookie
 from pathlib import Path
 from typing import TYPE_CHECKING, Never, Self, SupportsIndex
 
-from ravage.web_core.http_probe import ProbeResponse, ProbeSession
+from ravage.web_core.http_probe import ProbeNetworkContext, ProbeResponse, ProbeSession
 
 from .configured import (
     ConfiguredAuthenticationError,
@@ -107,6 +107,18 @@ class ManagedAttackAuthentication:
     @property
     def identity(self) -> str:
         return self.__identity
+
+    @property
+    def identity_generation(self) -> int:
+        """Return non-secret session generation metadata for paired comparisons."""
+        with self.__lock:
+            return self.__handle.generation
+
+    @property
+    def network_context(self) -> ProbeNetworkContext:
+        """Return the shared resolver and DNS pin context retained by this identity."""
+        with self.__lock:
+            return self.__handle.session.network_context
 
     @property
     def traffic_policy(self) -> TrafficPolicyController | None:
@@ -591,6 +603,7 @@ def build_authenticated_attack_runtime(  # noqa: PLR0913 - explicit public build
     secret_resolver: SecretResolver,
     traffic_policy: TrafficPolicyController | None = None,
     traffic_policy_reference: dict[str, object] | None = None,
+    network_context: ProbeNetworkContext | None = None,
 ) -> ManagedAttackAuthentication:
     """Build and authenticate one attack identity without mutating secret sources."""
     assert_secure_configured_auth_transport(
@@ -616,6 +629,7 @@ def build_authenticated_attack_runtime(  # noqa: PLR0913 - explicit public build
         in_scope=in_scope,
         out_of_scope=out_of_scope,
         max_rps=max_rps,
+        network_context=network_context,
         traffic_policy=traffic_policy,
         traffic_policy_reference=traffic_policy_reference,
     )

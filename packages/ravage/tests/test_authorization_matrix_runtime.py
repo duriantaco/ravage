@@ -35,7 +35,7 @@ from ravage.traffic.policy import (
     TrafficPolicyController,
     TrafficPolicyMode,
 )
-from ravage.web_core.http_probe import ProbeResponse
+from ravage.web_core.http_probe import ProbeNetworkContext, ProbeResponse
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -48,12 +48,16 @@ _OWNER_SECRET = "owner-secret-must-not-escape"  # noqa: S105 - redaction sentine
 _ANONYMOUS_SECRET = "anonymous-secret-must-not-escape"  # noqa: S105 - redaction sentinel.
 _BUILT_OWNER_COUNT = 2
 _END_TO_END_REQUEST_COUNT = 9
+_ALICE_GENERATION = 3
+_BOB_GENERATION = 7
 
 
 @dataclass
 class _StubOwner:
     identity: str
     traffic_policy: TrafficPolicyController
+    network_context: ProbeNetworkContext | None = None
+    identity_generation: int = 1
     secret: str = _OWNER_SECRET
     close_error: Exception | None = None
     requests: list[tuple[str, str]] = field(default_factory=list)
@@ -77,6 +81,7 @@ class _StubOwner:
 @dataclass
 class _StubSession:
     traffic_policy: TrafficPolicyController
+    network_context: ProbeNetworkContext | None = None
     secret: str = _ANONYMOUS_SECRET
     requests: list[tuple[str, str]] = field(default_factory=list)
     default_headers: dict[str, str] = field(
@@ -91,8 +96,9 @@ class _StubSession:
 
 def test_constructor_requires_two_identities_and_matching_role_keys(tmp_path: Path) -> None:
     policy = _traffic_policy(tmp_path)
-    anonymous = _StubSession(policy)
-    alice = _StubOwner("alice", policy)
+    network_context = ProbeNetworkContext()
+    anonymous = _StubSession(policy, network_context=network_context)
+    alice = _StubOwner("alice", policy, network_context=network_context)
 
     with pytest.raises(AuthorizationMatrixRuntimeError, match="at least two"):
         ManagedAuthorizationMatrix(
@@ -101,9 +107,10 @@ def test_constructor_requires_two_identities_and_matching_role_keys(tmp_path: Pa
             anonymous_session=anonymous,  # type: ignore[arg-type]
             traffic_policy=policy,
             initial_traffic_snapshot=policy.snapshot(),
+            network_context=network_context,
         )
 
-    bob = _StubOwner("bob", policy)
+    bob = _StubOwner("bob", policy, network_context=network_context)
     with pytest.raises(AuthorizationMatrixRuntimeError, match="roles do not match"):
         ManagedAuthorizationMatrix(
             owners={"alice": alice, "bob": bob},
@@ -111,6 +118,7 @@ def test_constructor_requires_two_identities_and_matching_role_keys(tmp_path: Pa
             anonymous_session=anonymous,  # type: ignore[arg-type]
             traffic_policy=policy,
             initial_traffic_snapshot=policy.snapshot(),
+            network_context=network_context,
         )
 
 
@@ -120,17 +128,26 @@ def test_constructor_rejects_reserved_identity_aliases(
     reserved_alias: str,
 ) -> None:
     policy = _traffic_policy(tmp_path)
+    network_context = ProbeNetworkContext()
 
     with pytest.raises(AuthorizationMatrixRuntimeError, match="reserved anonymous alias"):
         ManagedAuthorizationMatrix(
             owners={
-                "alice": _StubOwner("alice", policy),
-                reserved_alias: _StubOwner(reserved_alias, policy),
+                "alice": _StubOwner("alice", policy, network_context=network_context),
+                reserved_alias: _StubOwner(
+                    reserved_alias,
+                    policy,
+                    network_context=network_context,
+                ),
             },
             roles={"alice": ("member",), reserved_alias: ("guest",)},
-            anonymous_session=_StubSession(policy),  # type: ignore[arg-type]
+            anonymous_session=_StubSession(  # type: ignore[arg-type]
+                policy,
+                network_context=network_context,
+            ),
             traffic_policy=policy,
             initial_traffic_snapshot=policy.snapshot(),
+            network_context=network_context,
         )
 
 
@@ -162,6 +179,31 @@ def test_constructor_rejects_owner_and_anonymous_policy_mismatches(tmp_path: Pat
 
     with pytest.raises(AuthorizationMatrixRuntimeError, match="anonymous matrix traffic"):
         _matrix(policy, anonymous_session=_StubSession(other_policy))
+
+
+def test_constructor_rejects_owner_and_anonymous_network_context_mismatches(
+    tmp_path: Path,
+) -> None:
+    policy = _traffic_policy(tmp_path)
+    shared = ProbeNetworkContext()
+    other = ProbeNetworkContext()
+
+    with pytest.raises(AuthorizationMatrixRuntimeError, match="identities do not share"):
+        _matrix(
+            policy,
+            owners={
+                "alice": _StubOwner("alice", policy, network_context=shared),
+                "bob": _StubOwner("bob", policy, network_context=other),
+            },
+            network_context=shared,
+        )
+
+    with pytest.raises(AuthorizationMatrixRuntimeError, match="anonymous matrix traffic"):
+        _matrix(
+            policy,
+            anonymous_session=_StubSession(policy, network_context=other),
+            network_context=shared,
+        )
 
 
 def test_requests_route_to_configured_and_anonymous_lanes(tmp_path: Path) -> None:
@@ -219,6 +261,32 @@ def test_roles_are_normalized_and_fail_closed_for_unknown_aliases(tmp_path: Path
     assert runtime.roles("anonymous") == ()
     with pytest.raises(AuthorizationMatrixRuntimeError, match="unknown authorization"):
         runtime.roles("mallory")
+
+
+def test_identity_generations_are_exposed_without_credentials(tmp_path: Path) -> None:
+    policy = _traffic_policy(tmp_path)
+    runtime = _matrix(
+        policy,
+        owners={
+            "alice": _StubOwner(
+                "alice",
+                policy,
+                identity_generation=_ALICE_GENERATION,
+            ),
+            "bob": _StubOwner(
+                "bob",
+                policy,
+                identity_generation=_BOB_GENERATION,
+            ),
+        },
+    )
+
+    assert runtime.identity_generation("alice") == _ALICE_GENERATION
+    assert runtime.identity_generation("bob") == _BOB_GENERATION
+    assert runtime.identity_generation(None) == 0
+    assert runtime.identity_generation("anonymous") == 0
+    with pytest.raises(AuthorizationMatrixRuntimeError, match="unknown authorization"):
+        runtime.identity_generation("mallory")
 
 
 def test_initial_snapshot_is_stable_and_current_snapshot_is_live(tmp_path: Path) -> None:
@@ -334,23 +402,36 @@ def test_builder_selects_roles_shares_controller_and_snapshots_before_owners(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     policy = _traffic_policy(tmp_path)
+    network_context = ProbeNetworkContext()
     owner_calls: list[tuple[str, TrafficPolicyController]] = []
     anonymous_calls: list[TrafficPolicyController] = []
-    anonymous = _StubSession(policy)
+    owner_network_contexts: list[ProbeNetworkContext] = []
+    anonymous_network_contexts: list[ProbeNetworkContext] = []
+    anonymous = _StubSession(policy, network_context=network_context)
 
     def fake_build(**kwargs: object) -> _StubOwner:
         identity = kwargs["identity"]
         candidate = kwargs["traffic_policy"]
+        candidate_network_context = kwargs["network_context"]
         assert isinstance(identity, str)
         assert isinstance(candidate, TrafficPolicyController)
+        assert isinstance(candidate_network_context, ProbeNetworkContext)
         owner_calls.append((identity, candidate))
+        owner_network_contexts.append(candidate_network_context)
         candidate.record_unmetered_action()
-        return _StubOwner(identity, candidate)
+        return _StubOwner(
+            identity,
+            candidate,
+            network_context=candidate_network_context,
+        )
 
     def fake_probe_session(_target_url: str, **kwargs: object) -> _StubSession:
         candidate = kwargs["traffic_policy"]
+        candidate_network_context = kwargs["network_context"]
         assert isinstance(candidate, TrafficPolicyController)
+        assert isinstance(candidate_network_context, ProbeNetworkContext)
         anonymous_calls.append(candidate)
+        anonymous_network_contexts.append(candidate_network_context)
         return anonymous
 
     monkeypatch.setattr(matrix_runtime, "build_authenticated_attack_runtime", fake_build)
@@ -360,6 +441,7 @@ def test_builder_selects_roles_shares_controller_and_snapshots_before_owners(
         config=_authentication_config(),
         identities=(" bob ", "alice", "bob"),
         policy=policy,
+        network_context=network_context,
     )
 
     assert runtime.identities == ("alice", "bob")
@@ -368,6 +450,8 @@ def test_builder_selects_roles_shares_controller_and_snapshots_before_owners(
     assert [alias for alias, _candidate in owner_calls] == ["alice", "bob"]
     assert all(candidate is policy for _alias, candidate in owner_calls)
     assert anonymous_calls == [policy]
+    assert owner_network_contexts == [network_context, network_context]
+    assert anonymous_network_contexts == [network_context]
     assert runtime.initial_traffic_snapshot.unmetered_action_count == 0
     assert runtime.traffic_snapshot().unmetered_action_count == _BUILT_OWNER_COUNT
     runtime.close()
@@ -384,12 +468,15 @@ def test_builder_closes_partial_owners_when_later_construction_fails(
     def fake_build(**kwargs: object) -> _StubOwner:
         identity = kwargs["identity"]
         candidate = kwargs["traffic_policy"]
+        network_context = kwargs["network_context"]
         assert isinstance(identity, str)
         assert candidate is policy
+        assert isinstance(network_context, ProbeNetworkContext)
         calls.append(identity)
         if identity == "bob":
             message = "owner build exploded"
             raise RuntimeError(message)
+        alice.network_context = network_context
         return alice
 
     def unexpected_probe_session(*_args: object, **_kwargs: object) -> None:
@@ -528,13 +615,14 @@ def test_real_managed_runtime_keeps_bearer_identities_isolated_end_to_end(
     ]
 
 
-def _matrix(
+def _matrix(  # noqa: PLR0913 - explicit fault injection for constructor invariants.
     policy: TrafficPolicyController,
     *,
     owners: Mapping[str, _StubOwner] | None = None,
     roles: Mapping[str, tuple[str, ...]] | None = None,
     anonymous_session: _StubSession | None = None,
     initial_snapshot: object | None = None,
+    network_context: ProbeNetworkContext | None = None,
 ) -> ManagedAuthorizationMatrix:
     selected_owners = dict(
         owners
@@ -543,14 +631,33 @@ def _matrix(
             "bob": _StubOwner("bob", policy),
         }
     )
+    shared_network_context = network_context or next(
+        (
+            owner.network_context
+            for owner in selected_owners.values()
+            if owner.network_context is not None
+        ),
+        None,
+    )
+    if shared_network_context is None and anonymous_session is not None:
+        shared_network_context = anonymous_session.network_context
+    if shared_network_context is None:
+        shared_network_context = ProbeNetworkContext()
+    for owner in selected_owners.values():
+        if owner.network_context is None:
+            owner.network_context = shared_network_context
+    selected_anonymous = anonymous_session or _StubSession(policy)
+    if selected_anonymous.network_context is None:
+        selected_anonymous.network_context = shared_network_context
     selected_roles = roles or dict.fromkeys(selected_owners, ("member",))
     snapshot = policy.snapshot() if initial_snapshot is None else initial_snapshot
     return ManagedAuthorizationMatrix(
         owners=selected_owners,  # type: ignore[arg-type]
         roles=selected_roles,
-        anonymous_session=anonymous_session or _StubSession(policy),  # type: ignore[arg-type]
+        anonymous_session=selected_anonymous,  # type: ignore[arg-type]
         traffic_policy=policy,
         initial_traffic_snapshot=snapshot,  # type: ignore[arg-type]
+        network_context=shared_network_context,
     )
 
 
@@ -559,6 +666,7 @@ def _build(
     config: AuthenticationConfig,
     identities: Sequence[str],
     policy: TrafficPolicyController,
+    network_context: ProbeNetworkContext | None = None,
 ) -> ManagedAuthorizationMatrix:
     return build_managed_authorization_matrix(
         config=config,
@@ -571,6 +679,7 @@ def _build(
         max_rps=5,
         secret_resolver=MappingSecretResolver({}, provider="test"),
         traffic_policy=policy,
+        network_context=network_context,
     )
 
 

@@ -7,13 +7,14 @@ from email.message import Message
 from http.client import HTTPException, IncompleteRead
 from http.cookiejar import Cookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Thread
+from threading import Barrier, Lock, Thread
 from typing import cast
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request
 
 import pytest
 from ravage.web_core.http_probe import (
+    ProbeNetworkContext,
     ProbeResponse,
     ProbeSession,
     _connect_pinned_socket,
@@ -193,6 +194,113 @@ def test_remote_probe_enforces_path_scope_and_dns_pin(monkeypatch) -> None:
     assert allowed.status == 302
     assert "outside target origin" in denied.error
     assert "changed after pinning" in changed.error
+
+
+def test_network_context_shares_dns_pin_across_isolated_sessions_without_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ravage.web_core.http_probe.build_opener", lambda *_handlers: _FakeOpener())
+    answers = iter((("203.0.113.25",), ("203.0.113.26",)))
+    resolver_calls: list[tuple[str, int]] = []
+
+    def resolver(host: str, port: int) -> tuple[str, ...]:
+        resolver_calls.append((host, port))
+        return next(answers)
+
+    network_context = ProbeNetworkContext(resolver)
+    first = ProbeSession(
+        "https://staging.example.test/",
+        allow_remote_target=True,
+        network_context=network_context,
+    )
+    second = ProbeSession(
+        "https://staging.example.test/",
+        allow_remote_target=True,
+        network_context=network_context,
+    )
+
+    first_response = first.get("/first")
+    second_response = second.get("/second")
+
+    assert first.network_context is network_context
+    assert second.network_context is network_context
+    assert first_response.status == _FakeResponse.status
+    assert second_response.status is None
+    assert "changed after pinning" in second_response.error
+    assert resolver_calls == [
+        ("staging.example.test", 443),
+        ("staging.example.test", 443),
+    ]
+
+
+def test_network_context_accepts_dns_reordering_but_never_races_pin_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ravage.web_core.http_probe.build_opener", lambda *_handlers: _FakeOpener())
+    reordered = iter(
+        (
+            ("203.0.113.25", "203.0.113.26"),
+            ("203.0.113.26", "203.0.113.25"),
+        )
+    )
+    shared = ProbeNetworkContext(lambda _host, _port: next(reordered))
+    first = ProbeSession(
+        "https://staging.example.test/",
+        allow_remote_target=True,
+        network_context=shared,
+    )
+    second = ProbeSession(
+        "https://staging.example.test/",
+        allow_remote_target=True,
+        network_context=shared,
+    )
+
+    assert first.get("/first").status == _FakeResponse.status
+    assert second.get("/second").status == _FakeResponse.status
+
+    barrier = Barrier(2)
+    answer_lock = Lock()
+    answers = iter((("203.0.113.30",), ("203.0.113.31",)))
+
+    def racing_resolver(_host: str, _port: int) -> tuple[str, ...]:
+        with answer_lock:
+            answer = next(answers)
+        barrier.wait(timeout=2)
+        return answer
+
+    racing = ProbeNetworkContext(racing_resolver)
+    results: list[str] = []
+
+    def pin() -> None:
+        results.append(racing.pin("race.example.test", 443))
+
+    threads = (Thread(target=pin), Thread(target=pin))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert sorted(results) == ["", "remote target DNS resolution changed after pinning"]
+    assert racing.pinned_addresses("race.example.test", 443) in {
+        ("203.0.113.30",),
+        ("203.0.113.31",),
+    }
+
+
+def test_probe_forks_retain_network_context_and_mixed_dns_configuration_is_rejected() -> None:
+    network_context = ProbeNetworkContext(lambda _host, _port: ("127.0.0.1",))
+    session = ProbeSession(
+        "http://127.0.0.1:8000/",
+        network_context=network_context,
+    )
+
+    assert session.fork().network_context is network_context
+    with pytest.raises(ValueError, match="cannot be combined"):
+        ProbeSession(
+            "http://127.0.0.1:8000/",
+            resolver=lambda _host, _port: ("127.0.0.1",),
+            network_context=network_context,
+        )
 
 
 @pytest.mark.parametrize("address", ["0.0.0.0", "::", "::ffff:0.0.0.0"])

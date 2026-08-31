@@ -507,6 +507,53 @@ class ResponseDelta:
         }
 
 
+class ProbeNetworkContext:
+    """Share one resolver and immutable DNS pin set across isolated sessions."""
+
+    __slots__ = ("_lock", "_pins", "_resolver")
+
+    def __init__(
+        self,
+        resolver: Callable[[str, int], Sequence[str]] | None = None,
+        *,
+        _pins: dict[tuple[str, int], tuple[str, ...]] | None = None,
+        _lock: threading.Lock | None = None,
+    ) -> None:
+        self._resolver = resolver or _resolve_addresses
+        self._pins = _pins if _pins is not None else {}
+        self._lock = _lock or threading.Lock()
+
+    def pin(self, host: str, port: int) -> str:
+        """Resolve and freeze one address set, returning a stable error if unsafe."""
+        try:
+            resolved = self._resolver(host, port)
+            parsed_addresses = tuple(
+                _validated_connection_address(str(address).strip()) for address in resolved
+            )
+        except OSError as exc:
+            return f"remote target DNS resolution failed: {exc}"
+        except ValueError as exc:
+            return f"remote target DNS resolution rejected an address: {exc}"
+        addresses = tuple(sorted({str(address) for address in parsed_addresses}))
+        if not addresses:
+            return "remote target DNS resolution returned no addresses"
+        key = (host.lower(), port)
+        with self._lock:
+            pinned = self._pins.setdefault(key, addresses)
+            if pinned != addresses:
+                return "remote target DNS resolution changed after pinning"
+        return ""
+
+    def pinned_addresses(self, host: str, port: int) -> tuple[str, ...]:
+        """Return a frozen address set without exposing mutable pin storage."""
+        with self._lock:
+            addresses = self._pins.get((host.lower(), port))
+        if addresses is None:
+            message = "probe connection attempted before DNS pinning"
+            raise OSError(message)
+        return addresses
+
+
 class ProbeSession:
     def __init__(  # noqa: PLR0913
         self,
@@ -519,6 +566,7 @@ class ProbeSession:
         out_of_scope: Sequence[str] = (),
         max_rps: float | None = None,
         resolver: Callable[[str, int], Sequence[str]] | None = None,
+        network_context: ProbeNetworkContext | None = None,
         _request_pacer: _RequestPacer | None = None,
         _physical_request_counter: _SharedPhysicalRequestCounter | None = None,
         _dns_pins: dict[tuple[str, int], tuple[str, ...]] | None = None,
@@ -555,9 +603,17 @@ class ProbeSession:
         self._physical_request_counter = (
             _physical_request_counter or _SharedPhysicalRequestCounter()
         )
-        self._resolver = resolver or _resolve_addresses
-        self._dns_pins = _dns_pins if _dns_pins is not None else {}
-        self._dns_pin_lock = _dns_pin_lock or threading.Lock()
+        if network_context is not None and (
+            resolver is not None or _dns_pins is not None or _dns_pin_lock is not None
+        ):
+            raise ValueError(
+                "network_context cannot be combined with resolver or private DNS state"
+            )
+        self._network_context = network_context or ProbeNetworkContext(
+            resolver,
+            _pins=_dns_pins,
+            _lock=_dns_pin_lock,
+        )
         self._traffic_observer = traffic_observer
         if traffic_policy is not None and traffic_policy_reference is not None:
             raise ValueError("traffic_policy and traffic_policy_reference are mutually exclusive")
@@ -689,6 +745,10 @@ class ProbeSession:
         return self._traffic_policy.to_reference()
 
     @property
+    def network_context(self) -> ProbeNetworkContext:
+        return self._network_context
+
+    @property
     def managed_identity_generation(self) -> int | None:
         return self._managed_identity_generation
 
@@ -739,11 +799,9 @@ class ProbeSession:
             in_scope=self.scope_in_scope,
             out_of_scope=self.scope_out_of_scope,
             max_rps=self.max_rps,
-            resolver=self._resolver,
+            network_context=self._network_context,
             _request_pacer=self._request_pacer,
             _physical_request_counter=self._physical_request_counter,
-            _dns_pins=self._dns_pins,
-            _dns_pin_lock=self._dns_pin_lock,
             traffic_observer=self._traffic_observer,
             traffic_policy=self._traffic_policy,
             traffic_lane=self._traffic_lane,
@@ -1390,33 +1448,10 @@ class ProbeSession:
         parsed = urlsplit(url)
         host = parsed.hostname or ""
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        try:
-            resolved = self._resolver(host, port)
-            parsed_addresses = tuple(
-                _validated_connection_address(str(address).strip()) for address in resolved
-            )
-        except OSError as exc:
-            return f"remote target DNS resolution failed: {exc}"
-        except ValueError as exc:
-            return f"remote target DNS resolution rejected an address: {exc}"
-        addresses = tuple(sorted({str(address) for address in parsed_addresses}))
-        if not addresses:
-            return "remote target DNS resolution returned no addresses"
-        key = (host.lower(), port)
-        with self._dns_pin_lock:
-            pinned = self._dns_pins.setdefault(key, addresses)
-            if pinned != addresses:
-                return "remote target DNS resolution changed after pinning"
-        return ""
+        return self._network_context.pin(host, port)
 
     def _pinned_addresses_for_connection(self, host: str, port: int) -> tuple[str, ...]:
-        key = (host.lower(), port)
-        with self._dns_pin_lock:
-            addresses = self._dns_pins.get(key)
-        if addresses is None:
-            message = "probe connection attempted before DNS pinning"
-            raise OSError(message)
-        return addresses
+        return self._network_context.pinned_addresses(host, port)
 
 
 def _validated_timeout(value: object) -> float:

@@ -24,6 +24,16 @@ from .authorization_matrix_runtime import (
     ManagedAuthorizationMatrix,
     build_managed_authorization_matrix,
 )
+from .authorization_surface_map import (
+    AUTHORIZATION_SURFACE_MAP_RESULT_SCHEMA,
+    AuthorizationSurfaceAccessClass,
+    AuthorizationSurfaceActorResult,
+    AuthorizationSurfaceCandidate,
+    AuthorizationSurfaceCandidateActor,
+    AuthorizationSurfaceMapResult,
+    AuthorizationSurfaceMapRunner,
+    run_authorization_surface_map,
+)
 from .configured import (
     ConfiguredAuthenticationError,
     UnsupportedConfiguredAuthFlowError,
@@ -82,6 +92,7 @@ __all__ = [
     "ANONYMOUS_ACTOR",
     "AUTHORIZATION_MATRIX_PLAN_SCHEMA",
     "AUTHORIZATION_MATRIX_RESULT_SCHEMA",
+    "AUTHORIZATION_SURFACE_MAP_RESULT_SCHEMA",
     "AuthArtifactRedactor",
     "AuthPreflightResult",
     "AuthPreflightStage",
@@ -100,6 +111,12 @@ __all__ = [
     "AuthorizationMatrixRuntimeError",
     "AuthorizationObservation",
     "AuthorizationObservationOutcome",
+    "AuthorizationSurfaceAccessClass",
+    "AuthorizationSurfaceActorResult",
+    "AuthorizationSurfaceCandidate",
+    "AuthorizationSurfaceCandidateActor",
+    "AuthorizationSurfaceMapResult",
+    "AuthorizationSurfaceMapRunner",
     "AuthorizationVerdict",
     "ConfiguredAuthenticationError",
     "EnvironmentFileError",
@@ -143,5 +160,6 @@ __all__ = [
     "resolve_auth_url",
     "run_auth_preflight",
     "run_authorization_matrix",
+    "run_authorization_surface_map",
     "scaffold_auth_identity",
 ]

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import secrets
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from html.parser import HTMLParser
 from http.cookies import CookieError, Morsel, SimpleCookie
@@ -239,6 +239,39 @@ class _ParsedReconDocument:
     body_text: str
     query_parameter_names: list[str]
     interesting_markers: list[str]
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class PassiveReconParameter:
+    """One transient parameter name and location extracted without its value."""
+
+    name: str
+    location: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class PassiveReconOperation:
+    """One transient request declaration from an already-fetched document.
+
+    ``url`` can contain concrete identifiers and query values. Callers must keep
+    this object in memory and project it through the canonical surface graph
+    before writing, displaying, or logging it.
+    """
+
+    method: str
+    url: str
+    parameters: tuple[PassiveReconParameter, ...] = ()
+    header_names: tuple[str, ...] = ()
+    hints: tuple[str, ...] = ()
+    source_kind: str = "native_recon"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class PassiveReconDocument:
+    """Transient bounded navigation data without body, cookie, or field values."""
+
+    links: tuple[str, ...]
+    operations: tuple[PassiveReconOperation, ...]
 
 
 class _ReconHeaders:
@@ -861,6 +894,110 @@ def _parse_recon_document(
     )
 
 
+def parse_passive_recon_document(
+    final_url: str,
+    headers: Mapping[str, str],
+    body: bytes | str,
+) -> PassiveReconDocument:
+    """Extract transient navigation declarations without retaining field values.
+
+    This parser performs no I/O.  It deliberately omits response text, titles,
+    cookies, header values, form defaults, and JavaScript payload values. Exact
+    URLs remain transient and must never be serialized or logged directly.
+    """
+    document = _parse_recon_document(
+        final_url,
+        _ReconHeaders({str(name): str(value) for name, value in headers.items()}),
+        body,
+    )
+    operations: list[PassiveReconOperation] = []
+    page_url = _canonical_url(final_url)
+    links = tuple(item for item in sorted(set(document.links))[:128] if item != page_url)
+    for link in links:
+        operations.append(
+            PassiveReconOperation(
+                method="GET",
+                url=link,
+                parameters=tuple(
+                    PassiveReconParameter(name=name, location="query")
+                    for name in _query_names(link)[:32]
+                ),
+                hints=("link",),
+            )
+        )
+    for script in (item for item in sorted(set(document.scripts))[:64] if item != page_url):
+        operations.append(
+            PassiveReconOperation(
+                method="GET",
+                url=script,
+                parameters=tuple(
+                    PassiveReconParameter(name=name, location="query")
+                    for name in _query_names(script)[:32]
+                ),
+                hints=("script",),
+            )
+        )
+    for form in document.forms[:64]:
+        fields = tuple(
+            sorted({field.name for field in form.inputs[:64] if field.name and not field.disabled})
+        )
+        query_parameters = tuple(
+            PassiveReconParameter(name=name, location="query")
+            for name in _query_names(form.action)[:32]
+        )
+        form_parameters = tuple(
+            PassiveReconParameter(
+                name=name,
+                location="query" if form.method == "GET" else "form",
+            )
+            for name in fields[:64]
+        )
+        operations.append(
+            PassiveReconOperation(
+                method=form.method,
+                url=form.action,
+                parameters=tuple((*query_parameters, *form_parameters))[:64],
+                hints=("form",),
+            )
+        )
+    for template in document.request_templates[:64]:
+        template_fields = template.get("fields")
+        template_headers = template.get("headers")
+        template_url = urljoin(final_url, str(template.get("url") or ""))
+        query_parameters = tuple(
+            PassiveReconParameter(name=name, location="query")
+            for name in _query_names(template_url)[:32]
+        )
+        body_parameters = (
+            tuple(
+                PassiveReconParameter(name=name, location="body")
+                for name in sorted(
+                    str(raw_name) for raw_name in template_fields if str(raw_name).strip()
+                )
+            )
+            if isinstance(template_fields, Mapping)
+            else ()
+        )
+        operations.append(
+            PassiveReconOperation(
+                method=str(template.get("method") or "GET").strip().upper(),
+                url=template_url,
+                parameters=tuple((*query_parameters, *body_parameters))[:64],
+                header_names=(
+                    tuple(sorted(str(name) for name in template_headers if str(name).strip()))[:64]
+                    if isinstance(template_headers, Mapping)
+                    else ()
+                ),
+                hints=("javascript",),
+                source_kind="javascript_inline",
+            )
+        )
+    return PassiveReconDocument(
+        links=links,
+        operations=tuple(operations[:256]),
+    )
+
+
 def _looks_like_html(body_text: str, content_type: str) -> bool:
     content_type = content_type.lower()
     if "html" in content_type:
@@ -1469,9 +1606,13 @@ def _contains_any(text: str, words: Iterable[str]) -> bool:
 
 
 __all__ = [
+    "PassiveReconDocument",
+    "PassiveReconOperation",
+    "PassiveReconParameter",
     "ReconForm",
     "ReconInput",
     "ReconPage",
     "ReconResult",
+    "parse_passive_recon_document",
     "run_recon",
 ]
