@@ -135,6 +135,69 @@ ravage auth add ravage-brief.yaml \
 
 Set the generated `RAVAGE_PARTNER_API_KEY` value in `.env.ravage`.
 
+## Role-aware surface map
+
+`ravage auth map` compares a bounded route frontier across at least two
+configured identities. It is useful when one role exposes links or endpoints
+that another role does not show.
+
+Check every selected identity first, then run:
+
+```bash
+ravage auth map ravage-brief.yaml \
+  --identity alice \
+  --identity bob \
+  --include-anonymous
+```
+
+If `--identity` is omitted, Ravage uses every configured identity. Anonymous
+traffic is excluded unless `--include-anonymous` is present. Remote targets
+still require `--authorized-remote-target`.
+
+The mapper is deliberately narrow. It processes one deterministic
+breadth-first union frontier, measures a URL across every actor before going
+deeper, sends only `GET`, and repeats possible differences in reverse actor
+order. It never submits forms, guesses or increments IDs, mutates query values,
+executes JavaScript, launches a browser or external scanner, or automatically
+follows redirects. Safe same-origin redirects are admitted as separate metered
+frontier entries.
+
+Discovered query URLs, form actions, inline JavaScript requests, and
+state-changing-looking routes are recorded only as route shapes. They are not
+dispatched. By default the frontier is eight URLs, the whole run is capped at
+200 physical requests, and traffic is paced at 0.5 requests per second. Login,
+health checks, mapping requests, and any session refresh all use that same
+ledger. Use `--max-urls`, `--max-physical-requests`, and `--traffic-max-rps` to
+tighten those bounds.
+
+The private `authorization-surface-map.json` receipt contains the canonical
+surface graph, actor and role labels, response classes and statuses, coverage
+limits, candidate reason codes, and exact traffic totals. It does not contain
+exact URLs, response bodies, body hashes, cookies, header values, or raw query
+values. Recognized IDs and ambiguous path segments are replaced with
+placeholders; ordinary short route labels can remain so the map stays useful.
+All identities share one DNS answer set and fail closed if that set changes
+during the run.
+
+Two differences can become review candidates:
+
+- `identity_visibility_difference`: a stable operation shape was declared to
+  only some actors.
+- `response_access_class_difference`: stable repeated observations differed
+  between success, redirect, and safe denial classes.
+
+These are coverage clues, not vulnerabilities. The mapper does not infer an
+owner or the intended access policy, and a `200` response alone proves nothing.
+A candidate stays non-confirming even when the run is complete. Supply the
+known concrete URL, owner, expected actors, and a secret-backed response marker
+to `ravage auth matrix` for confirmation.
+
+An incomplete map exits with status 1. Authentication generation changes,
+unstable repeats, transport errors, truncation, `429`/`5xx` responses, a policy
+halt, reused or retried responses, unmetered traffic, or inexact accounting all
+prevent candidates from being marked review-ready. A completed but
+coverage-limited map exits successfully and lists the limits in its receipt.
+
 ## Authorization matrix
 
 `ravage auth matrix` compares a small set of known resource URLs across

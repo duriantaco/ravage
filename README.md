@@ -133,8 +133,23 @@ credentials stay inside the authenticated HTTP owner; process, Python, and
 command lanes are blocked when an identity is selected. See
 [Authentication](docs/authentication.md) for setup and limitations.
 
-With at least two configured identities, compare access to operator-supplied,
-read-only resources with a narrow authorization matrix:
+With at least two configured identities, first map which read-only routes each
+role can see:
+
+~~~bash
+ravage auth map ravage-brief.yaml \
+  --identity alice \
+  --identity bob \
+  --include-anonymous
+~~~
+
+The map follows a small, deterministic GET-only frontier across every selected
+identity. It records conservatively shaped routes and parameter names, not
+exact URLs, response bodies, or query values. Recognized IDs and ambiguous path
+segments become placeholders. A difference is only a review candidate; it is
+not a vulnerability claim.
+
+Confirm a reviewed, operator-supplied resource with the authorization matrix:
 
 ~~~bash
 ravage auth matrix ravage-brief.yaml authorization-matrix.yaml
@@ -143,8 +158,8 @@ ravage auth matrix ravage-brief.yaml authorization-matrix.yaml
 The plan names each explicit GET URL, its allowed and denied actors (including
 `anonymous`), and a secret-backed response marker. Ravage does not discover or
 guess resource IDs. See the
-[authorization matrix guide](docs/authentication.md#authorization-matrix) for
-the plan format, receipt boundary, and limitations.
+[authentication guide](docs/authentication.md#role-aware-surface-map) for map
+safety limits, the matrix plan format, receipt boundaries, and limitations.
 
 ## Authorized remote targets
 
@@ -216,7 +231,7 @@ model assertion as a confirmed finding.
 | --- | --- | --- |
 | Deterministic recon and probes | <code>ravage scan</code> | No model required |
 | Model-driven assessment | <code>ravage attack</code> | Evidence-gated and scoped |
-| Managed authentication | <code>ravage auth</code> | Form, bearer, static header |
+| Managed authentication | <code>ravage auth</code> | Sessions, role-aware map, authorization matrix |
 | Traffic inspection and replay | <code>ravage traffic</code> | Scoped artifacts |
 | Knowledge skills | <code>ravage skills</code>, <code>ravage code-bug</code> | Advisory |
 | Passive SATCOM inspection | <code>ravage satcom inspect</code> | No transmit |
