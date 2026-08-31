@@ -59,7 +59,11 @@ from ravage.agent_core.surface_graph_ingest import (
 from ravage.agent_knowledge import describe_knowledge_pack
 from ravage.agent_knowledge.cli import handle_skills_command
 from ravage.auth import (
+    ANONYMOUS_ACTOR,
     AuthArtifactRedactor,
+    AuthorizationMatrixPlanError,
+    AuthorizationMatrixRuntimeError,
+    AuthorizationVerdict,
     AuthScaffoldError,
     AuthScaffoldResult,
     ConfiguredAuthenticationError,
@@ -74,12 +78,15 @@ from ravage.auth import (
     SessionManager,
     assert_secure_configured_auth_transport,
     build_authenticated_attack_runtime,
+    build_managed_authorization_matrix,
     default_secret_environment_key,
     environment_secret_resolver,
     identity_profile_from_config,
     is_contextual_identity_secret_name,
+    load_authorization_matrix_plan,
     read_environment_file,
     run_auth_preflight,
+    run_authorization_matrix,
     scaffold_auth_identity,
 )
 from ravage.benchmark import BenchmarkOverrides, run_benchmark
@@ -194,7 +201,12 @@ from ravage.traffic.store import TrafficStore, TrafficStoreError
 from ravage.web_core.http_probe import ProbeSession
 from ravage.web_core.proof_recognizer import recognize_proofs
 from ravage.web_core.recon import run_recon
-from ravage.web_core.scope_policy import assert_authorized_target, is_local_url
+from ravage.web_core.scope_policy import (
+    assert_authorized_target,
+    assert_scoped_same_origin,
+    is_local_url,
+    same_origin,
+)
 from ravage.xben_parts.models import DEFAULT_BENCHMARKS_ROOT, XbenSettings
 from ravage.xben_parts.runner import run_xben
 
@@ -801,7 +813,7 @@ def _top_level_help() -> None:
                 "  ravage code-bug BRIEF.yaml --skills PATH [attack/options]",
                 "  ravage code-bug xben --skills PATH [selection/options]",
                 "  ravage scan BRIEF.yaml [options]",
-                "  ravage auth {add,list,check} BRIEF.yaml",
+                "  ravage auth {add,list,check,matrix} BRIEF.yaml",
                 "  ravage traffic {capture,list,show,replay,diff}",
                 "  ravage xben [selection/options]",
                 "  ravage authbench [--json]",
@@ -963,6 +975,60 @@ def _auth(args: list[str]) -> None:
     )
     check.add_argument("--json", action="store_true", help="print a machine-readable result")
 
+    matrix = subparsers.add_parser(
+        "matrix",
+        help="compare one resource across isolated identities",
+        description=(
+            "Run explicit, read-only authorization checks across configured identities "
+            "and an optional anonymous actor."
+        ),
+        epilog=(
+            "Example:\n"
+            "  ravage auth matrix ravage-brief.yaml authorization-matrix.yaml "
+            "--env-file .env.ravage"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    matrix.add_argument("brief", type=Path, help="engagement brief YAML")
+    matrix.add_argument("plan", type=Path, help="authorization matrix plan YAML")
+    matrix.add_argument(
+        "--env-file",
+        type=Path,
+        help="secrets file; auto-detects .env.ravage when omitted",
+    )
+    matrix.add_argument("--target-url", help="override the first HTTP(S) scoped target")
+    matrix.add_argument(
+        "--run-dir",
+        type=Path,
+        help="fresh private output directory; defaults below runs/",
+    )
+    matrix.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=10,
+        help="1-60 seconds per request; defaults to 10",
+    )
+    matrix.add_argument(
+        "--max-physical-requests",
+        type=int,
+        default=100,
+        help="whole-run request cap, including login and health checks; defaults to 100",
+    )
+    matrix.add_argument(
+        "--traffic-max-rps",
+        type=float,
+        default=0.5,
+        help="whole-run dispatch rate below 1 RPS; defaults to 0.5",
+    )
+    matrix.add_argument(
+        "--allow-remote-target",
+        "--authorized-remote-target",
+        dest="allow_remote_target",
+        action="store_true",
+        help="confirm explicit authorization to test a remote target",
+    )
+    matrix.add_argument("--json", action="store_true", help="print the sanitized receipt")
+
     parsed = parser.parse_args(args)
     if parsed.command == "add":
         _auth_add(add, parsed)
@@ -970,7 +1036,10 @@ def _auth(args: list[str]) -> None:
     if parsed.command == "list":
         _auth_list(list_parser, parsed)
         return
-    _auth_check(check, parsed)
+    if parsed.command == "check":
+        _auth_check(check, parsed)
+        return
+    _auth_matrix(matrix, parsed)
 
 
 def _auth_add(parser: argparse.ArgumentParser, parsed: argparse.Namespace) -> None:
@@ -1160,6 +1229,153 @@ def _auth_check(parser: argparse.ArgumentParser, parsed: argparse.Namespace) -> 
                 include_check=False,
             )
     if not result.passed:
+        raise SystemExit(1)
+
+
+def _auth_matrix(parser: argparse.ArgumentParser, parsed: argparse.Namespace) -> None:
+    brief = _load_engagement_brief_for_cli(parser, parsed.brief)
+    authentication = brief.authentication
+    if authentication is None or len(authentication.identities) < 2:
+        parser.error("authorization matrix requires at least two configured identities")
+    configured_identities = tuple(
+        identity.alias for identity in authentication.identities
+    )
+
+    target_url = _target_url_from_brief(parsed.brief, explicit=parsed.target_url)
+    if not is_local_url(target_url) and not parsed.allow_remote_target:
+        parser.error("remote targets require --authorized-remote-target")
+    try:
+        assert_authorized_target(
+            target_url,
+            scope=brief.scope,
+            allow_remote_target=parsed.allow_remote_target,
+            agent_name="authorization matrix",
+        )
+    except ValueError:
+        parser.error("authorization matrix target is invalid or outside engagement scope")
+
+    try:
+        plan = load_authorization_matrix_plan(
+            parsed.plan,
+            known_identities=configured_identities,
+        )
+    except AuthorizationMatrixPlanError as exc:
+        parser.error(f"invalid authorization matrix plan: {_concise_cli_error(exc)}")
+
+    selected_identities = tuple(
+        sorted(
+            {
+                actor
+                for case in plan.cases
+                for actor in case.expect
+                if actor != ANONYMOUS_ACTOR
+            }
+        )
+    )
+    if len(selected_identities) < 2:
+        parser.error("authorization matrix plan must compare at least two configured identities")
+    for case in plan.cases:
+        if not same_origin(target_url, case.url):
+            parser.error(f"matrix case {case.case_id!r} must use the target origin")
+        try:
+            assert_scoped_same_origin(
+                target_url,
+                case.url,
+                scope=brief.scope,
+                allow_remote_target=parsed.allow_remote_target,
+            )
+        except ValueError:
+            parser.error(f"matrix case {case.case_id!r} is outside engagement scope")
+
+    if not 1 <= parsed.timeout_seconds <= 60:
+        parser.error("--timeout-seconds must be between 1 and 60")
+    parsed.traffic_policy = "low-noise"
+    _resolve_traffic_policy_args(
+        parser,
+        parsed,
+        default_mode="low-noise",
+        roe_max_rps=brief.roe.max_rps,
+    )
+
+    env_file = parsed.env_file or _discover_auth_env_file(parsed.brief)
+    try:
+        secret_resolver = environment_secret_resolver(env_file=env_file)
+    except EnvironmentFileError as exc:
+        parser.error(f"cannot load authentication secrets: {_concise_cli_error(exc)}")
+
+    run_dir = parsed.run_dir or _default_run_dir(parsed.brief, "auth-matrix")
+    if run_dir.exists() or run_dir.is_symlink():
+        parser.error("authorization matrix run directory must be new and empty")
+    try:
+        run_dir.mkdir(parents=True, mode=0o700)
+        run_dir.chmod(0o700)
+        traffic_policy = TrafficPolicyController.open(
+            run_dir / "traffic-policy.json",
+            target_url=target_url,
+            config=_traffic_policy_config(parsed),
+        )
+    except (OSError, TrafficPolicyError, ValueError) as exc:
+        parser.error(f"cannot initialize authorization matrix: {_concise_cli_error(exc)}")
+
+    try:
+        with build_managed_authorization_matrix(
+            config=authentication,
+            target_url=target_url,
+            identities=selected_identities,
+            timeout_seconds=parsed.timeout_seconds,
+            allow_remote_target=parsed.allow_remote_target,
+            in_scope=brief.scope.in_scope,
+            out_of_scope=brief.scope.out_of_scope,
+            max_rps=float(parsed.traffic_max_rps),
+            secret_resolver=secret_resolver,
+            traffic_policy=traffic_policy,
+        ) as runtime:
+            result = run_authorization_matrix(
+                plan,
+                runtime=runtime,
+                secret_resolver=secret_resolver,
+            )
+    except (
+        AuthorizationMatrixRuntimeError,
+        ConfiguredAuthenticationError,
+        SecretResolutionError,
+        SessionError,
+        ValueError,
+    ) as exc:
+        parser.error(f"authorization matrix could not run: {_concise_cli_error(exc)}")
+
+    receipt_path = run_dir / "authorization-matrix.json"
+    try:
+        _atomic_write_cli_text(
+            receipt_path,
+            json.dumps(result.to_json(), indent=2, sort_keys=True) + "\n",
+            mode=0o600,
+        )
+    except OSError as exc:
+        parser.error(f"cannot write authorization matrix receipt: {_concise_cli_error(exc)}")
+
+    if parsed.json:
+        _write_line(json.dumps(result.to_json(), indent=2, sort_keys=True))
+    else:
+        _write_line(banner("AUTH MATRIX", "isolated read-only authorization checks"))
+        _write_line(f"{'target':<10}{redacted_target_url(target_url)}")
+        for case in result.cases:
+            if case.verdict is AuthorizationVerdict.CONFIRMED_VIOLATION:
+                actors = ", ".join(case.violation_actors)
+                _write_line(f"{badge('vulnerable', 'fail')} {case.case_id} · exposed to {actors}")
+            elif case.verdict is AuthorizationVerdict.NO_VIOLATION:
+                _write_line(f"{badge('no violation', 'ok')} {case.case_id}")
+            else:
+                reasons = ", ".join(case.reason_codes) or "comparison was not conclusive"
+                _write_line(f"{badge('inconclusive', 'warn')} {case.case_id} · {reasons}")
+        traffic = result.traffic_delta
+        _write_line(
+            f"{'traffic':<10}{traffic.physical_request_count} physical requests · "
+            f"accounting={traffic.current_accounting_status}"
+        )
+        _write_line(f"{badge('receipt', 'info')} {receipt_path} · mode=0600")
+
+    if result.verdict is not AuthorizationVerdict.NO_VIOLATION:
         raise SystemExit(1)
 
 
