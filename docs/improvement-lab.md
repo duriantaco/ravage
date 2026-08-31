@@ -54,7 +54,10 @@ flowchart LR
   evidence-advance, classification, closure, and accounting patterns;
 - independent candidate clones with source-state checks before and after;
 - pinned, networkless, non-root/capability-dropped container job specifications
-  for more reproducible candidate checks;
+  plus a bounded host executor that revalidates and runs those jobs without
+  granting network access;
+- Ed25519-signed execution envelopes, frozen-output validation, and a receipt
+  adapter that counts only executor-verified findings and observations;
 - exact matched champion-versus-candidate evaluation with at least three
   repeats, controls, conservative stability gates, and efficiency limits;
 - Ed25519-signed evaluation bindings that pin the champion and candidate,
@@ -67,13 +70,13 @@ flowchart LR
   patch.
 
 The lab is not autonomous or self-training. It does not yet contain an
-unattended code-proposing model broker, a trusted execution/evidence adapter, a
-live target scheduler, or a microVM backend. It does not execute the emitted
-job specification, derive receipts from reports or traffic, authenticate the
-person named in an approval record, or merge code. A Codex agent or human can
-propose a candidate patch today, and a separately trusted executor must run the
-pinned suite, derive the receipts, and control the referee key. Human identity
-and mainline authorization remain controls of the surrounding review system.
+unattended code-proposing model broker, a live target scheduler, or a microVM
+backend. The bounded executor and receipt adapter are library components; the
+CLI still expects a trusted evaluator to create and sign the final execution
+observations and finding verdicts. It does not authenticate the person named in
+an approval record or merge code. Executor and referee keys are deliberately
+separate. Human identity and mainline authorization remain controls of the
+surrounding review system.
 
 The proposal step should receive only the generated brief and development
 capsules. Candidate execution additionally receives the candidate source and
@@ -130,8 +133,8 @@ Create holdout capsules separately:
 Candidate-visible export fails if even one sealed capsule is mixed in. Use a
 different HMAC domain for development and holdout identities, so matching IDs
 cannot disclose the hidden partition. The current lab can archive these sealed
-artifacts, but it does not schedule a holdout run or derive a promotion receipt
-from one; that remains the trusted evaluator's job.
+artifacts and derive a receipt from a signed completed run, but it does not
+schedule the holdout itself; that remains the trusted evaluator's job.
 
 ## Trusted Historical Replay
 
@@ -164,6 +167,10 @@ or live authorized runs.
 .venv/bin/python scripts/improvement_lab.py referee-keygen \
   --private-key "$LAB_ROOT/referee-private.key" \
   --public-key "$LAB_ROOT/referee-public.key"
+
+.venv/bin/python scripts/improvement_lab.py executor-keygen \
+  --private-key "$LAB_ROOT/executor-private.key" \
+  --public-key "$LAB_ROOT/executor-public.key"
 
 .venv/bin/python scripts/improvement_lab.py artifact-add \
   --archive "$LAB_ROOT/archive" \
@@ -212,9 +219,10 @@ gate rather than relying on the verification performed by other lab commands.
 
 Use `.ravage/improvement-lab/<operator-label>/archive` as the local default;
 the generated ID in `format.json` is authoritative. The repository already
-ignores `.ravage/`; do not commit an archive or its HMAC key
-or referee private key to Git. Keep the referee private key outside both the
-archive and candidate environments; use a secret manager or KMS in production.
+ignores `.ravage/`; do not commit an archive, its HMAC key, or either private
+key to Git. Keep executor and referee private keys outside both the archive and
+candidate environments, and never give either key to a candidate. Use a secret
+manager or KMS in production.
 For disaster recovery, mirror the archive to private, encrypted, versioned
 object storage with retention lock. A mirror is a backup, not a candidate
 input, and must preserve object names and the ledger exactly. Store the current
@@ -238,7 +246,9 @@ Keep the compact decision record indefinitely:
 - every registered candidate patch, configuration, and parent identity;
 - secret-safe development capsules and capability briefs;
 - aggregate historical-replay, repeated-run, control, evaluation, tournament,
-  rejection, and approval receipts recorded through the archive; and
+  rejection, and approval receipts recorded through the archive;
+- canonical signed execution envelopes referenced by fixture and live
+  receipts; and
 - the content-addressed objects, manifests, lab pointer, and event ledger.
 
 Do not put candidate workspaces, container images, caches, packet captures,
@@ -253,12 +263,9 @@ expiry.
 
 The archive is intentionally append-only, so retention is applied to the raw
 vault and disposable workspaces, not to decision records. Content addressing
-deduplicates identical archive objects. At the current demonstration scale, 15
-workspace run directories occupy about 19 MB of allocated disk while the
-verified compact archive occupies about 212 KB, roughly 90 times less; treat
-that ratio as an observation, not a fixed capacity guarantee. Those existing
-workspace runs are measurement inputs, not an example of the encrypted raw
-vault policy described above.
+deduplicates identical archive objects. Archive growth is roughly proportional
+to registered candidates, signed run envelopes, and evaluations; raw response
+bodies and full workspaces are deliberately excluded.
 
 Monitor `object_bytes` and `verified_bytes` from `archive-verify`. A sensible
 operating budget is to investigate any candidate that adds more than 10 MB,
@@ -355,14 +362,15 @@ image and resolve from `/trusted-tests`, not from candidate-controlled source:
   --evaluation-suite "$LAB_ROOT/evaluation-suite.json" \
   --runner-image registry.example/improvement@sha256:IMAGE_DIGEST \
   --referee-public-key "$LAB_ROOT/referee-public.key" \
+  --executor-public-key "$LAB_ROOT/executor-public.key" \
   --candidate-artifact-id DEVELOPMENT_CORPUS_ARTIFACT_ID \
   --candidate-artifact-id CAPABILITY_BRIEF_ARTIFACT_ID
 ```
 
 One campaign has one fixed champion commit, tree, policy, suite, runner image,
-referee key, and exact corpus/brief pair. The archive rebuilds the brief from
-the corpus before exposing either to a candidate. A candidate cannot change
-that baseline during its tournament.
+separate referee and executor keys, and exact corpus/brief pair. The archive
+rebuilds the brief from the corpus before exposing either to a candidate. A
+candidate cannot change that baseline during its tournament.
 
 After an operator-selected patch passes the normal review and is committed,
 start the next campaign from that clean commit and pass the old lab champion
@@ -442,31 +450,52 @@ mounted, so Git's `assume-unchanged` and `skip-worktree` hints cannot hide a
 substitution. Because the generated command uses `--pull=never`, the trusted
 executor must preload and verify the digest-pinned image.
 
-This command remains a specification builder. A trusted executor must
-revalidate immediately before launch and enforce time, disk, process, and
-file-size limits. Tests visible inside this development container are not a
-sealed promotion holdout. Live model/target evaluation needs a future scoped
-model broker and target-only network rather than general internet access. Use
-fresh `--lab-root`, `--candidate-view-root`, and `--job-output` paths for every
-retry.
+This command remains a specification builder. Evaluator services can call the
+bounded `execute_offline_job` API, which revalidates immediately before launch,
+enforces a timeout, captures bounded output, and freezes a size-limited output
+tree. Deployment-level process and disk quotas still belong to the container
+runtime. Tests visible inside this development container are not a sealed
+promotion holdout. Live model/target evaluation needs a future scoped model
+broker and target-only network rather than general internet access. Use fresh
+`--lab-root`, `--candidate-view-root`, and `--job-output` paths for every retry.
 
 ## Evaluate Detection, Including No-Flag Targets
 
-The current CLI does not execute the container job or convert a Ravage report,
-traffic capture, or target run into these files. A separately trusted
-executor/evidence adapter must produce the receipts from evaluator-owned
-observations. `evaluate` validates, retains, compares, and signs the supplied
-fields; it cannot independently prove that the declared execution occurred or
-that a self-supplied metric is truthful.
+The evaluator must first sign an execution envelope with the campaign's
+executor key. The envelope binds the campaign, champion/candidate side, suite,
+trusted tests, runner image, source tree, artifact tree, case, repeat, seed,
+target snapshot, model, prompt, external resource counts, safety counts, and
+finding verdicts. Candidate-side evidence also binds the candidate ID. Champion
+evidence is campaign-scoped so one exact signed baseline can be reused fairly
+across that campaign's candidates. Do not create an envelope inside a candidate
+container.
 
-The canonical retained form uses `ravage.improvement-run.v1` per-case receipts.
+Use `receipt-build` on the evaluator host after the artifact tree is frozen:
+
+```bash
+.venv/bin/python scripts/improvement_lab.py receipt-build \
+  --archive "$LAB_ROOT/archive" \
+  --candidate-id CANDIDATE_ID \
+  --artifacts "$WORK_ROOT/jobs/CANDIDATE_ID/output" \
+  --execution-envelope "$WORK_ROOT/attestations/RUN_ID.signed.json" \
+  --output "$LAB_ROOT/receipts/RUN_ID.json"
+```
+
+The command re-verifies the executor signature, artifact-tree digest, nominated
+finding identities, proof-integrity claims, and physical-request accounting. It
+counts only signed executor verdicts, writes one canonical receipt, and retains
+the exact signed envelope in the archive. Candidate-declared flags and finding
+status do not create promotion credit. A missing envelope, wrong key, changed
+artifact, unsigned metric, or under-reported mismatch fails closed.
+
+The canonical retained form uses `ravage.improvement-run.v2` per-case receipts.
 Each input file may be a top-level receipt list or an object with a `receipts`
 list. Champion and candidate files must contain the exact same
 `(cohort, case_id, execution_kind, repeat)` matrix. Each receipt must explicitly
 report:
 
-- a unique run ID, a matched pair-seed digest, target-snapshot digest, and model
-  and prompt fingerprints;
+- a unique run ID and signed-execution-envelope digest, a matched pair-seed
+  digest, target-snapshot digest, and model and prompt fingerprints;
 - evidence-backed, verified, confirmed, and suspected vulnerability counts;
 - expected vulnerability count when evaluator-owned ground truth exists;
 - proof-integrity and false-proof failures;
@@ -482,8 +511,9 @@ case is still a regression. On a target without a flag, set `case_success` to
 counts. Suspected findings remain telemetry but do not count as an improvement.
 The lab receipt stores aggregate counts, not vulnerability identities,
 descriptions, or evidence. The normal Ravage report and sealed evaluator vault
-must retain every actual finding, and the trusted adapter must derive the counts
-from that report.
+must retain every actual finding. Historical v1 receipts remain readable only
+for diagnostic `historical_replay`; they cannot be used for promotion because
+they have no signed execution-envelope digest.
 
 ```bash
 .venv/bin/python scripts/improvement_lab.py evaluate \
@@ -509,14 +539,14 @@ Promotion requires at least three repeats, a stable lower confidence bound,
 strictly better evidence-backed detection, no persistent case regression, no
 control regression, zero safety/accounting violations, no timeouts/errors, and
 no more than the configured cost/request-per-result regression.
-The signature binds the result to the archived campaign, candidate bytes,
-champion source, evaluation policy and suite, digest-pinned runner, and exact
-champion/candidate receipt-set objects. Archive verification reloads those
-objects and recomputes the full decision against the pinned suite. Rebinding a
-good result to another candidate, supplying a favorable subset, or silently
-changing the policy fails verification. The signature authenticates its signer
-and these exact bindings; without the future trusted executor it does not prove
-the underlying execution claims.
+The referee signature binds the result to the archived campaign, candidate
+bytes, champion source, evaluation policy and suite, digest-pinned runner, and
+exact champion/candidate receipt-set objects. Each promotable receipt points to
+its own canonical executor-signed envelope. Archive verification follows every
+pointer, re-verifies the separate executor key, checks the side and campaign
+binding, reproduces the exact receipt, and then recomputes the full decision.
+Rebinding a good result, swapping champion and candidate evidence, supplying a
+favorable subset, or silently changing the policy fails verification.
 
 ## How To Know It Worked
 
@@ -531,9 +561,9 @@ The mechanism is healthy only when all of the following hold:
   candidate, evaluate it, re-verify the signed decision, rank it, accept it with
   compare-and-swap, recover derived files, and verify the same ledger head and
   archive checkpoint;
-- altered receipts, a favorable suite subset, a changed candidate or test tree,
-  a wrong external checkpoint, stale promotion, and conflicting retries are
-  all rejected; and
+- altered receipts or execution envelopes, reused or wrong-side evidence, a
+  favorable suite subset, a changed candidate or test tree, a wrong external
+  checkpoint, stale promotion, and conflicting retries are all rejected; and
 - recovery after a committed event but missing derived manifest or pointer
   restores the exact projection without adding a second ledger event or
   changing the externally anchored archive checkpoint.
@@ -553,10 +583,10 @@ capture or `case_success` utility. Confirm that every counted finding also
 appears in the normal Ravage report; the compact lab receipt alone cannot show
 that. Public prior logs are diagnostic data, not a sealed promotion holdout.
 
-Passing these checks validates the archive and evaluator. Until a trusted
-executor/evidence adapter exists, it does not prove that an untrusted producer
-honestly generated the original receipts, and it is not unattended autonomous
-self-improvement.
+Passing these checks validates the archive, signed execution chain, adapter,
+and referee. It still depends on protecting the executor/referee private keys
+and on the trusted evaluator honestly observing the run; it is not unattended
+autonomous self-improvement.
 
 ## Tournament And Operator Approval
 
@@ -625,10 +655,10 @@ long-lived VM per conversational agent. Each environment should have:
 - bounded CPU, memory, processes, time, model calls, and physical requests; and
 - a single append-only result channel to the trusted evaluator.
 
-The current code emits hardened container specifications for development
-checks; it does not run them. Use a future microVM backend when running
-adversarial candidate-generated tools or when a stronger kernel boundary is
-worth the startup cost.
+The current code emits hardened container specifications and provides a bounded
+host executor for networkless development checks. Use a future microVM backend
+when running adversarial candidate-generated tools or when a stronger kernel
+boundary is worth the startup cost.
 
 ## Benchmark And Overfitting Rules
 

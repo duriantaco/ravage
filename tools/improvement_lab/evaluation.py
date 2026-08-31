@@ -27,8 +27,10 @@ from pathlib import Path
 from typing import Final
 
 EVALUATION_SCHEMA_VERSION: Final = "ravage.improvement-evaluation.v1"
-RUN_RECEIPT_SCHEMA_VERSION: Final = "ravage.improvement-run.v1"
-RUN_RECEIPT_SET_SCHEMA_VERSION: Final = "ravage.improvement-run-set.v1"
+RUN_RECEIPT_SCHEMA_VERSION: Final = "ravage.improvement-run.v2"
+RUN_RECEIPT_SET_SCHEMA_VERSION: Final = "ravage.improvement-run-set.v2"
+_LEGACY_RUN_RECEIPT_SCHEMA_VERSION: Final = "ravage.improvement-run.v1"
+_LEGACY_RUN_RECEIPT_SET_SCHEMA_VERSION: Final = "ravage.improvement-run-set.v1"
 EVALUATION_SUITE_SCHEMA_VERSION: Final = "ravage.improvement-suite.v1"
 
 _PROMOTABLE_EXECUTION_KINDS = ("fixture", "live")
@@ -393,6 +395,7 @@ class RunReceipt:
     cost_usd: float | None
     request_accounting_status: str = "unspecified"
     run_id: str = ""
+    execution_attestation_digest: str | None = None
     pair_seed_digest: str = ""
     target_snapshot_digest: str = ""
     model_fingerprint: str = ""
@@ -407,6 +410,14 @@ class RunReceipt:
             "prompt_fingerprint",
         ):
             _required_sha256(getattr(self, name), name)
+        if (
+            self.execution_kind in _PROMOTABLE_EXECUTION_KINDS
+            or self.execution_attestation_digest is not None
+        ):
+            _required_sha256(
+                self.execution_attestation_digest,
+                "execution_attestation_digest",
+            )
         if not (
             self.confirmed_finding_count
             <= self.verified_vulnerability_count
@@ -584,6 +595,15 @@ class RunReceipt:
                 _lookup(payload, metric_payload, "run_id"),
                 "run_id",
             ),
+            execution_attestation_digest=_optional_sha256(
+                _lookup(
+                    payload,
+                    metric_payload,
+                    "execution_attestation_digest",
+                    default=None,
+                ),
+                "execution_attestation_digest",
+            ),
             pair_seed_digest=_required_sha256(
                 _lookup(payload, metric_payload, "pair_seed_digest"),
                 "pair_seed_digest",
@@ -615,6 +635,7 @@ class RunReceipt:
             "case_success": self.case_success,
             "expected_vulnerability_count": self.expected_vulnerability_count,
             "run_id": self.run_id,
+            "execution_attestation_digest": self.execution_attestation_digest,
             "pair_seed_digest": self.pair_seed_digest,
             "target_snapshot_digest": self.target_snapshot_digest,
             "model_fingerprint": self.model_fingerprint,
@@ -1045,7 +1066,11 @@ def load_canonical_run_receipts(content: bytes) -> tuple[RunReceipt, ...]:
         raise ValueError("retained run receipt set JSON is invalid") from exc
     if not isinstance(payload, Mapping) or set(payload) != {"schema_version", "receipts"}:
         raise ValueError("retained run receipt set fields are invalid")
-    if payload.get("schema_version") != RUN_RECEIPT_SET_SCHEMA_VERSION:
+    schema_version = payload.get("schema_version")
+    if schema_version not in {
+        RUN_RECEIPT_SET_SCHEMA_VERSION,
+        _LEGACY_RUN_RECEIPT_SET_SCHEMA_VERSION,
+    }:
         raise ValueError("retained run receipt set schema is unsupported")
     raw_receipts = payload.get("receipts")
     if not isinstance(raw_receipts, list):
@@ -1054,6 +1079,16 @@ def load_canonical_run_receipts(content: bytes) -> tuple[RunReceipt, ...]:
         RunReceipt.from_mapping(item) if isinstance(item, Mapping) else _raise_invalid_run_receipt()
         for item in raw_receipts
     )
+    if not receipts:
+        raise ValueError("retained run receipt set cannot be empty")
+    if schema_version == _LEGACY_RUN_RECEIPT_SET_SCHEMA_VERSION:
+        if any(item.execution_kind != _HISTORICAL_EXECUTION_KIND for item in receipts):
+            raise ValueError("legacy promotable run receipts lack execution attestations")
+        if any(item.execution_attestation_digest is not None for item in receipts):
+            raise ValueError("legacy historical receipts cannot add v2 attestation fields")
+        if content != _legacy_canonical_run_receipts_bytes(receipts):
+            raise ValueError("retained legacy run receipt set is not byte-canonical")
+        return receipts
     if content != canonical_run_receipts_bytes(receipts):
         raise ValueError("retained run receipt set is not byte-canonical")
     return receipts
@@ -1067,6 +1102,22 @@ def canonical_json(value: object) -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+def _legacy_canonical_run_receipts_bytes(receipts: Sequence[RunReceipt]) -> bytes:
+    ordered = sorted(receipts, key=lambda item: (item.key, item.run_id))
+    legacy_receipts: list[dict[str, object]] = []
+    for receipt in ordered:
+        payload = receipt.to_json()
+        payload["schema_version"] = _LEGACY_RUN_RECEIPT_SCHEMA_VERSION
+        del payload["execution_attestation_digest"]
+        legacy_receipts.append(payload)
+    return canonical_json(
+        {
+            "schema_version": _LEGACY_RUN_RECEIPT_SET_SCHEMA_VERSION,
+            "receipts": legacy_receipts,
+        }
+    ).encode()
 
 
 def _parse_receipts(
@@ -1226,8 +1277,10 @@ def _validate_execution_attestations(
     for side, receipts in (("champion", champion), ("candidate", candidate)):
         seen_runs: set[str] = set()
         seen_seeds: set[tuple[tuple[str, str, str], str]] = set()
+        seen_attestations: set[str] = set()
         duplicate_runs: list[dict[str, object]] = []
         duplicate_seeds: list[dict[str, object]] = []
+        duplicate_attestations: list[dict[str, object]] = []
         for receipt in receipts:
             if receipt.run_id in seen_runs:
                 duplicate_runs.append({"key": _key_json(receipt.key)})
@@ -1236,7 +1289,12 @@ def _validate_execution_attestations(
             if seed_key in seen_seeds:
                 duplicate_seeds.append({"key": _key_json(receipt.key)})
             seen_seeds.add(seed_key)
-        if duplicate_runs or duplicate_seeds:
+            attestation = receipt.execution_attestation_digest
+            if attestation is not None:
+                if attestation in seen_attestations:
+                    duplicate_attestations.append({"key": _key_json(receipt.key)})
+                seen_attestations.add(attestation)
+        if duplicate_runs or duplicate_seeds or duplicate_attestations:
             _reject(
                 rejections,
                 gate="input_and_matching",
@@ -1246,6 +1304,7 @@ def _validate_execution_attestations(
                     "side": side,
                     "duplicate_runs": duplicate_runs,
                     "duplicate_pair_seeds": duplicate_seeds,
+                    "duplicate_execution_envelopes": duplicate_attestations,
                 },
             )
 
@@ -1258,7 +1317,14 @@ def _validate_execution_attestations(
             or champion_item.model_fingerprint != candidate_item.model_fingerprint
         ):
             mismatches.append({"key": _key_json(champion_item.key)})
-        if champion_item.run_id == candidate_item.run_id:
+        if (
+            champion_item.run_id == candidate_item.run_id
+            or (
+                champion_item.execution_attestation_digest is not None
+                and champion_item.execution_attestation_digest
+                == candidate_item.execution_attestation_digest
+            )
+        ):
             reused_sessions.append({"key": _key_json(champion_item.key)})
     if mismatches:
         _reject(
@@ -2001,6 +2067,12 @@ def _required_sha256(value: object, label: str) -> str:
     if _SHA256_RE.fullmatch(digest) is None:
         raise ValueError(f"{label} must be a sha256 digest")
     return digest
+
+
+def _optional_sha256(value: object, label: str) -> str | None:
+    if value is None:
+        return None
+    return _required_sha256(value, label)
 
 
 def _boolean(value: object, label: str) -> bool:

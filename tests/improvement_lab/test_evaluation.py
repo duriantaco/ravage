@@ -11,6 +11,8 @@ import pytest
 
 from tools.improvement_lab.evaluation import (
     EVALUATION_SCHEMA_VERSION,
+    RUN_RECEIPT_SCHEMA_VERSION,
+    RUN_RECEIPT_SET_SCHEMA_VERSION,
     EvaluationConfig,
     RunReceipt,
     canonical_run_receipts_bytes,
@@ -59,6 +61,9 @@ def _receipt(  # noqa: PLR0913 - the receipt fixture mirrors the public schema.
         "case_success": success,
         "expected_vulnerability_count": expected,
         "run_id": digest(f"run:{side}:{case_id}:{repeat}"),
+        "execution_attestation_digest": digest(
+            f"attestation:{side}:{case_id}:{repeat}"
+        ),
         "pair_seed_digest": digest(f"seed:{case_id}:{repeat}"),
         "target_snapshot_digest": digest(f"target:{case_id}:{repeat}"),
         "model_fingerprint": digest("model:fixed"),
@@ -152,6 +157,16 @@ def _metrics(item: dict[str, object]) -> dict[str, object]:
     metrics = item["metrics"]
     assert isinstance(metrics, dict)
     return metrics
+
+
+def _canonical_bytes(payload: object) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
 
 
 def test_repeated_evidence_backed_improvement_promotes() -> None:
@@ -381,6 +396,18 @@ def test_repeat_labels_cannot_reuse_execution_or_seed_attestations() -> None:
     assert "duplicate_execution_attestation" in _codes(receipt)
 
 
+def test_repeat_labels_cannot_reuse_signed_execution_attestations() -> None:
+    champion, candidate = _passing_panel()
+    first = _candidate_item(candidate, case_id="capability-case", repeat=1)
+    second = _candidate_item(candidate, case_id="capability-case", repeat=2)
+    second["execution_attestation_digest"] = first["execution_attestation_digest"]
+
+    receipt = evaluate_candidate(champion, candidate)
+
+    assert receipt.accepted is False
+    assert "duplicate_execution_attestation" in _codes(receipt)
+
+
 def test_matched_runs_require_same_seed_snapshot_and_distinct_sessions() -> None:
     champion, candidate = _passing_panel()
     champion_item = _candidate_item(champion, case_id="capability-case", repeat=1)
@@ -470,6 +497,51 @@ def test_run_receipt_loader_uses_the_same_fail_closed_schema(tmp_path: Path) -> 
         load_run_receipts(path)
 
 
+@pytest.mark.parametrize("execution_kind", ["fixture", "live"])
+@pytest.mark.parametrize("attestation_field", ["missing", "null"])
+def test_promotable_run_receipt_requires_execution_attestation_digest(
+    execution_kind: str,
+    attestation_field: str,
+) -> None:
+    payload = _receipt(
+        "promotable-case",
+        1,
+        cohort="development_failure",
+        control=False,
+        side="candidate",
+        execution_kind=execution_kind,
+    )
+    if attestation_field == "null":
+        payload["execution_attestation_digest"] = None
+    else:
+        del payload["execution_attestation_digest"]
+
+    with pytest.raises(ValueError, match="execution_attestation_digest"):
+        RunReceipt.from_mapping(payload)
+
+
+@pytest.mark.parametrize("attestation_field", ["missing", "null"])
+def test_historical_run_receipt_accepts_missing_or_null_execution_attestation(
+    attestation_field: str,
+) -> None:
+    payload = _receipt(
+        "historical-case",
+        1,
+        cohort="historical_failure",
+        control=False,
+        side="candidate",
+        execution_kind="historical_replay",
+    )
+    if attestation_field == "null":
+        payload["execution_attestation_digest"] = None
+    else:
+        del payload["execution_attestation_digest"]
+
+    receipt = RunReceipt.from_mapping(payload)
+
+    assert receipt.execution_attestation_digest is None
+
+
 def test_campaign_suite_rejects_a_favorable_subset() -> None:
     champion, candidate = _passing_panel()
     parsed_champion = tuple(RunReceipt.from_mapping(item) for item in champion)
@@ -504,16 +576,69 @@ def test_campaign_suite_rejects_a_path_resolved_runner() -> None:
         )
 
 
-def test_retained_receipt_set_is_byte_canonical_and_replayable() -> None:
+def test_v2_retained_receipt_set_is_byte_canonical_and_replayable() -> None:
     champion, _candidate = _passing_panel()
     parsed = tuple(RunReceipt.from_mapping(item) for item in champion)
     encoded = canonical_run_receipts_bytes(parsed)
+    payload = json.loads(encoded)
 
+    assert payload["schema_version"] == RUN_RECEIPT_SET_SCHEMA_VERSION
+    assert {item["schema_version"] for item in payload["receipts"]} == {
+        RUN_RECEIPT_SCHEMA_VERSION
+    }
     assert load_canonical_run_receipts(encoded) == tuple(
         sorted(parsed, key=lambda item: (item.key, item.run_id))
     )
     with pytest.raises(ValueError, match="byte-canonical"):
         load_canonical_run_receipts(encoded + b"\n")
+
+
+def test_canonical_v1_historical_receipt_set_remains_replayable() -> None:
+    historical = _receipt(
+        "historical-case",
+        1,
+        cohort="historical_failure",
+        control=False,
+        side="champion",
+        execution_kind="historical_replay",
+    )
+    historical["schema_version"] = "ravage.improvement-run.v1"
+    del historical["execution_attestation_digest"]
+    encoded = _canonical_bytes(
+        {
+            "schema_version": "ravage.improvement-run-set.v1",
+            "receipts": [historical],
+        }
+    )
+
+    loaded = load_canonical_run_receipts(encoded)
+
+    assert len(loaded) == 1
+    assert loaded[0].execution_kind == "historical_replay"
+    assert loaded[0].execution_attestation_digest is None
+
+
+@pytest.mark.parametrize("execution_kind", ["fixture", "live"])
+def test_canonical_v1_promotable_receipt_set_is_rejected(execution_kind: str) -> None:
+    promotable = _receipt(
+        "promotable-case",
+        1,
+        cohort="development_failure",
+        control=False,
+        side="candidate",
+        execution_kind=execution_kind,
+    )
+    promotable["schema_version"] = "ravage.improvement-run.v1"
+    del promotable["execution_attestation_digest"]
+    encoded = _canonical_bytes(
+        {
+            "schema_version": "ravage.improvement-run-set.v1",
+            "receipts": [promotable],
+        }
+    )
+
+    with pytest.raises(ValueError, match=r"execution_attestation_digest|legacy promotable"):
+        load_canonical_run_receipts(encoded)
 
 
 def test_config_enforces_three_or_more_repeats() -> None:
