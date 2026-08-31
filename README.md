@@ -133,6 +133,19 @@ credentials stay inside the authenticated HTTP owner; process, Python, and
 command lanes are blocked when an identity is selected. See
 [Authentication](docs/authentication.md) for setup and limitations.
 
+With at least two configured identities, compare access to operator-supplied,
+read-only resources with a narrow authorization matrix:
+
+~~~bash
+ravage auth matrix ravage-brief.yaml authorization-matrix.yaml
+~~~
+
+The plan names each explicit GET URL, its allowed and denied actors (including
+`anonymous`), and a secret-backed response marker. Ravage does not discover or
+guess resource IDs. See the
+[authorization matrix guide](docs/authentication.md#authorization-matrix) for
+the plan format, receipt boundary, and limitations.
+
 ## Authorized remote targets
 
 Remote execution is fail-closed and requires an explicit flag. Start with a
