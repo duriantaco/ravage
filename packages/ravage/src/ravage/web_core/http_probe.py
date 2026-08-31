@@ -61,6 +61,7 @@ DEFAULT_USER_AGENT = "ravage-probe/1.0"
 _HTTP_PROTOCOL_ERROR = "HTTP protocol error"
 _IPV6_VERSION = 6
 _HTTP_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_TRAFFIC_IDENTITY_ALIAS_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 _SENSITIVE_SUMMARY_HEADERS = frozenset(
     {
         "authentication-info",
@@ -584,6 +585,7 @@ class ProbeSession:
         ) = None
         self._request_gate: Callable[[str, str], object] | None = None
         self._traffic_identity_alias_override: str | None = None
+        self._traffic_identity_generation_override: int | None = None
         # Applied to every request (e.g. a confirmed canonical Host header) so a
         # host-sensitive app serves canonical content for all probes, not just the
         # one that discovered the redirect. Per-call headers still override these.
@@ -608,6 +610,46 @@ class ProbeSession:
             str(name).strip().casefold() for name in header_names if str(name).strip()
         )
         self._fork_inherits_managed_identity = True
+
+    def bind_traffic_identity(
+        self,
+        identity_alias: str,
+        *,
+        generation: int | None = None,
+    ) -> None:
+        """
+        Bind trusted logical identity metadata to target traffic.
+
+        The alias is non-secret policy and observer metadata. The optional
+        generation distinguishes refreshed credentials without changing the
+        managed request delegate's independently enforced lifecycle binding.
+        Forks inherit this metadata unless they are explicitly anonymous.
+        """
+        alias = _validated_traffic_identity_alias(identity_alias)
+        validated_generation = _validated_traffic_identity_generation(generation)
+        current_alias = self._traffic_identity_alias_override
+        if current_alias is not None and current_alias != alias:
+            message = "traffic identity alias is already bound"
+            raise RuntimeError(message)
+        current_generation = self._traffic_identity_generation_override
+        if (
+            current_generation is not None
+            and validated_generation is not None
+            and current_generation != validated_generation
+        ):
+            message = "traffic identity generation is already bound"
+            raise RuntimeError(message)
+        managed_generation = self._managed_identity_generation
+        if (
+            managed_generation is not None
+            and validated_generation is not None
+            and managed_generation != validated_generation
+        ):
+            message = "traffic identity generation conflicts with managed identity"
+            raise RuntimeError(message)
+        self._traffic_identity_alias_override = alias
+        if validated_generation is not None:
+            self._traffic_identity_generation_override = validated_generation
 
     def configure_request_gate(
         self,
@@ -714,8 +756,13 @@ class ProbeSession:
         forked._managed_identity_header_names = self._managed_identity_header_names
         forked._request_gate = self._request_gate
         forked._traffic_identity_alias_override = self._traffic_identity_alias_override
-        if not copy_identity and self._managed_identity_header_names:
+        forked._traffic_identity_generation_override = self._traffic_identity_generation_override
+        if (
+            inherit_identity is False
+            and self._traffic_identity_alias_override is not None
+        ) or (not copy_identity and self._managed_identity_header_names):
             forked._traffic_identity_alias_override = ""
+            forked._traffic_identity_generation_override = 0
         if copy_identity:
             for cookie in self.cookies:
                 forked.cookies.set_cookie(copy(cookie))
@@ -827,18 +874,14 @@ class ProbeSession:
             headers=MappingProxyType(request_headers),
             timeout_seconds=request_timeout,
         )
-        identity_alias = self._traffic_identity_alias_override
-        if identity_alias is None:
-            identity_alias = (
-                "managed" if self._managed_request_delegate is not None else "anonymous"
-            )
+        identity_alias, identity_generation = self._traffic_identity_context()
         intent = RequestIntent(
             method=normalized_method,
             url=absolute_url,
             headers=request_headers,
             lane=lane,
-            identity_alias=identity_alias or "anonymous",
-            identity_generation=self._managed_identity_generation or 0,
+            identity_alias=identity_alias,
+            identity_generation=identity_generation,
             retryable=retryable,
             timing_sensitive=timing_sensitive,
         )
@@ -1044,11 +1087,7 @@ class ProbeSession:
         response_body_limit = _validated_body_limit(
             self.max_body_bytes if max_body_bytes is None else max_body_bytes
         )
-        identity_alias = self._traffic_identity_alias_override
-        if identity_alias is None:
-            identity_alias = (
-                "managed" if self._managed_request_delegate is not None else "anonymous"
-            )
+        identity_alias, identity_generation = self._traffic_identity_context()
         attempt = 0
         while True:
             intent = RequestIntent(
@@ -1057,8 +1096,8 @@ class ProbeSession:
                 headers=request_headers,
                 body=data,
                 lane=self._traffic_lane,
-                identity_alias=identity_alias or "anonymous",
-                identity_generation=self._managed_identity_generation or 0,
+                identity_alias=identity_alias,
+                identity_generation=identity_generation,
                 cacheable=self._traffic_cacheable and not any(self.cookies),
                 retryable=self._traffic_retryable,
                 timing_sensitive=self._traffic_timing_sensitive,
@@ -1328,11 +1367,24 @@ class ProbeSession:
         }
         if self._traffic_identity_alias_override is not None:
             event["identity_alias"] = self._traffic_identity_alias_override
+            _identity_alias, identity_generation = self._traffic_identity_context()
+            event["identity_generation"] = identity_generation
         if disposition == "sent":
             event["request_headers"] = dict(request_headers or {})
             event["request_body"] = request_body
         with suppress(Exception):
             observer(event)
+
+    def _traffic_identity_context(self) -> tuple[str, int]:
+        alias = self._traffic_identity_alias_override
+        if alias is None:
+            alias = "managed" if self._managed_request_delegate is not None else "anonymous"
+        generation = (
+            self._managed_identity_generation
+            if self._managed_request_delegate is not None
+            else self._traffic_identity_generation_override
+        )
+        return alias or "anonymous", generation if generation is not None else 0
 
     def _dns_scope_error(self, url: str) -> str:
         parsed = urlsplit(url)
@@ -1377,6 +1429,28 @@ def _validated_timeout(value: object) -> float:
     if not math.isfinite(timeout) or not 0 < timeout <= MAX_TIMEOUT_SECONDS:
         raise ValueError("request timeout must be between 0 and 60 seconds")
     return timeout
+
+
+def _validated_traffic_identity_alias(value: object) -> str:
+    if not isinstance(value, str):
+        message = "traffic identity alias must be a string"
+        raise TypeError(message)
+    if value != value.strip() or not _TRAFFIC_IDENTITY_ALIAS_RE.fullmatch(value):
+        message = "traffic identity alias must be a simple non-empty name"
+        raise ValueError(message)
+    return value
+
+
+def _validated_traffic_identity_generation(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        message = "traffic identity generation must be an integer"
+        raise TypeError(message)
+    if value < 0:
+        message = "traffic identity generation must be non-negative"
+        raise ValueError(message)
+    return value
 
 
 def _validated_http_method(value: object) -> str:

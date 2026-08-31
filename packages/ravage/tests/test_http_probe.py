@@ -381,6 +381,41 @@ def test_managed_probe_forks_inherit_identity_unless_explicitly_anonymous() -> N
     assert list(anonymous.cookies) == []
 
 
+def test_traffic_identity_binding_is_validated_and_inherited_by_forks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ravage.web_core.http_probe.build_opener", lambda *_handlers: _FakeOpener())
+    observed: list[dict[str, object]] = []
+    session = ProbeSession(
+        "http://127.0.0.1:8000/",
+        traffic_observer=observed.append,
+    )
+
+    session.bind_traffic_identity("alice", generation=4)
+    session.bind_traffic_identity("alice")
+    session.fork().get("/account")
+    session.fork(inherit_identity=False).get("/public")
+
+    assert [event.get("identity_alias") for event in observed] == ["alice", ""]
+    assert [event.get("identity_generation") for event in observed] == [4, 0]
+    with pytest.raises(RuntimeError, match="alias is already bound"):
+        session.bind_traffic_identity("bob", generation=4)
+    with pytest.raises(RuntimeError, match="generation is already bound"):
+        session.bind_traffic_identity("alice", generation=5)
+    with pytest.raises(ValueError, match="simple non-empty name"):
+        ProbeSession("http://127.0.0.1:8000/").bind_traffic_identity("alice secret")
+    with pytest.raises(TypeError, match="generation must be an integer"):
+        ProbeSession("http://127.0.0.1:8000/").bind_traffic_identity(
+            "alice",
+            generation=True,
+        )
+    with pytest.raises(ValueError, match="generation must be non-negative"):
+        ProbeSession("http://127.0.0.1:8000/").bind_traffic_identity(
+            "alice",
+            generation=-1,
+        )
+
+
 def test_probe_session_records_blocked_attempt_without_sensitive_material() -> None:
     observed: list[dict[str, object]] = []
     session = ProbeSession(

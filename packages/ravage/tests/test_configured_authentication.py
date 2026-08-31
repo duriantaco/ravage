@@ -41,10 +41,21 @@ class _ConfiguredSession:
         self.cookies: dict[str, str] = {}
         self.authenticated = False
         self.target_url = "https://target.test/"
+        self.identity_alias: str | None = None
+        self.identity_generation: int | None = None
 
     def fork(self, *, timeout_seconds: int | None = None) -> _ConfiguredSession:
         del timeout_seconds
         return _ConfiguredSession(self.backend)
+
+    def bind_traffic_identity(
+        self,
+        identity_alias: str,
+        *,
+        generation: int | None = None,
+    ) -> None:
+        self.identity_alias = identity_alias
+        self.identity_generation = generation
 
     def in_scope(self, url: str) -> bool:
         return url.startswith("https://target.test/")
@@ -155,8 +166,11 @@ def test_form_config_resolves_secrets_at_login_and_preserves_rotating_hidden_fie
     )
 
     handle = manager.acquire("alice")
+    configured_session = cast("_ConfiguredSession", handle.session)
 
     assert handle.generation == 1
+    assert configured_session.identity_alias == "alice"
+    assert configured_session.identity_generation == 1
     assert backend.posted_fields == [
         {
             "csrf_token": "rotating-login-token",
@@ -195,7 +209,10 @@ def test_bearer_config_is_applied_before_the_protected_health_check() -> None:
     )
 
     handle = manager.acquire("service")
+    configured_session = cast("_ConfiguredSession", handle.session)
 
+    assert configured_session.identity_alias == "service"
+    assert configured_session.identity_generation == 1
     assert handle.session.default_headers["Authorization"] == "Bearer service-token"
 
 

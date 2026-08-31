@@ -521,13 +521,14 @@ class ManagedAttackAuthentication:
         source_session: ProbeSession | None,
     ) -> None:
         with self.__lock:
+            snapshot: _ManagedIdentitySnapshot | None
             if source_session is None:
                 snapshot = self._managed_identity_snapshot(self.__handle.session)
             else:
                 snapshot = self.__probe_identity_snapshots.get(source_session)
-                if snapshot is None:
-                    message = "managed identity parent session is no longer active"
-                    raise AuthenticationError(message)
+            if snapshot is None:
+                message = "managed identity parent session is no longer active"
+                raise AuthenticationError(message)
             self.__probe_sessions.setdefault(lease, set()).add(session)
             self.__probe_identity_snapshots[session] = snapshot
 
@@ -586,7 +587,7 @@ def build_authenticated_attack_runtime(  # noqa: PLR0913 - explicit public build
     allow_remote_target: bool,
     in_scope: Sequence[str],
     out_of_scope: Sequence[str],
-    max_rps: int | None,
+    max_rps: float | None,
     secret_resolver: SecretResolver,
     traffic_policy: TrafficPolicyController | None = None,
     traffic_policy_reference: dict[str, object] | None = None,

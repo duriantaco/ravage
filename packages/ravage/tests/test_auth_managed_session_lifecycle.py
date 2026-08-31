@@ -6,7 +6,10 @@ import pickle
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from email.message import Message
 from http.cookiejar import Cookie
+from pathlib import Path
+from urllib.request import Request
 
 import pytest
 from ravage.auth import (
@@ -21,6 +24,13 @@ from ravage.auth import (
     SessionManagerClosedError,
     SessionRequestPolicy,
     UnknownIdentityError,
+)
+from ravage.traffic.policy import (
+    RequestIntent,
+    TrafficDecision,
+    TrafficPolicyConfig,
+    TrafficPolicyController,
+    TrafficPolicyMode,
 )
 from ravage.web_core.http_probe import ProbeResponse, ProbeSession
 
@@ -115,6 +125,130 @@ def test_each_identity_receives_an_isolated_probe_session_and_cookie_jar() -> No
     assert [(cookie.name, cookie.value) for cookie in second.session.cookies] == [
         ("identity", "customer_b")
     ]
+
+
+def test_identity_alias_and_generation_cover_login_health_and_resource_traffic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class OkResponse:
+        status = 200
+
+        def __init__(self, url: str) -> None:
+            self._url = url
+            self.headers = Message()
+            self.headers["Content-Type"] = "text/plain"
+
+        def getcode(self) -> int:
+            return self.status
+
+        def geturl(self) -> str:
+            return self._url
+
+        def read(self, _limit: int) -> bytes:
+            return b"ok"
+
+    class OkOpener:
+        def open(self, request: Request, *, timeout: float) -> OkResponse:
+            del timeout
+            return OkResponse(request.full_url)
+
+    monkeypatch.setattr(
+        "ravage.web_core.http_probe.build_opener",
+        lambda *_handlers: OkOpener(),
+    )
+    target_url = "http://127.0.0.1:18731/"
+    controller = TrafficPolicyController.open(
+        tmp_path / "traffic.json",
+        target_url=target_url,
+        config=TrafficPolicyConfig(
+            mode=TrafficPolicyMode.ENFORCE,
+            cache_enabled=True,
+            deduplicate=True,
+        ),
+    )
+    intents: list[RequestIntent] = []
+    acquire = controller.acquire
+
+    def record_intent(
+        intent: RequestIntent,
+        *,
+        retry: bool = False,
+    ) -> TrafficDecision:
+        intents.append(intent)
+        return acquire(intent, retry=retry)
+
+    monkeypatch.setattr(controller, "acquire", record_intent)
+    observed: list[dict[str, object]] = []
+    base = ProbeSession(
+        target_url,
+        timeout_seconds=1,
+        traffic_observer=observed.append,
+        traffic_policy=controller,
+        traffic_lane="recon",
+        traffic_cacheable=True,
+    )
+
+    def login(session: ProbeSession, secrets: object) -> bool:
+        identity = secrets.identity  # type: ignore[attr-defined]
+        return session.get("/login").status == 200 and identity in {"alice", "bob"}
+
+    def health(session: ProbeSession) -> SessionHealth:
+        return (
+            SessionHealth.HEALTHY if session.get("/health").status == 200 else SessionHealth.EXPIRED
+        )
+
+    manager = SessionManager(
+        base,
+        [
+            IdentityProfile("alice", login=login, health_check=health),
+            IdentityProfile("bob", login=login, health_check=health),
+        ],
+    )
+
+    alice = manager.acquire("alice")
+    manager.acquire("bob")
+    manager.request("alice", "GET", "/resource")
+    manager.request("bob", "GET", "/resource")
+    manager.relogin(alice)
+    manager.request("alice", "GET", "/resource")
+
+    expected = [
+        ("/login", "alice", 1),
+        ("/health", "alice", 1),
+        ("/login", "bob", 1),
+        ("/health", "bob", 1),
+        ("/resource", "alice", 1),
+        ("/resource", "bob", 1),
+        ("/login", "alice", 2),
+        ("/health", "alice", 2),
+        ("/resource", "alice", 2),
+    ]
+    assert [
+        (
+            intent.url.removeprefix(target_url.rstrip("/")),
+            intent.identity_alias,
+            intent.identity_generation,
+        )
+        for intent in intents
+    ] == expected
+    assert [
+        (
+            str(event["url"]).removeprefix(target_url.rstrip("/")),
+            event.get("identity_alias"),
+            event.get("identity_generation"),
+        )
+        for event in observed
+    ] == expected
+    resource_fingerprints = [
+        intent.fingerprint for intent in intents if intent.url.endswith("/resource")
+    ]
+    assert len(set(resource_fingerprints)) == 3
+    snapshot = controller.snapshot()
+    assert snapshot.physical_request_count == len(expected)
+    assert snapshot.cache_hit_count == 0
+    assert snapshot.deduplicated_count == 0
+    assert {str(event.get("disposition")) for event in observed} == {"sent"}
 
 
 def test_concurrent_initial_acquire_runs_login_once_per_identity() -> None:
