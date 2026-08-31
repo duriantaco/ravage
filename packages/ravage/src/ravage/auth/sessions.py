@@ -497,6 +497,12 @@ class SessionManager:
         candidate: ProbeSession | None = None
         try:
             candidate = self.__base_session.fork()
+            bind_traffic_identity = getattr(candidate, "bind_traffic_identity", None)
+            if callable(bind_traffic_identity):
+                bind_traffic_identity(
+                    slot.profile.name,
+                    generation=slot.generation + 1,
+                )
             if slot.profile.login is not None:
                 secrets = IdentitySecrets(
                     slot.profile.name,

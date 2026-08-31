@@ -197,6 +197,56 @@ def test_safe_anonymous_get_cache_avoids_second_dispatch(tmp_path: Path) -> None
     assert controller.snapshot().physical_request_count == 1
 
 
+def test_authenticated_aliases_and_generations_never_share_cache_or_dedup(
+    tmp_path: Path,
+) -> None:
+    controller = _controller(
+        tmp_path,
+        TrafficPolicyConfig(
+            mode=TrafficPolicyMode.ENFORCE,
+            cache_enabled=True,
+            deduplicate=True,
+        ),
+    )
+    base = _intent("/resource", cacheable=True)
+    intents = (
+        replace(base, identity_alias="alice", identity_generation=1),
+        replace(base, identity_alias="bob", identity_generation=1),
+        replace(base, identity_alias="alice", identity_generation=2),
+    )
+
+    first_decisions = [controller.acquire(intent) for intent in intents]
+
+    assert all(decision.kind is TrafficDecisionKind.DISPATCH for decision in first_decisions)
+    assert len({intent.fingerprint for intent in intents}) == len(intents)
+    for decision in first_decisions:
+        assert decision.lease is not None
+        controller.begin_dispatch(decision.lease)
+        controller.complete(
+            decision.lease,
+            TrafficOutcome(
+                status=200,
+                cache_record=TrafficCacheRecord(
+                    status=200,
+                    final_url="http://127.0.0.1/resource",
+                    headers={"content-type": "text/plain"},
+                    body="identity-bound",
+                ),
+            ),
+        )
+
+    second_decisions = [controller.acquire(intent) for intent in intents]
+
+    assert all(decision.kind is TrafficDecisionKind.DISPATCH for decision in second_decisions)
+    for decision in second_decisions:
+        assert decision.lease is not None
+        controller.cancel(decision.lease)
+    snapshot = controller.snapshot()
+    assert snapshot.physical_request_count == len(intents)
+    assert snapshot.cache_hit_count == 0
+    assert snapshot.deduplicated_count == 0
+
+
 def test_cache_body_limit_uses_authoritative_raw_bytes(tmp_path: Path) -> None:
     controller = _controller(
         tmp_path,

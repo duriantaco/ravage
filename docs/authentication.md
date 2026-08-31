@@ -135,6 +135,83 @@ ravage auth add ravage-brief.yaml \
 
 Set the generated `RAVAGE_PARTNER_API_KEY` value in `.env.ravage`.
 
+## Authorization matrix
+
+`ravage auth matrix` compares a small set of known resource URLs across
+isolated authenticated sessions and an optional anonymous session. It is a
+read-only authorization check, not resource discovery: the brief must configure
+at least two distinct identities, and you must supply every exact resource URL
+and expected actor decision.
+
+First configure and check each identity as described above. Then create a plan
+such as `authorization-matrix.yaml`:
+
+```yaml
+schema: ravage.authorization-matrix.plan.v1
+cases:
+  - id: invoice-1001
+    method: GET
+    url: http://127.0.0.1:3000/invoices/1001
+    owner: alice
+    marker_env: RAVAGE_INVOICE_1001_MARKER
+    expect:
+      alice: allow
+      bob: deny
+      anonymous: deny
+```
+
+Store `RAVAGE_INVOICE_1001_MARKER` in the private authentication secret source,
+such as `.env.ravage` beside the brief. Its value should be stable text that is
+unique to the owner's response for that exact resource. It must be at least 12
+printable characters, with no surrounding whitespace, and must not appear in
+the request URL. Keep the value out of the plan and command line. Run the plan
+with:
+
+```bash
+ravage auth matrix ravage-brief.yaml authorization-matrix.yaml
+```
+
+Each case has a lowercase `id` used only to label the result. `url` must be a
+concrete, absolute HTTP(S) URL without templates, globs, user information, or a
+fragment; Ravage does not increment, substitute, discover, or guess object IDs.
+`method` is optional and defaults to `GET`, but no other method is accepted.
+The `owner` must be a configured identity and must explicitly be `allow` in
+`expect`. Every other named actor must also be a configured identity and may be
+`allow` or `deny`. `anonymous` is the one special actor: it uses a credential-free
+session and must not be configured as an identity alias. Each case must compare
+at least two actors, and the matrix still requires at least two configured
+identities even when one expectation is for `anonymous`.
+
+An allowed actor is established only when a successful response contains the
+marker. A denied actor that exposes the marker on the repeated confirmation
+request produces a confirmed violation. A `401`, `403`, or `404` without the
+marker is a safe denial. Other responses, a missing or generic marker, transport
+errors, truncation, or an unstable owner baseline produce an inconclusive result
+instead of being treated as proof.
+
+All authenticated and anonymous requests share one low-noise `TrafficPolicy`,
+including its pacing, request ceiling, accounting, backoff, and circuit breaker.
+The matrix stops after a policy halt, and policy blocks, retries, reused
+responses, unmetered traffic, or inexact accounting make the affected result
+inconclusive rather than weakening the shared controls.
+
+The versioned result receipt contains actor and role labels, verdicts, reason
+codes, sanitized route metadata, response status and byte count, a
+marker-observed boolean, and aggregate traffic deltas. It does not contain
+credentials, response bodies, body digests, marker values, or raw URL query
+values. URL sanitization is not anonymization: route shape, case labels, actor
+aliases, and roles can remain, so do not put secrets or unnecessary personal
+data in them.
+
+This capability does not crawl for objects, enumerate adjacent identifiers,
+test state-changing methods, or infer an application's complete role or policy
+model. It only evaluates the explicit expectations and marker supplied in the
+plan. Matrix resource probes send only `GET`; configured login flows still send
+their normal authentication requests. A target that changes state on `GET` can
+also have side effects, so choose reviewed read-only endpoints in a disposable
+or staging environment. The supported login-flow limitations below apply to
+every configured matrix identity.
+
 ## What happens during an authenticated run
 
 Each identity gets an isolated cookie jar and set of headers. Ravage logs in,
