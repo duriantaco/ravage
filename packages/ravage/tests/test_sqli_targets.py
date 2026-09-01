@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 
 from ravage.agent_core.agent_state import AgentState
 from ravage.probe_suite_parts.sqli.sqli import (
+    _target_looks_auth_bypass_candidate,
     probe_filtered_query_bypass,
     probe_sqli_differential,
     probe_sqli_exploit_runner,
@@ -17,6 +18,23 @@ from ravage.web_core.http_probe import ProbeResponse
 
 _MIN_LONG_EXTRACTION_OFFSET = 73
 _MAX_PARENTHESES_UNION_REQUESTS = 100
+
+
+def test_testfire_uid_form_is_an_auth_bypass_candidate() -> None:
+    target = {
+        "kind": "form",
+        "url": "https://demo.testfire.net/doLogin",
+        "input": "uid",
+        "form": {
+            "inputs": [
+                {"name": "uid", "type": "text"},
+                {"name": "passw", "type": "password"},
+                {"name": "btnSubmit", "type": "submit"},
+            ]
+        },
+    }
+
+    assert _target_looks_auth_bypass_candidate(target)
 
 
 def test_sqli_targets_skip_off_origin_parameters_and_prioritize_contact_forms() -> None:

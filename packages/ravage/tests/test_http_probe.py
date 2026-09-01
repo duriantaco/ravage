@@ -7,12 +7,14 @@ from email.message import Message
 from http.client import HTTPException, IncompleteRead
 from http.cookiejar import Cookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from threading import Barrier, Lock, Thread
 from typing import cast
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request
 
 import pytest
+from ravage.traffic.policy import TrafficPolicyConfig, TrafficPolicyController
 from ravage.web_core.http_probe import (
     ProbeNetworkContext,
     ProbeResponse,
@@ -322,6 +324,83 @@ def test_remote_probe_rejects_unspecified_dns_addresses(
 
     assert response.status is None
     assert "unspecified address" in response.error
+
+
+@pytest.mark.parametrize(
+    "addresses",
+    [
+        ("127.0.0.1",),
+        ("10.0.0.8",),
+        ("169.254.169.254",),
+        ("224.0.0.1",),
+        ("ff0e::1",),
+        ("::1",),
+        ("8.8.8.8", "127.0.0.1"),
+    ],
+    ids=[
+        "loopback",
+        "private",
+        "metadata",
+        "ipv4-multicast",
+        "ipv6-multicast",
+        "ipv6-loopback",
+        "mixed",
+    ],
+)
+def test_public_only_policy_rejects_non_public_dns_before_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    addresses: tuple[str, ...],
+) -> None:
+    monkeypatch.setattr(
+        "ravage.web_core.http_probe.build_opener",
+        lambda *_handlers: _FakeOpener(),
+    )
+    target = "https://demo.testfire.net/login.jsp"
+    policy = TrafficPolicyController.open(
+        tmp_path / "traffic.json",
+        target_url=target,
+        config=TrafficPolicyConfig(require_public_addresses=True),
+    )
+    session = ProbeSession(
+        target,
+        allow_remote_target=True,
+        resolver=lambda _host, _port: addresses,
+        traffic_policy=policy,
+    )
+
+    response = session.get(target)
+
+    assert response.status is None
+    assert "non-public address" in response.error
+    assert policy.snapshot().physical_request_count == 0
+
+
+def test_public_only_policy_accepts_public_dns_answer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ravage.web_core.http_probe.build_opener",
+        lambda *_handlers: _FakeOpener(),
+    )
+    target = "https://demo.testfire.net/login.jsp"
+    policy = TrafficPolicyController.open(
+        tmp_path / "traffic.json",
+        target_url=target,
+        config=TrafficPolicyConfig(require_public_addresses=True),
+    )
+    session = ProbeSession(
+        target,
+        allow_remote_target=True,
+        resolver=lambda _host, _port: ("8.8.8.8",),
+        traffic_policy=policy,
+    )
+
+    response = session.get(target)
+
+    assert response.status == _FakeResponse.status
+    assert policy.snapshot().physical_request_count == 1
 
 
 def test_form_defaults_preserve_named_submit_controls() -> None:

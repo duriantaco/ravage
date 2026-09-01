@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -254,6 +255,41 @@ def test_policy_reference_cannot_weaken_settings(tmp_path: Path) -> None:
             target_url="http://127.0.0.1/",
             roe_max_rps=5,
         )
+
+
+def test_policy_reference_preserves_code_owned_request_restrictions(tmp_path: Path) -> None:
+    workspace = AgentWorkspace.open(tmp_path / "workspace")
+    config = replace(
+        TrafficPolicyConfig.low_noise(max_physical_requests=24, max_rps=0.5),
+        allowed_request_routes=("GET /login.jsp", "POST /doLogin"),
+        allowed_query_fields=("mode",),
+        allowed_explicit_headers=("content-type", "user-agent"),
+        allowed_form_fields=("passw", "uid"),
+        max_request_body_bytes=1_024,
+        request_value_profile="testfire-login-demo",
+        require_public_addresses=True,
+    )
+    expected = TrafficPolicyController.open(
+        workspace.root / "traffic-policy.json",
+        target_url="https://demo.testfire.net/login.jsp?mode=demo",
+        config=config,
+    )
+    settings = AIWebAgentSettings(
+        traffic_policy_mode="low-noise",
+        traffic_policy_max_physical_requests=24,
+        traffic_policy_max_rps=0.5,
+        traffic_policy_config=config,
+        traffic_policy_reference=expected.to_reference(),
+    )
+
+    opened = _open_run_traffic_policy(
+        settings=settings,
+        workspace=workspace,
+        target_url="https://demo.testfire.net/login.jsp?mode=demo",
+        roe_max_rps=0.5,
+    )
+
+    assert opened.config == config
 
 
 def test_resume_rejects_missing_workspace_policy_ledger(tmp_path: Path) -> None:

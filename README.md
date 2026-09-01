@@ -110,7 +110,9 @@ retention controls. Do not use a hosted route for sensitive customer or
 production data unless the engagement permits that disclosure. Use a local
 model route when target evidence must remain local.
 
-## Live XBEN demo
+## Live demos
+
+### Local XBEN
 
 For a short live demo, set <code>XBEN_ROOT</code> to the <code>benchmarks</code>
 directory in an XBEN checkout, start Docker, and export
@@ -124,6 +126,26 @@ Ravage builds a fresh local XBEN-009 target, attacks it with the pinned
 GPT-5.4 high profile, scores the result, saves the evidence under
 <code>runs/demo</code>, and removes the target and its local image. The preset
 limits the run to ten model requests, ten turns, ten minutes, and $1.50.
+
+### Authorized TestFire website
+
+For a live domain-name demo, Ravage can assess HCL AppScan's deliberately
+vulnerable TestFire banking site. HCL publishes
+<a href="https://help.hcl-software.com/appscan/ASoC/appseccloud_results_samplescans_2.html">demo.testfire.net as a dynamic scanning sample</a>.
+Review that authorization, export <code>OPENAI_API_KEY</code>, and explicitly
+acknowledge the remote target:
+
+~~~bash
+ravage demo testfire --authorized-remote-target
+~~~
+
+This command cannot accept another hostname. It permits only the curated login
+routes, GET/HEAD plus the login POST, and a code-owned set of harmless login
+values; stacked, destructive, and time-delay payloads are rejected before
+dispatch. It also disables process, scanner, recovery, and autonomous lanes,
+caps the whole run at 24 physical requests and 0.5 RPS, and stops after one
+non-destructive, evidence-backed finding. The target is a shared public demo and
+may occasionally be unavailable or reset by its operator.
 
 ## Authenticated testing
 
@@ -257,7 +279,8 @@ model assertion as a confirmed finding.
 | Traffic inspection and replay | <code>ravage traffic</code> | Scoped artifacts |
 | Knowledge skills | <code>ravage skills</code>, <code>ravage code-bug</code> | Advisory |
 | Passive SATCOM inspection | <code>ravage satcom inspect</code> | No transmit |
-| XBEN evaluation | <code>ravage xben</code>, <code>ravage demo xben</code> | Docker-based research harness and live demo |
+| Curated live demos | <code>ravage demo xben</code>, <code>ravage demo testfire</code> | Local XBEN or scope-locked HCL TestFire target |
+| XBEN evaluation | <code>ravage xben</code> | Docker-based research harness |
 | Improvement Lab | <code>scripts/improvement_lab.py</code> | Isolated archive |
 
 Knowledge skills can guide prioritization, but cannot add tools, expand scope,

@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 import os
+import posixpath
 import secrets
 import stat
 import tempfile
@@ -25,7 +26,7 @@ from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -36,6 +37,25 @@ TRAFFIC_POLICY_VERSION = 1
 _MAX_LEDGER_BYTES = 8_000_000
 _CACHE_FILE_SUFFIX = ".json"
 _OVERLOAD_STATUSES = frozenset({429, 502, 503, 504})
+_REQUEST_VALUE_PROFILES = frozenset({"testfire-login-demo"})
+_TESTFIRE_SAFE_QUERY_VALUES = {"mode": frozenset({"demo"})}
+_TESTFIRE_SAFE_FORM_VALUES = {
+    "btnsubmit": frozenset({"Login", "Submit", "btnSubmit"}),
+    "passw": frozenset({"", "RavagePass123!"}),
+    "uid": frozenset(
+        {
+            "",
+            "ravage",
+            "admin' -- ",
+            "admin' -- -",
+            "admin'#",
+            "' OR '1'='1' -- ",
+            "1' OR '1'='1' -- ",
+            "admin' OR '1'='1' -- ",
+            "admin') OR ('1'='1' -- ",
+        }
+    ),
+}
 _SENSITIVE_REQUEST_HEADERS = frozenset(
     {
         "authorization",
@@ -82,6 +102,10 @@ class TrafficPolicyConfig:
     ``observe`` records physical dispatches without changing request behavior.
     ``enforce`` activates the cap, pacing, cache/deduplication, retries, backoff,
     and circuit breaker.
+
+    ``allowed_explicit_headers`` constrains caller-supplied headers. Trusted
+    transport headers such as Host, Cookie, and Content-Length are generated
+    after admission and are not model-controlled.
     """
 
     mode: TrafficPolicyMode = TrafficPolicyMode.OBSERVE
@@ -100,6 +124,13 @@ class TrafficPolicyConfig:
     lease_timeout_seconds: float = 120.0
     dedupe_wait_timeout_seconds: float = 30.0
     cacheable_lanes: tuple[str, ...] = ("agent_http", "baseline", "recon")
+    allowed_request_routes: tuple[str, ...] = ()
+    allowed_query_fields: tuple[str, ...] | None = None
+    allowed_explicit_headers: tuple[str, ...] | None = None
+    allowed_form_fields: tuple[str, ...] | None = None
+    max_request_body_bytes: int | None = None
+    request_value_profile: str | None = None
+    require_public_addresses: bool = False
 
     def __post_init__(self) -> None:
         try:
@@ -135,6 +166,37 @@ class TrafficPolicyConfig:
         if not lanes:
             raise ValueError("cacheable_lanes cannot be empty")
         object.__setattr__(self, "cacheable_lanes", lanes)
+        routes = tuple(
+            sorted({_normalized_request_route(item) for item in self.allowed_request_routes})
+        )
+        object.__setattr__(self, "allowed_request_routes", routes)
+        object.__setattr__(
+            self,
+            "allowed_query_fields",
+            _normalized_field_names(self.allowed_query_fields, "allowed_query_fields"),
+        )
+        object.__setattr__(
+            self,
+            "allowed_explicit_headers",
+            _normalized_field_names(
+                self.allowed_explicit_headers,
+                "allowed_explicit_headers",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "allowed_form_fields",
+            _normalized_field_names(self.allowed_form_fields, "allowed_form_fields"),
+        )
+        if self.max_request_body_bytes is not None:
+            _positive_int(self.max_request_body_bytes, "max_request_body_bytes")
+        if (
+            self.request_value_profile is not None
+            and self.request_value_profile not in _REQUEST_VALUE_PROFILES
+        ):
+            raise ValueError("request_value_profile is unsupported")
+        if not isinstance(self.require_public_addresses, bool):
+            raise ValueError("require_public_addresses must be a boolean")
 
     @classmethod
     def low_noise(
@@ -154,7 +216,7 @@ class TrafficPolicyConfig:
         )
 
     def to_json(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "mode": self.mode.value,
             "max_rps": self.max_rps,
             "max_physical_requests": self.max_physical_requests,
@@ -172,6 +234,21 @@ class TrafficPolicyConfig:
             "dedupe_wait_timeout_seconds": self.dedupe_wait_timeout_seconds,
             "cacheable_lanes": list(self.cacheable_lanes),
         }
+        if self.allowed_request_routes:
+            payload["allowed_request_routes"] = list(self.allowed_request_routes)
+        if self.allowed_query_fields is not None:
+            payload["allowed_query_fields"] = list(self.allowed_query_fields)
+        if self.allowed_explicit_headers is not None:
+            payload["allowed_explicit_headers"] = list(self.allowed_explicit_headers)
+        if self.allowed_form_fields is not None:
+            payload["allowed_form_fields"] = list(self.allowed_form_fields)
+        if self.max_request_body_bytes is not None:
+            payload["max_request_body_bytes"] = self.max_request_body_bytes
+        if self.request_value_profile is not None:
+            payload["request_value_profile"] = self.request_value_profile
+        if self.require_public_addresses:
+            payload["require_public_addresses"] = True
+        return payload
 
     @classmethod
     def from_json(cls, value: Mapping[str, object]) -> Self:
@@ -192,6 +269,13 @@ class TrafficPolicyConfig:
             "lease_timeout_seconds",
             "dedupe_wait_timeout_seconds",
             "cacheable_lanes",
+            "allowed_request_routes",
+            "allowed_query_fields",
+            "allowed_explicit_headers",
+            "allowed_form_fields",
+            "max_request_body_bytes",
+            "request_value_profile",
+            "require_public_addresses",
         }
         unknown = set(value).difference(allowed)
         if unknown:
@@ -235,6 +319,19 @@ class TrafficPolicyConfig:
             cacheable_lanes=tuple(
                 str(item)
                 for item in _list(value.get("cacheable_lanes", list(defaults.cacheable_lanes)))
+            ),
+            allowed_request_routes=tuple(
+                str(item) for item in _list(value.get("allowed_request_routes", []))
+            ),
+            allowed_query_fields=_optional_string_tuple(value.get("allowed_query_fields")),
+            allowed_explicit_headers=_optional_string_tuple(
+                value.get("allowed_explicit_headers")
+            ),
+            allowed_form_fields=_optional_string_tuple(value.get("allowed_form_fields")),
+            max_request_body_bytes=_optional_int(value.get("max_request_body_bytes")),
+            request_value_profile=_optional_string(value.get("request_value_profile")),
+            require_public_addresses=_bool(
+                value.get("require_public_addresses", defaults.require_public_addresses)
             ),
         )
 
@@ -483,6 +580,10 @@ class TrafficPolicyController:
     def acquire(self, intent: RequestIntent, *, retry: bool = False) -> TrafficDecision:
         """Return a cache hit, a scheduled dispatch lease, or a preflight block."""
         self._validate_intent_origin(intent)
+        blocked_reason = self._request_restriction_reason(intent)
+        if blocked_reason:
+            self._record_blocked()
+            return TrafficDecision(TrafficDecisionKind.BLOCKED, reason=blocked_reason)
         wait_started = self._now()
         dedupe_observed = False
         while True:
@@ -907,6 +1008,84 @@ class TrafficPolicyController:
         if _target_origin(intent.url) != self.target_origin:
             raise TrafficPolicyBlocked("traffic intent belongs to a different target origin")
 
+    def _request_restriction_reason(  # noqa: PLR0911 - fail-closed checks stay explicit.
+        self,
+        intent: RequestIntent,
+    ) -> str:
+        config = self.config
+        if config.allowed_request_routes:
+            request_path = urlsplit(intent.url).path or "/"
+            normalized_path = _normalized_request_path(intent.url)
+            if request_path != normalized_path:
+                return "traffic request path is not canonical"
+            route = f"{intent.method} {normalized_path}"
+            if route not in config.allowed_request_routes:
+                return "traffic request method and path are outside the permitted route set"
+
+        parsed = urlsplit(intent.url)
+        query_fields: list[tuple[str, str]] = []
+        if config.allowed_query_fields is not None or config.request_value_profile is not None:
+            try:
+                query_fields = parse_qsl(
+                    parsed.query,
+                    keep_blank_values=True,
+                    max_num_fields=32,
+                )
+            except ValueError:
+                return "traffic request query is malformed or too large"
+        if config.allowed_query_fields is not None:
+            query_names = {str(name).casefold() for name, _value in query_fields}
+            if not query_names.issubset(set(config.allowed_query_fields)):
+                return "traffic request query contains a field outside the permitted set"
+        query_value_reason = _request_query_value_restriction_reason(
+            config.request_value_profile,
+            query_fields,
+        )
+        if query_value_reason:
+            return query_value_reason
+
+        if config.allowed_explicit_headers is not None:
+            header_names = {str(name).strip().casefold() for name in intent.headers}
+            if not header_names.issubset(set(config.allowed_explicit_headers)):
+                return "traffic request contains an explicit header outside the permitted set"
+
+        body = intent.body or b""
+        if config.max_request_body_bytes is not None and len(body) > config.max_request_body_bytes:
+            return "traffic request body exceeds the permitted size"
+        if not body:
+            return ""
+        if intent.method != "POST":
+            return "traffic request bodies are permitted only for POST"
+        if config.allowed_form_fields is None:
+            return ""
+        content_type = next(
+            (
+                str(value).split(";", 1)[0].strip().casefold()
+                for name, value in intent.headers.items()
+                if str(name).casefold() == "content-type"
+            ),
+            "",
+        )
+        if content_type != "application/x-www-form-urlencoded":
+            return "traffic request body is not an approved form encoding"
+        try:
+            decoded = body.decode("utf-8", errors="strict")
+            fields = parse_qsl(decoded, keep_blank_values=True, max_num_fields=16)
+        except (UnicodeDecodeError, ValueError):
+            return "traffic request form body is malformed or too large"
+        if not fields:
+            return "traffic request form body is empty"
+        field_names = {str(name).casefold() for name, _value in fields}
+        if not field_names.issubset(set(config.allowed_form_fields)):
+            return "traffic request form contains a field outside the permitted set"
+        form_value_reason = _request_form_value_restriction_reason(
+            config.request_value_profile,
+            fields,
+        )
+        if form_value_reason:
+            return form_value_reason
+        return ""
+
     @staticmethod
     def _validate_lease(raw: Mapping[str, object], lease: DispatchLease) -> str:
         if _counter(raw, "sequence") != lease.sequence:
@@ -1165,6 +1344,83 @@ def _target_origin(url: str) -> str:
     return urlunsplit((parsed.scheme.lower(), netloc, "", "", ""))
 
 
+def _normalized_request_route(value: object) -> str:
+    raw = str(value).strip()
+    method, separator, raw_path = raw.partition(" ")
+    method = method.strip().upper()
+    raw_path = raw_path.strip()
+    if (
+        not separator
+        or not method
+        or not method.isascii()
+        or not method.isalpha()
+        or not raw_path.startswith("/")
+        or "?" in raw_path
+        or "#" in raw_path
+    ):
+        raise ValueError("allowed_request_routes entries must use 'METHOD /absolute-path'")
+    path = _normalized_url_path(raw_path)
+    return f"{method} {path}"
+
+
+def _normalized_request_path(url: str) -> str:
+    return _normalized_url_path(urlsplit(url).path or "/")
+
+
+def _normalized_url_path(path: str) -> str:
+    normalized = posixpath.normpath(unquote(path or "/"))
+    if normalized == ".":
+        return "/"
+    return normalized if normalized.startswith("/") else f"/{normalized}"
+
+
+def _normalized_field_names(
+    values: tuple[str, ...] | None,
+    name: str,
+) -> tuple[str, ...] | None:
+    if values is None:
+        return None
+    normalized: set[str] = set()
+    for value in values:
+        field = str(value).strip().casefold()
+        if (
+            not field
+            or len(field) > 128
+            or any(character.isspace() or ord(character) < 33 for character in field)
+        ):
+            raise ValueError(f"{name} contains an invalid field name")
+        normalized.add(field)
+    return tuple(sorted(normalized))
+
+
+def _request_query_value_restriction_reason(
+    profile: str | None,
+    fields: list[tuple[str, str]],
+) -> str:
+    if profile is None:
+        return ""
+    if profile == "testfire-login-demo":
+        for raw_name, value in fields:
+            allowed = _TESTFIRE_SAFE_QUERY_VALUES.get(str(raw_name).casefold())
+            if allowed is None or value not in allowed:
+                return "traffic request query contains a value outside the safe profile"
+    return ""
+
+
+def _request_form_value_restriction_reason(
+    profile: str | None,
+    fields: list[tuple[str, str]],
+) -> str:
+    if profile is None:
+        return ""
+    if profile == "testfire-login-demo":
+        for raw_name, value in fields:
+            allowed = _TESTFIRE_SAFE_FORM_VALUES.get(str(raw_name).casefold())
+            if allowed is None or value not in allowed:
+                return "traffic request form contains a value outside the safe profile"
+    return ""
+
+
 def _retry_after_seconds(headers: Mapping[str, str], *, now: float) -> float:
     value = next(
         (str(item) for name, item in headers.items() if str(name).casefold() == "retry-after"),
@@ -1320,6 +1576,20 @@ def _optional_int(value: object) -> int | None:
 
 def _optional_float(value: object) -> float | None:
     return None if value is None else _float(value)
+
+
+def _optional_string(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TrafficPolicyError("traffic policy configuration string is invalid")
+    return value
+
+
+def _optional_string_tuple(value: object) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    return tuple(str(item) for item in _list(value))
 
 
 def _positive_number(value: object, name: str) -> None:
