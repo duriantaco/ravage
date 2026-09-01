@@ -208,6 +208,7 @@ from ravage.web_core.scope_policy import (
     is_local_url,
     same_origin,
 )
+from ravage.xben_parts.demo import handle_demo_command
 from ravage.xben_parts.models import DEFAULT_BENCHMARKS_ROOT, XbenSettings
 from ravage.xben_parts.runner import run_xben
 
@@ -249,6 +250,7 @@ _TOP_LEVEL_COMMANDS = (
     "code-bug",
     "competitors",
     "dashboard",
+    "demo",
     "doctor",
     "help",
     "init",
@@ -357,6 +359,9 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
     if args_list[:1] == ["competitors"]:
         _competitors(args_list[1:])
         return
+    if args_list[:1] == ["demo"]:
+        handle_demo_command(args_list[1:])
+        return
     if args_list[:1] in (["xben"], ["benchmark"]):
         _xben(args_list[1:])
         return
@@ -461,6 +466,11 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
         choices=["auto", "live", "plain", "quiet"],
         default="auto",
         help="run progress display (default: live on a terminal, plain when piped)",
+    )
+    parser.add_argument(
+        "--show-agent-actions",
+        action="store_true",
+        help="show concrete probe requests and response observations as they happen",
     )
     parser.add_argument("--allow-degraded", action="store_true")
     parser.add_argument("--allow-paid-models", action="store_true")
@@ -623,7 +633,10 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
                 parser.error(
                     f"cannot authenticate identity {args.identity!r}: {_concise_cli_error(exc)}"
                 )
-        run_display = _attack_event_sink(mode=args.display)
+        run_display = _attack_event_sink(
+            mode=args.display,
+            show_agent_actions=args.show_agent_actions,
+        )
         settings = AIWebAgentSettings(
             db_path=args.db_path,
             report_path=args.report_path,
@@ -800,6 +813,7 @@ def _top_level_help() -> None:
                 "  ravage scan --list-probes",
                 "  ravage auth add BRIEF.yaml --type form --health /account --marker Logout",
                 "  ravage traffic capture http://127.0.0.1:3000",
+                "  ravage demo xben",
                 "  ravage lab list",
                 "  ravage authbench",
                 "",
@@ -827,6 +841,7 @@ def _top_level_help() -> None:
                 "  ravage skills {list,validate} [PATH|builtin]",
                 "  ravage satcom inspect ARTIFACT --format {tle,ccsds-space-packets}",
                 "  ravage competitors {preflight,run,report,adapt-ravage}",
+                "  ravage demo xben",
                 "  ravage lab {list,show,up,down}",
                 "  ravage observe RUN_DIR",
                 "  ravage report RUN_DIR --brief BRIEF.yaml",
@@ -2034,6 +2049,11 @@ def _attack(  # noqa: C901, PLR0912, PLR0915 - CLI options are intentionally exp
         default="auto",
         help="run progress display (default: live on a terminal, plain when piped)",
     )
+    parser.add_argument(
+        "--show-agent-actions",
+        action="store_true",
+        help="show concrete probe requests and response observations as they happen",
+    )
     tool_recon = parser.add_mutually_exclusive_group()
     tool_recon.add_argument("--tool-recon", dest="tool_recon", action="store_true")
     tool_recon.add_argument("--no-tool-recon", dest="tool_recon", action="store_false")
@@ -2683,6 +2703,8 @@ def _local_attack_command(  # noqa: C901, PLR0912, PLR0913
         command.append("--allow-degraded")
     if parsed.allow_paid_models:
         command.append("--allow-paid-models")
+    if parsed.show_agent_actions:
+        command.append("--show-agent-actions")
     if parsed.authorized_remote_target:
         command.append("--authorized-remote-target")
     if parsed.allow_empty_description:
@@ -2839,17 +2861,34 @@ def _assert_fresh_scan_workspace(
 
 
 class _AttackEventSink:
-    def __init__(self, *, mode: DisplayMode) -> None:
+    def __init__(self, *, mode: DisplayMode, show_agent_actions: bool = False) -> None:
+        self.show_agent_actions = show_agent_actions
         output = sys.stdout
         if isinstance(output, _TeeStream):
-            self._displays = [RunDisplay(mode=mode, stream=output.primary_stream)]
+            self._displays = [
+                RunDisplay(
+                    mode=mode,
+                    stream=output.primary_stream,
+                    show_agent_actions=show_agent_actions,
+                )
+            ]
             transcript_mode: DisplayMode = "quiet" if mode == "quiet" else "plain"
             self._displays.extend(
-                RunDisplay(mode=transcript_mode, stream=stream)
+                RunDisplay(
+                    mode=transcript_mode,
+                    stream=stream,
+                    show_agent_actions=show_agent_actions,
+                )
                 for stream in output.transcript_streams
             )
         else:
-            self._displays = [RunDisplay(mode=mode, stream=output)]
+            self._displays = [
+                RunDisplay(
+                    mode=mode,
+                    stream=output,
+                    show_agent_actions=show_agent_actions,
+                )
+            ]
 
     def __call__(self, event: Mapping[str, Any]) -> None:
         for display in self._displays:
@@ -2862,8 +2901,12 @@ class _AttackEventSink:
                 display.close()
 
 
-def _attack_event_sink(*, mode: DisplayMode = "auto") -> _AttackEventSink:
-    return _AttackEventSink(mode=mode)
+def _attack_event_sink(
+    *,
+    mode: DisplayMode = "auto",
+    show_agent_actions: bool = False,
+) -> _AttackEventSink:
+    return _AttackEventSink(mode=mode, show_agent_actions=show_agent_actions)
 
 
 def _scan(args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
@@ -5069,6 +5112,11 @@ def _xben(args: list[str]) -> None:  # noqa: PLR0915 - benchmark options are exp
     parser.add_argument("--tool-image", default=DEFAULT_TOOL_IMAGE)
     parser.add_argument("--flag-mode", choices=["exact", "pattern"], default="exact")
     parser.add_argument("--operator-log-root", type=Path)
+    parser.add_argument(
+        "--stream-agent-output",
+        action="store_true",
+        help="show each child attack step while retaining the per-case agent.stdout artifact",
+    )
     parser.add_argument("--cockpit", action="store_true")
     parser.add_argument("--cockpit-host", default="127.0.0.1")
     parser.add_argument("--cockpit-port", type=int, default=8787)
@@ -5125,6 +5173,7 @@ def _xben(args: list[str]) -> None:  # noqa: PLR0915 - benchmark options are exp
         tool_runtime=parsed.tool_runtime,
         tool_image=parsed.tool_image,
         operator_log_root=parsed.operator_log_root or parsed.output_dir / "operator-logs",
+        stream_agent_output=parsed.stream_agent_output,
         cockpit=parsed.cockpit,
         cockpit_host=parsed.cockpit_host,
         cockpit_port=parsed.cockpit_port,

@@ -12,6 +12,7 @@ from urllib.request import Request
 import pytest
 from ravage import probe_runner
 from ravage.agent_core.agent_state import AgentState
+from ravage.agent_core.live_events import PROBE_HTTP_EVENT_PREFIX
 from ravage.probe_suite import run_builtin_probe
 from ravage.probe_suite_parts.result import ProbeRunResult
 from ravage.traffic.policy import (
@@ -703,6 +704,54 @@ def test_probe_runner_accepts_fractional_rate_and_object_policy_reference(
     assert result["status"] == "ok"
     assert captured["max_rps"] == 0.5
     assert captured["traffic_policy_reference"] == reference
+
+
+def test_probe_runner_streams_secret_safe_http_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stderr = StringIO()
+
+    def fake_run_builtin_probe(*_args: object, **kwargs: object) -> ProbeRunResult:
+        observer = kwargs["traffic_observer"]
+        assert callable(observer)
+        observer(
+            {
+                "method": "GET",
+                "url": (
+                    "http://127.0.0.1:8000/greet/"
+                    "?name=%7B%7B7%2A7%7D%7D&token=do-not-print"
+                ),
+                "response_status": 200,
+                "response_body": b"<h1>Hello, 49 flag{proof-secret}</h1>",
+                "elapsed_ms": 8,
+                "disposition": "sent",
+            }
+        )
+        return ProbeRunResult(ok=True, probe="ssti_fingerprint", summary="accepted")
+
+    monkeypatch.setattr(probe_runner, "run_builtin_probe", fake_run_builtin_probe)
+    monkeypatch.setattr(probe_runner.sys, "stderr", stderr)
+
+    result = _invoke_probe_runner(
+        monkeypatch,
+        {
+            "probe": "ssti_fingerprint",
+            "target_url": _TARGET_URL,
+            "trace_http": True,
+        },
+    )
+
+    assert result["status"] == "ok"
+    line = stderr.getvalue().strip()
+    assert line.startswith(PROBE_HTTP_EVENT_PREFIX)
+    event = json.loads(line.removeprefix(PROBE_HTTP_EVENT_PREFIX))
+    assert event["query"] == [
+        {"name": "name", "value": "{{7*7}}"},
+        {"name": "token", "value": "[REDACTED]"},
+    ]
+    assert event["response_summary"] == "Hello, 49 [REDACTED-PROOF]"
+    assert "do-not-print" not in line
+    assert "proof-secret" not in line
 
 
 @pytest.mark.parametrize(

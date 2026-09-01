@@ -169,6 +169,7 @@ class XbenSettings:
     proof_bundle_verifier: bool = False
     require_proof_bundle_findings: bool = False
     operator_log_root: Path = Path("logs")
+    stream_agent_output: bool = False
     cockpit: bool = False
     cockpit_host: str = "127.0.0.1"
     cockpit_port: int = 8787

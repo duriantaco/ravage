@@ -357,6 +357,7 @@ def test_ssti_prioritizes_openapi_username_over_generated_probe_urls(monkeypatch
     target = first_baseline["target"]
     assert isinstance(target, dict)
     assert target["input"] == "username"
+    assert sum(request.get("probe_kind") == "baseline" for request in result.requests) == 1
 
 
 def test_ssti_does_not_post_generated_username_query_endpoint(monkeypatch) -> None:

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import io
+import json
 from typing import TYPE_CHECKING
 
 import pytest
 from ravage import __main__ as cli
+from ravage.agent_core.live_events import probe_http_exchange_payload
 from ravage.cli_run_display import RunDisplay, redacted_target_url
 
 if TYPE_CHECKING:
@@ -21,6 +23,210 @@ class _ASCIIBuffer(io.StringIO):
     @property
     def encoding(self) -> str:
         return "ascii"
+
+
+def test_agent_action_trace_shows_reasoning_and_real_http_exchanges() -> None:
+    output = io.StringIO()
+    display = RunDisplay(mode="plain", stream=output, show_agent_actions=True)
+
+    display(
+        _event(
+            "recon_completed",
+            {
+                "pages": [
+                    {
+                        "url": "http://127.0.0.1:8000/",
+                        "final_url": "http://127.0.0.1:8000/",
+                        "status": 200,
+                        "title": "SSTI Demo",
+                        "reflected_parameters": [
+                            {
+                                "name": "name",
+                                "url": "http://127.0.0.1:8000/greet/?name=marker",
+                            }
+                        ],
+                        "forms": [
+                            {
+                                "method": "GET",
+                                "action": "http://127.0.0.1:8000/greet/",
+                                "inputs": [{"name": "name"}],
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+    )
+    display(
+        _event(
+            "harness_selection",
+            {
+                "turn": 1,
+                "selected_action": {
+                    "action": "run_probe",
+                    "probe": "ssti_fingerprint",
+                    "hypotheses": ["The reflected name may be evaluated server-side."],
+                    "fallback": "Map the HTML reflection context.",
+                },
+                "selected_route": {"family": "template_injection"},
+            },
+        )
+    )
+    display(
+        _event(
+            "action_started",
+            {
+                "action_id": "action-1",
+                "action_kind": "run_probe",
+                "params": {"probe": "ssti_fingerprint"},
+                "turn": 1,
+            },
+        )
+    )
+    display(
+        _event(
+            "probe_http_exchange",
+            probe_http_exchange_payload(
+                {
+                    "method": "GET",
+                    "url": "http://127.0.0.1:8000/greet/?name=ravage",
+                    "response_status": 200,
+                    "response_body": b"<h1>Hello, ravage</h1>",
+                    "elapsed_ms": 7,
+                    "disposition": "sent",
+                },
+                index=1,
+                probe="ssti_fingerprint",
+            ),
+        )
+    )
+    display(
+        _event(
+            "probe_http_exchange",
+            probe_http_exchange_payload(
+                {
+                    "method": "GET",
+                    "url": (
+                        "http://127.0.0.1:8000/greet/"
+                        "?name=%7B%7B+7%7Cadd%3A%2242%22+%7D%7D&token=hidden"
+                    ),
+                    "response_status": 200,
+                    "response_body": b"<h1>Hello, 49</h1>",
+                    "elapsed_ms": 9,
+                    "disposition": "sent",
+                },
+                index=2,
+                probe="ssti_fingerprint",
+            ),
+        )
+    )
+    display(
+        _event(
+            "probe_http_exchange",
+            probe_http_exchange_payload(
+                {
+                    "method": "GET",
+                    "url": (
+                        "http://127.0.0.1:8000/greet/"
+                        "?name=%7B%7BFLAG%7D%7D"
+                    ),
+                    "response_status": 200,
+                    "response_body": b"<h1>Hello, flag{do-not-print-this}</h1>",
+                    "elapsed_ms": 8,
+                    "disposition": "sent",
+                },
+                index=3,
+                probe="ssti_fingerprint",
+            ),
+        )
+    )
+    display.close()
+
+    text = output.getvalue()
+    assert "Mapped · GET / · 200 · SSTI Demo" in text
+    assert "Reflection · name · GET /greet/" in text
+    assert "Form · GET /greet/ · fields=name" in text
+    assert "[agent] I found the name input reflected by GET /greet/." in text
+    assert "[agent] I suspect the reflected name may be evaluated server-side." in text
+    assert "[agent] Next I'll run the ssti fingerprint probe" in text
+    assert (
+        "[agent] If that signal is absent, my fallback is: "
+        "Map the HTML reflection context."
+    ) in text
+    assert "[agent] I'm starting with a baseline, then harmless SSTI fingerprints" in text
+    assert "[agent] I'm establishing a baseline for GET /greet/" in text
+    assert "[agent] The ordinary value was reflected." in text
+    assert "[agent] Now I'm trying harmless Django template arithmetic" in text
+    assert 'Request 02 · GET · /greet/?name={{ 7|add:"42" }}&token=[REDACTED]' in text
+    assert "Response · 200 · 9ms · Hello, 49" in text
+    assert "[agent] The response became 49, not the literal expression." in text
+    assert "[agent] I'm waiting for probe validation before calling it confirmed." in text
+    assert "That confirms template evaluation" not in text
+    assert "[agent] Template evaluation worked." in text
+    assert "[agent] Now I'm trying the smallest engine-specific proof read." in text
+    assert "[agent] A proof-shaped value came back." in text
+    assert "hidden" not in text
+    assert "flag{do-not-print-this}" not in text
+
+
+def test_agent_action_trace_redacts_proof_bodies() -> None:
+    payload = probe_http_exchange_payload(
+        {
+            "method": "GET",
+            "url": "http://127.0.0.1:8000/greet/?name=%7B%7BFLAG%7D%7D",
+            "response_status": 200,
+            "response_body": b"Hello flag{do-not-print-this}",
+        },
+        index=3,
+        probe="ssti_fingerprint",
+    )
+
+    assert payload["query"] == [{"name": "name", "value": "{{FLAG}}"}]
+    assert payload["response_summary"] == "Hello [REDACTED-PROOF]"
+
+
+def test_agent_action_trace_redacts_short_structured_secrets() -> None:
+    json_payload = probe_http_exchange_payload(
+        {
+            "method": "POST",
+            "url": (
+                "http://127.0.0.1:8000/reset/short-code"
+                "?code=short-code&view=compact"
+            ),
+            "request_body": (
+                b'{"password":"short-secret","nested":{"api_key":"short-key"},'
+                b'"note":"safe"}'
+            ),
+            "response_status": 200,
+            "response_body": b'{"token":"short-response","status":"ok"}',
+        },
+        index=1,
+        probe="auth_flow",
+    )
+    form_payload = probe_http_exchange_payload(
+        {
+            "method": "POST",
+            "url": "http://127.0.0.1:8000/login",
+            "request_body": b"username=alice&code=1234&password=tiny",
+            "response_status": 204,
+        },
+        index=2,
+        probe="auth_flow",
+    )
+
+    serialized = json.dumps([json_payload, form_payload], sort_keys=True)
+    for secret in ("short-code", "short-secret", "short-key", "short-response", "1234", "tiny"):
+        assert secret not in serialized
+    assert json_payload["path"] == "/reset/:id"
+    assert json_payload["query"] == [
+        {"name": "code", "value": "[REDACTED]"},
+        {"name": "view", "value": "compact"},
+    ]
+    assert '"note":"safe"' in json_payload["request_body"]
+    assert '"status":"ok"' in json_payload["response_summary"]
+    assert form_payload["request_body"] == (
+        "username=alice&code=[REDACTED]&password=[REDACTED]"
+    )
 
 
 def test_attack_sink_keeps_live_ansi_out_of_plain_transcript(

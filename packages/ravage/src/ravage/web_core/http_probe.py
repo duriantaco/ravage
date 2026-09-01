@@ -714,6 +714,24 @@ class ProbeSession:
         """Install owner preflight with an optional post-dispatch accounting commit."""
         self._request_gate = gate
 
+    def add_traffic_observer(
+        self,
+        observer: Callable[[dict[str, object]], None],
+    ) -> None:
+        """Add an auxiliary observer without replacing traffic accounting capture."""
+        existing = self._traffic_observer
+        if existing is None:
+            self._traffic_observer = observer
+            return
+
+        def combined(event: dict[str, object]) -> None:
+            with suppress(Exception):
+                existing(event)
+            with suppress(Exception):
+                observer(event)
+
+        self._traffic_observer = combined
+
     def bind_managed_request_delegate(
         self,
         delegate: Callable[..., ProbeResponse],

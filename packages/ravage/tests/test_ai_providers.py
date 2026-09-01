@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 OPENAI_MINI_STANDARD_PRICES = (0.75, 0.075, 4.5)
+GPT_5_4_HIGH_OUTPUT_TOKENS = 16_384
 ANTHROPIC_STANDARD_ROUTES = (
     ("high", "claude-opus-4-7", (5.0, 0.5, 25.0)),
     ("mid", "claude-sonnet-4-6", (3.0, 0.3, 15.0)),
@@ -141,6 +142,28 @@ def test_hosted_openai_profile_reports_missing_key() -> None:
     assert not routes[0].ready
     assert routes[0].missing_env == ("OPENAI_API_KEY",)
     assert ready_model_routes(routes) == ()
+
+
+def test_hosted_openai_gpt_5_4_high_profile_is_pinned_and_accountable() -> None:
+    env = {"OPENAI_API_KEY": "test-key"}
+    registry = load_model_registry(env=env)
+
+    route = resolve_model_routes(
+        registry,
+        profile_name="hosted-openai-gpt-5.4-high",
+        tier="high",
+        env=env,
+    )[0]
+
+    assert route.ready
+    assert route.model == "gpt-5.4-2026-03-05"
+    assert route.reasoning_effort == "high"
+    assert route.max_output_tokens == GPT_5_4_HIGH_OUTPUT_TOKENS
+    assert (
+        route.input_cost_per_1m_tokens,
+        route.cached_input_cost_per_1m_tokens,
+        route.output_cost_per_1m_tokens,
+    ) == (2.5, 0.25, 15.0)
 
 
 def test_hosted_openai_low_route_has_pinned_standard_pricing() -> None:

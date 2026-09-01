@@ -28,6 +28,7 @@ from ravage.web_core.http_probe import ProbeResponse
 from ravage.web_core.poc_validator import validate_http_poc
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
 
@@ -68,6 +69,92 @@ def test_available_probes_cover_core_black_box_workflows() -> None:
         "browser_boundary",
         "idor_boundary",
     }.issubset(names)
+
+
+def test_probe_action_records_streamed_http_exchanges_live(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TraceSink:
+        show_agent_actions = True
+
+        def __init__(self) -> None:
+            self.events: list[dict[str, object]] = []
+
+        def __call__(self, event: Mapping[str, object]) -> None:
+            self.events.append(dict(event))
+
+    captured: dict[str, object] = {}
+
+    def fake_streaming_probe(
+        *,
+        request: str,
+        timeout_seconds: int,
+        progress_sink: object,
+    ) -> _CompletedProbeRunner:
+        captured["request"] = json.loads(request)
+        captured["timeout_seconds"] = timeout_seconds
+        assert callable(progress_sink)
+        progress_sink(
+            {
+                "index": 1,
+                "probe": "surface_map",
+                "method": "GET",
+                "path": "/",
+                "query": [],
+                "request_body": "",
+                "status": 200,
+                "elapsed_ms": 3,
+                "response_summary": "Home",
+                "disposition": "sent",
+                "error": "",
+            }
+        )
+        probe_text = json.dumps(
+            {
+                "ok": True,
+                "probe": "surface_map",
+                "summary": "mapped target",
+                "findings": [],
+                "requests": [],
+                "errors": [],
+            }
+        )
+        return _CompletedProbeRunner(
+            json.dumps({"status": "ok", "ok": True, "text": probe_text})
+        )
+
+    monkeypatch.setattr(
+        "ravage.agent_core.action_executor._run_streaming_probe_subprocess",
+        fake_streaming_probe,
+    )
+    sink = TraceSink()
+    workspace = AgentWorkspace.open(tmp_path / "workspace", event_sink=sink)
+    audit = AuditStore(tmp_path / "audit.db")
+    try:
+        outcome = execute_action(
+            {"action": "run_probe", "probe": "surface_map"},
+            target_url="http://127.0.0.1/",
+            runtime=_ProofRuntime(),
+            state=AgentState(),
+            workspace=workspace,
+            audit=audit,
+            engagement_id=uuid4(),
+            repeat_count=1,
+            max_observation_chars=2_000,
+            max_transcript_chars=4_000,
+            action_id="trace-action",
+        )
+    finally:
+        audit.close()
+
+    assert outcome.ok is True
+    assert captured["request"]["trace_http"] is True
+    trace_events = [event for event in sink.events if event["kind"] == "probe_http_exchange"]
+    assert len(trace_events) == 1
+    payload = trace_events[0]["payload"]
+    assert payload["action_id"] == "trace-action"
+    assert payload["response_summary"] == "Home"
 
 
 def test_executor_owned_probe_batch_feeds_canonical_surface_graph(

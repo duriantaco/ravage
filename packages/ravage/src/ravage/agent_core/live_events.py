@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
 import re
+from html import unescape
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, unquote, urlparse
 
-MASK = "••••" 
+from ravage.traffic.redaction import REDACTED, redact_text, sanitize_url
+
+MASK = "••••"
 
 _SECRET_KEY_HINTS = (
     "password",
@@ -22,6 +26,7 @@ _SECRET_KEY_HINTS = (
     "credential",
     "private_key",
 )
+_SECRET_EXACT_KEYS = frozenset({"code", "pin"})
 
 _SECRET_INLINE_RE = re.compile(
     r"(?i)\b(password|passwd|pwd|secret|token|otp|api[_-]?key|access[_-]?key|authorization)\b"
@@ -30,11 +35,22 @@ _SECRET_INLINE_RE = re.compile(
 )
 
 _MAX_DETAIL_CHARS = 160
+PROBE_HTTP_EVENT_PREFIX = "RAVAGE_PROBE_HTTP "
+_MAX_TRACE_QUERY_FIELDS = 12
+_MAX_TRACE_VALUE_CHARS = 160
+_MAX_TRACE_RESPONSE_CHARS = 240
+_HTML_TAG_RE = re.compile(r"<[^>]{0,512}>")
+_WHITESPACE_RE = re.compile(r"\s+")
+_QUOTED_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)([\"'][^\"']*(?:password|passwd|pwd|secret|token|otp|api[_-]?key|"
+    r"access[_-]?key|authorization|session|cookie|credential|private[_-]?key|code|pin)"
+    r"[^\"']*[\"']\s*:\s*[\"'])([^\"']*)([\"'])"
+)
 
 
 def looks_secret(key: str) -> bool:
-    lowered = str(key).lower()
-    return any(hint in lowered for hint in _SECRET_KEY_HINTS)
+    lowered = str(key).strip().lower()
+    return lowered in _SECRET_EXACT_KEYS or any(hint in lowered for hint in _SECRET_KEY_HINTS)
 
 
 def mask_value(key: str, value: object) -> object:
@@ -178,6 +194,163 @@ def http_step_payload(  # noqa: PLR0913 - flat kwargs mirror the recorded payloa
         "response_headers": mask_headers(response_headers),
         "body": _clip(str(body), 800) if isinstance(body, str) and body else "",
     }
+
+
+def probe_http_exchange_payload(
+    event: dict[str, object],
+    *,
+    index: int,
+    probe: str,
+) -> dict[str, Any]:
+    """Build a bounded, secret-safe live view of one probe HTTP exchange."""
+    method = str(event.get("method") or "GET").strip().upper()
+    path, query = _trace_request_target(event.get("url"))
+    status_value = event.get("response_status")
+    status = (
+        status_value
+        if isinstance(status_value, int) and not isinstance(status_value, bool)
+        else None
+    )
+    elapsed_value = event.get("elapsed_ms")
+    elapsed_ms = (
+        max(0, elapsed_value)
+        if isinstance(elapsed_value, int) and not isinstance(elapsed_value, bool)
+        else 0
+    )
+    request_body = _trace_body(event.get("request_body"), response=False)
+    response_body = _trace_body(event.get("response_body"), response=True)
+    return {
+        "index": max(1, index),
+        "probe": _clip(str(probe or "probe"), 80),
+        "method": method if re.fullmatch(r"[A-Z]{3,12}", method) else "HTTP",
+        "path": path,
+        "query": query,
+        "request_body": request_body,
+        "status": status,
+        "elapsed_ms": elapsed_ms,
+        "response_summary": response_body,
+        "disposition": _clip(str(event.get("disposition") or "sent"), 24),
+        "error": redact_text(event.get("error") or "", max_chars=160),
+    }
+
+
+def _trace_request_target(value: object) -> tuple[str, list[dict[str, str]]]:
+    raw_url = str(value or "")
+    try:
+        parsed = urlparse(raw_url)
+    except ValueError:
+        return "/", []
+    safe_url = sanitize_url(raw_url)
+    try:
+        path = unquote(urlparse(safe_url).path or "/")
+    except ValueError:
+        path = "/"
+    path = redact_text(path, max_chars=240) or "/"
+    try:
+        items = parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+            max_num_fields=_MAX_TRACE_QUERY_FIELDS,
+        )
+    except ValueError:
+        items = []
+    query: list[dict[str, str]] = []
+    for raw_name, raw_value in items[:_MAX_TRACE_QUERY_FIELDS]:
+        name = redact_text(raw_name, max_chars=80)
+        if not name:
+            continue
+        value_text = (
+            REDACTED
+            if looks_secret(name)
+            else redact_text(raw_value, max_chars=_MAX_TRACE_VALUE_CHARS)
+        )
+        query.append({"name": name, "value": value_text})
+    return path, query
+
+
+def _trace_body(value: object, *, response: bool) -> str:
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    elif isinstance(value, str):
+        text = value
+    else:
+        return ""
+    structured = _trace_json_body(text)
+    if structured is not None:
+        text = structured
+    elif response:
+        text = unescape(_HTML_TAG_RE.sub(" ", text))
+    else:
+        form = _trace_form_body(text)
+        if form is None:
+            return "[request body omitted]"
+        text = form
+    text = _QUOTED_SECRET_ASSIGNMENT_RE.sub(r"\1[REDACTED]\3", text)
+    text = _WHITESPACE_RE.sub(" ", text).strip()
+    limit = _MAX_TRACE_RESPONSE_CHARS if response else _MAX_TRACE_VALUE_CHARS
+    return redact_text(text, max_chars=limit).replace("%5BREDACTED%5D", REDACTED)
+
+
+def _trace_json_body(value: str) -> str | None:
+    try:
+        decoded = json.loads(value)
+    except (json.JSONDecodeError, RecursionError):
+        return None
+    if not isinstance(decoded, dict | list):
+        return None
+    masked = _mask_trace_value(decoded)
+    return json.dumps(masked, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _trace_form_body(value: str) -> str | None:
+    if "=" not in value or "\n" in value or "\r" in value:
+        return None
+    try:
+        items = parse_qsl(
+            value,
+            keep_blank_values=True,
+            max_num_fields=_MAX_TRACE_QUERY_FIELDS,
+        )
+    except ValueError:
+        return None
+    if not items:
+        return None
+    fields: list[str] = []
+    for raw_name, raw_value in items[:_MAX_TRACE_QUERY_FIELDS]:
+        name = redact_text(raw_name, max_chars=80)
+        if not name:
+            continue
+        field_value = (
+            REDACTED
+            if looks_secret(name)
+            else redact_text(raw_value, max_chars=_MAX_TRACE_VALUE_CHARS)
+        )
+        fields.append(f"{name}={field_value}")
+    return "&".join(fields)
+
+
+def _mask_trace_value(value: object, *, depth: int = 0) -> object:
+    if depth >= 6:
+        return "[nested value omitted]"
+    if isinstance(value, dict):
+        masked: dict[str, object] = {}
+        for raw_key, raw_value in list(value.items())[:24]:
+            key = redact_text(raw_key, max_chars=80)
+            if not key:
+                continue
+            masked[key] = (
+                REDACTED
+                if looks_secret(key)
+                else _mask_trace_value(raw_value, depth=depth + 1)
+            )
+        return masked
+    if isinstance(value, list):
+        return [_mask_trace_value(item, depth=depth + 1) for item in value[:24]]
+    if isinstance(value, str):
+        return redact_text(value, max_chars=_MAX_TRACE_VALUE_CHARS)
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    return redact_text(value, max_chars=_MAX_TRACE_VALUE_CHARS)
 
 
 def _path_of(url: str) -> str:

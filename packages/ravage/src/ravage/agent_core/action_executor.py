@@ -4,16 +4,22 @@ import json
 import re
 import subprocess
 import sys
+import threading
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TextIO, cast
 from urllib.parse import parse_qsl, unquote_plus, urljoin, urlsplit, urlunsplit
 from uuid import UUID, uuid5
 
 from ravage.agent_core.agent_state import AgentState, append_unique, merge_signals
 from ravage.agent_core.agent_strategy import observation_digest
-from ravage.agent_core.live_events import http_step_payload, mask_headers
+from ravage.agent_core.live_events import (
+    PROBE_HTTP_EVENT_PREFIX,
+    http_step_payload,
+    mask_headers,
+    probe_http_exchange_payload,
+)
 from ravage.agent_core.observation_analysis import (
     classify_action_result,
     extract_probe_signals,
@@ -171,6 +177,9 @@ class _ProbeActionResult:
     timed_out: bool = False
 
 
+ProbeProgressSink = Callable[[dict[str, object]], None]
+
+
 def execute_action(  # noqa: PLR0913
     action: dict[str, object],
     *,
@@ -271,6 +280,14 @@ def execute_action(  # noqa: PLR0913
         )
     if kind == "run_probe":
         probe = str(action.get("probe") or "").strip()
+        progress_sink = (
+            _probe_progress_recorder(
+                workspace=workspace,
+                action_id=action_id,
+            )
+            if _shows_agent_actions(workspace)
+            else None
+        )
         unavailable_reason = (
             authenticated_probe_unavailability(probe) if authentication is not None else ""
         )
@@ -312,6 +329,7 @@ def execute_action(  # noqa: PLR0913
                 authentication=authentication,
                 use_managed_identity=use_managed_identity,
                 traffic_policy=traffic_policy,
+                progress_sink=progress_sink,
             )
         else:
             probe_result = _run_probe_action(
@@ -322,6 +340,7 @@ def execute_action(  # noqa: PLR0913
                 traffic_policy_reference=(
                     traffic_policy.to_reference() if traffic_policy is not None else None
                 ),
+                progress_sink=progress_sink,
             )
         result = record_probe_result(
             probe_result.text,
@@ -2746,7 +2765,42 @@ def _bounded_tool_command(command: Sequence[str], *, max_chars: int) -> list[str
     ]
 
 
-def _run_authenticated_probe_action(
+def _shows_agent_actions(workspace: AgentWorkspace) -> bool:
+    event_sink = workspace.event_sink
+    return event_sink is not None and getattr(event_sink, "show_agent_actions", False) is True
+
+
+def _probe_progress_recorder(
+    *,
+    workspace: AgentWorkspace,
+    action_id: str,
+) -> ProbeProgressSink:
+    def record(payload: dict[str, object]) -> None:
+        workspace.record_event(
+            kind="probe_http_exchange",
+            payload={**payload, "action_id": action_id},
+        )
+
+    return record
+
+
+def _probe_traffic_observer(
+    probe: str,
+    progress_sink: ProbeProgressSink | None,
+) -> Callable[[dict[str, object]], None] | None:
+    if progress_sink is None:
+        return None
+    index = 0
+
+    def observe(event: dict[str, object]) -> None:
+        nonlocal index
+        index += 1
+        progress_sink(probe_http_exchange_payload(event, index=index, probe=probe))
+
+    return observe
+
+
+def _run_authenticated_probe_action(  # noqa: PLR0913
     probe: str,
     *,
     target_url: str,
@@ -2755,6 +2809,7 @@ def _run_authenticated_probe_action(
     authentication: ManagedAttackAuthentication,
     use_managed_identity: bool,
     traffic_policy: TrafficPolicyController | None = None,
+    progress_sink: ProbeProgressSink | None = None,
 ) -> _ProbeActionResult:
     session: ProbeSession | None = None
     session_mode = (
@@ -2768,6 +2823,14 @@ def _run_authenticated_probe_action(
             if use_managed_identity
             else None
         )
+        authenticated_progress_sink = (
+            _authenticated_probe_progress_sink(authentication, progress_sink)
+            if progress_sink is not None
+            else None
+        )
+        trace_observer = _probe_traffic_observer(probe, authenticated_progress_sink)
+        if session is not None and trace_observer is not None:
+            session.add_traffic_observer(trace_observer)
         result = run_builtin_probe(
             probe,
             target_url=target_url,
@@ -2778,6 +2841,7 @@ def _run_authenticated_probe_action(
             out_of_scope=_surface_string_list(state, "scope_out_of_scope"),
             max_rps=_surface_int(state, "scope_max_rps"),
             session=session,
+            traffic_observer=trace_observer if session is None else None,
             traffic_policy=(traffic_policy if not use_managed_identity else None),
         )
     except AuthenticationError:
@@ -2823,13 +2887,24 @@ def _run_authenticated_probe_action(
     return _ProbeActionResult(text=json.dumps(payload, indent=2, sort_keys=True), ok=result.ok)
 
 
-def _run_probe_action(
+def _authenticated_probe_progress_sink(
+    authentication: ManagedAttackAuthentication,
+    progress_sink: ProbeProgressSink,
+) -> ProbeProgressSink:
+    def emit(payload: dict[str, object]) -> None:
+        progress_sink(_authenticated_mapping(authentication.redact(payload)))
+
+    return emit
+
+
+def _run_probe_action(  # noqa: PLR0913
     probe: str,
     *,
     target_url: str,
     state: AgentState,
     timeout_seconds: int,
     traffic_policy_reference: dict[str, object] | None = None,
+    progress_sink: ProbeProgressSink | None = None,
 ) -> _ProbeActionResult:
     try:
         return _run_probe_with_wall_clock(
@@ -2838,12 +2913,16 @@ def _run_probe_action(
             state=state,
             timeout_seconds=timeout_seconds,
             traffic_policy_reference=traffic_policy_reference,
+            progress_sink=progress_sink,
         )
     except ProbeExecutionTimeout as exc:
         return _ProbeActionResult(
             text=_probe_failure_text(
                 probe=probe,
-                summary=f"probe timed out after {timeout_seconds}s request timeout and wall-clock guard",
+                summary=(
+                    f"probe timed out after {timeout_seconds}s request timeout "
+                    "and wall-clock guard"
+                ),
                 errors=[str(exc)],
             ),
             ok=False,
@@ -2860,13 +2939,14 @@ def _run_probe_action(
         )
 
 
-def _run_probe_with_wall_clock(
+def _run_probe_with_wall_clock(  # noqa: PLR0913
     probe: str,
     *,
     target_url: str,
     state: AgentState,
     timeout_seconds: int,
     traffic_policy_reference: dict[str, object] | None = None,
+    progress_sink: ProbeProgressSink | None = None,
 ) -> _ProbeActionResult:
     wall_timeout = _probe_wall_timeout(timeout_seconds, probe=probe)
     request = json.dumps(
@@ -2880,22 +2960,29 @@ def _run_probe_with_wall_clock(
             "out_of_scope": _surface_string_list(state, "scope_out_of_scope"),
             "max_rps": _surface_int(state, "scope_max_rps"),
             "traffic_policy_reference": traffic_policy_reference,
+            "trace_http": progress_sink is not None,
         },
         sort_keys=True,
     )
     try:
-        completed = subprocess.run(  # noqa: S603
-            [sys.executable, "-m", "ravage.probe_runner"],
-            input=request,
-            capture_output=True,
-            text=True,
-            timeout=wall_timeout,
-            check=False,
-        )
+        if progress_sink is None:
+            completed = subprocess.run(
+                [sys.executable, "-m", "ravage.probe_runner"],
+                input=request,
+                capture_output=True,
+                text=True,
+                timeout=wall_timeout,
+                check=False,
+            )
+        else:
+            completed = _run_streaming_probe_subprocess(
+                request=request,
+                timeout_seconds=wall_timeout,
+                progress_sink=progress_sink,
+            )
     except subprocess.TimeoutExpired as exc:
-        raise ProbeExecutionTimeout(
-            f"run_probe {probe} exceeded {wall_timeout}s wall-clock limit"
-        ) from exc
+        message = f"run_probe {probe} exceeded {wall_timeout}s wall-clock limit"
+        raise ProbeExecutionTimeout(message) from exc
     payload = _decode_probe_runner_payload(
         completed.stdout, stderr=completed.stderr, returncode=completed.returncode
     )
@@ -2912,6 +2999,99 @@ def _run_probe_with_wall_clock(
         ),
         ok=False,
     )
+
+
+def _run_streaming_probe_subprocess(
+    *,
+    request: str,
+    timeout_seconds: int,
+    progress_sink: ProbeProgressSink,
+) -> subprocess.CompletedProcess[str]:
+    command = [sys.executable, "-m", "ravage.probe_runner"]
+    process = subprocess.Popen(  # noqa: S603
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    if process.stdin is None or process.stdout is None or process.stderr is None:
+        process.kill()
+        process.wait()
+        message = "probe runner pipes were not created"
+        raise RuntimeError(message)
+
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    stdout_pump = threading.Thread(
+        target=_pump_probe_stdout,
+        args=(process.stdout, stdout_parts),
+        name="ravage-probe-stdout",
+        daemon=True,
+    )
+    stderr_pump = threading.Thread(
+        target=_pump_probe_stderr,
+        args=(process.stderr, stderr_parts, progress_sink),
+        name="ravage-probe-progress",
+        daemon=True,
+    )
+    stdout_pump.start()
+    stderr_pump.start()
+    try:
+        process.stdin.write(request)
+        process.stdin.close()
+        returncode = process.wait(timeout=timeout_seconds)
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        raise
+    finally:
+        if not process.stdin.closed:
+            process.stdin.close()
+        stdout_pump.join()
+        stderr_pump.join()
+    return subprocess.CompletedProcess(
+        command,
+        returncode,
+        stdout="".join(stdout_parts),
+        stderr="".join(stderr_parts),
+    )
+
+
+def _pump_probe_stdout(pipe: TextIO, output: list[str]) -> None:
+    try:
+        output.extend(pipe)
+    finally:
+        pipe.close()
+
+
+def _pump_probe_stderr(
+    pipe: TextIO,
+    output: list[str],
+    progress_sink: ProbeProgressSink,
+) -> None:
+    try:
+        for line in pipe:
+            if not line.startswith(PROBE_HTTP_EVENT_PREFIX):
+                output.append(line)
+                continue
+            try:
+                payload = json.loads(line.removeprefix(PROBE_HTTP_EVENT_PREFIX))
+            except json.JSONDecodeError:
+                output.append(line)
+                continue
+            if not isinstance(payload, dict):
+                output.append(line)
+                continue
+            normalized = {str(key): value for key, value in payload.items()}
+            try:
+                progress_sink(normalized)
+            except Exception as exc:  # noqa: BLE001 - display failure must not stop the probe.
+                output.append(f"probe progress sink failed: {type(exc).__name__}\n")
+    finally:
+        pipe.close()
 
 
 def _probe_failure_text(*, probe: str, summary: str, errors: list[str]) -> str:

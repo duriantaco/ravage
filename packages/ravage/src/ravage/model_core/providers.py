@@ -276,6 +276,21 @@ DEFAULT_MODEL_CONFIG: dict[str, object] = {
                 ],
             },
         },
+        "hosted-openai-gpt-5.4-high": {
+            "default_tier": "high",
+            "routes": {
+                "high": [
+                    {
+                        "provider": "openai",
+                        "model": "gpt-5.4-2026-03-05",
+                        "api_key_env": "OPENAI_API_KEY",
+                        "reasoning_effort": "high",
+                        "max_output_tokens": 16384,
+                        "output_token_limit_parameter": "max_completion_tokens",
+                    }
+                ],
+            },
+        },
         "hosted-anthropic": {
             "default_tier": "mid",
             "routes": {
