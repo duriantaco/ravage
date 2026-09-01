@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from email.message import Message
 from typing import TYPE_CHECKING
 
@@ -763,6 +764,48 @@ def test_each_redirect_is_scope_checked_before_following() -> None:
         )
 
     assert len(transport.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "addresses",
+    [
+        ("127.0.0.1",),
+        ("10.0.0.8",),
+        ("169.254.169.254",),
+        ("224.0.0.1",),
+        ("ff0e::1",),
+        ("8.8.8.8", "127.0.0.1"),
+    ],
+)
+def test_shared_public_only_policy_rejects_non_public_graph_dns(
+    tmp_path: Path,
+    addresses: tuple[str, ...],
+) -> None:
+    config = replace(
+        TrafficPolicyConfig.low_noise(max_physical_requests=4, max_rps=0.5),
+        require_public_addresses=True,
+    )
+    policy = TrafficPolicyController.open(
+        tmp_path / "traffic-policy.json",
+        target_url=TARGET_URL,
+        config=config,
+    )
+    transport = QueuedTransport([_response(status=200)])
+    executor = _executor(
+        transport,
+        resolver=lambda _host, _port: addresses,
+        traffic_policy=policy,
+    )
+
+    with pytest.raises(ScopedHttpError, match="non-public address"):
+        executor(
+            node_id="node-public-only",
+            arguments={"path": "/app"},
+            action_id="action-public-only",
+        )
+
+    assert transport.calls == []
+    assert policy.snapshot().physical_request_count == 0
 
 
 def test_managed_out_of_scope_redirect_redacts_sensitive_location_from_failure() -> None:

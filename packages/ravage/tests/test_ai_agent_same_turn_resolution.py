@@ -67,6 +67,20 @@ def test_injected_model_final_uses_open_surface_route_in_the_same_turn() -> None
     assert selected["task_id"] == "surface-map"
 
 
+def test_demo_stop_after_first_finding_turns_confirmation_terminal() -> None:
+    state = AgentState(surface={"stop_after_first_finding": True})
+    outcome = ActionResult(
+        ok=True,
+        observation="executor persisted a confirmed SQL injection finding",
+        outcome="finding_confirmed",
+    )
+
+    terminal = ai_agent._stop_after_finding_outcome(state, outcome)  # noqa: SLF001
+
+    assert terminal.stop is True
+    assert terminal.outcome == "finding_confirmed"
+
+
 def test_locked_primitive_precedes_a_higher_priority_open_recon_task() -> None:
     state = AgentState(turn=4)
     state.surface["flag_objective"] = False

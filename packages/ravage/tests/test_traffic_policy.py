@@ -7,8 +7,10 @@ import time
 from dataclasses import replace
 from pathlib import Path
 from threading import Event, Thread
+from urllib.parse import urlencode
 
 import pytest
+from ravage.probe_suite_parts.sqli.sqli import _SQLI_AUTH_BYPASS_PAYLOADS
 from ravage.traffic import policy as traffic_policy_module
 from ravage.traffic.policy import (
     RequestIntent,
@@ -66,6 +68,170 @@ def test_config_rejects_non_finite_numbers(value: float) -> None:
 def test_config_rejects_rate_with_infinite_interval() -> None:
     with pytest.raises(ValueError, match="finite pacing interval"):
         TrafficPolicyConfig(max_rps=5e-324)
+
+
+def _testfire_request_config() -> TrafficPolicyConfig:
+    return TrafficPolicyConfig(
+        mode=TrafficPolicyMode.ENFORCE,
+        max_physical_requests=24,
+        allowed_request_routes=("GET /", "GET /login.jsp", "POST /doLogin"),
+        allowed_query_fields=("mode",),
+        allowed_explicit_headers=(
+            "accept",
+            "accept-encoding",
+            "content-type",
+            "user-agent",
+        ),
+        allowed_form_fields=("uid", "passw", "btnSubmit"),
+        max_request_body_bytes=1_024,
+        request_value_profile="testfire-login-demo",
+        require_public_addresses=True,
+    )
+
+
+def test_request_restrictions_round_trip_through_durable_reference(tmp_path: Path) -> None:
+    config = _testfire_request_config()
+    controller = _controller(tmp_path, config)
+
+    restored = TrafficPolicyController.from_reference(controller.to_reference())
+
+    assert restored.config == config
+
+
+def test_request_restrictions_allow_only_curated_login_traffic(tmp_path: Path) -> None:
+    controller = _controller(tmp_path, _testfire_request_config())
+    get_login = RequestIntent(
+        "GET",
+        "http://127.0.0.1/login.jsp?mode=demo",
+        headers={"Accept": "text/html", "User-Agent": "ravage"},
+    )
+    post_login = RequestIntent(
+        "POST",
+        "http://127.0.0.1/doLogin",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        body=b"uid=ravage&passw=RavagePass123%21&btnSubmit=Login",
+    )
+    safe_auth_bypass = RequestIntent(
+        "POST",
+        "http://127.0.0.1/doLogin",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        body=b"uid=admin%27+--+&passw=RavagePass123%21&btnSubmit=Login",
+    )
+
+    for intent in (get_login, post_login, safe_auth_bypass):
+        decision = controller.acquire(intent)
+        assert decision.kind is TrafficDecisionKind.DISPATCH
+        assert decision.lease is not None
+        controller.cancel(decision.lease)
+
+
+@pytest.mark.parametrize("uid", _SQLI_AUTH_BYPASS_PAYLOADS)
+def test_testfire_profile_admits_every_code_owned_auth_bypass_value(
+    tmp_path: Path,
+    uid: str,
+) -> None:
+    controller = _controller(tmp_path, _testfire_request_config())
+    body = urlencode(
+        {
+            "uid": uid,
+            "passw": "RavagePass123!",
+            "btnSubmit": "Login",
+        }
+    ).encode()
+
+    decision = controller.acquire(
+        RequestIntent(
+            "POST",
+            "http://127.0.0.1/doLogin",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            body=body,
+        )
+    )
+
+    assert decision.kind is TrafficDecisionKind.DISPATCH
+    assert decision.lease is not None
+    controller.cancel(decision.lease)
+
+
+@pytest.mark.parametrize(
+    "intent",
+    [
+        RequestIntent("GET", "http://127.0.0.1/admin/admin.jsp"),
+        RequestIntent("GET", "http://127.0.0.1/ignored/../login.jsp"),
+        RequestIntent("GET", "http://127.0.0.1/login%2Ejsp"),
+        RequestIntent("DELETE", "http://127.0.0.1/login.jsp"),
+        RequestIntent("GET", "http://127.0.0.1/login.jsp?next=/admin"),
+        RequestIntent("GET", "http://127.0.0.1/login.jsp?mode=staging"),
+        RequestIntent(
+            "GET",
+            "http://127.0.0.1/login.jsp",
+            headers={"Host": "normal.example"},
+        ),
+        RequestIntent(
+            "GET",
+            "http://127.0.0.1/login.jsp",
+            headers={"Cookie": "session=attacker-controlled"},
+        ),
+        RequestIntent(
+            "POST",
+            "http://127.0.0.1/doLogin",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            body=b"uid=guest&passw=demo&role=admin",
+        ),
+        RequestIntent(
+            "POST",
+            "http://127.0.0.1/doLogin",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            body=b"uid=admin%27%3B+DROP+TABLE+users%3B--&passw=RavagePass123%21",
+        ),
+        RequestIntent(
+            "POST",
+            "http://127.0.0.1/doLogin",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            body=b"uid=1%27+OR+SLEEP%2810%29--+&passw=RavagePass123%21",
+        ),
+        RequestIntent(
+            "POST",
+            "http://127.0.0.1/doLogin",
+            headers={"Content-Type": "application/json"},
+            body=b'{"uid":"guest","passw":"demo"}',
+        ),
+        RequestIntent(
+            "POST",
+            "http://127.0.0.1/doLogin",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            body=b"uid=" + (b"x" * 1_024),
+        ),
+    ],
+    ids=[
+        "off-route",
+        "dot-segment-path",
+        "encoded-path",
+        "method",
+        "query-field",
+        "query-value",
+        "host-header",
+        "explicit-cookie",
+        "form-field",
+        "destructive-form-value",
+        "timing-form-value",
+        "body-encoding",
+        "body-size",
+    ],
+)
+def test_request_restrictions_block_before_dispatch(
+    tmp_path: Path,
+    intent: RequestIntent,
+) -> None:
+    controller = _controller(tmp_path, _testfire_request_config())
+
+    decision = controller.acquire(intent)
+
+    assert decision.kind is TrafficDecisionKind.BLOCKED
+    snapshot = controller.snapshot()
+    assert snapshot.physical_request_count == 0
+    assert snapshot.reservation_count == 0
+    assert snapshot.blocked_count == 1
 
 
 def _intent(path: str = "/", *, cacheable: bool = False) -> RequestIntent:

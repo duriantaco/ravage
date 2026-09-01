@@ -280,6 +280,18 @@ def _validated_connection_address(
     return parsed
 
 
+def _validated_public_connection_address(
+    address: str,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    parsed = _validated_connection_address(address)
+    effective = parsed.ipv4_mapped if isinstance(parsed, ipaddress.IPv6Address) else None
+    candidate = effective or parsed
+    if not candidate.is_global or candidate.is_multicast:
+        message = "probe resolver returned a non-public address"
+        raise ValueError(message)
+    return parsed
+
+
 class _RequestPacer:
     def __init__(self, max_rps: float | None) -> None:
         normalized_rate: float | None = None
@@ -510,7 +522,7 @@ class ResponseDelta:
 class ProbeNetworkContext:
     """Share one resolver and immutable DNS pin set across isolated sessions."""
 
-    __slots__ = ("_lock", "_pins", "_resolver")
+    __slots__ = ("_lock", "_pins", "_require_public_addresses", "_resolver")
 
     def __init__(
         self,
@@ -522,13 +534,29 @@ class ProbeNetworkContext:
         self._resolver = resolver or _resolve_addresses
         self._pins = _pins if _pins is not None else {}
         self._lock = _lock or threading.Lock()
+        self._require_public_addresses = False
+
+    def require_public_addresses(self) -> None:
+        """Reject private, loopback, link-local, reserved, and mixed DNS answers."""
+        with self._lock:
+            for addresses in self._pins.values():
+                for address in addresses:
+                    _validated_public_connection_address(address)
+            self._require_public_addresses = True
 
     def pin(self, host: str, port: int) -> str:
         """Resolve and freeze one address set, returning a stable error if unsafe."""
+        with self._lock:
+            require_public_addresses = self._require_public_addresses
         try:
             resolved = self._resolver(host, port)
             parsed_addresses = tuple(
-                _validated_connection_address(str(address).strip()) for address in resolved
+                (
+                    _validated_public_connection_address(str(address).strip())
+                    if require_public_addresses
+                    else _validated_connection_address(str(address).strip())
+                )
+                for address in resolved
             )
         except OSError as exc:
             return f"remote target DNS resolution failed: {exc}"
@@ -539,6 +567,12 @@ class ProbeNetworkContext:
             return "remote target DNS resolution returned no addresses"
         key = (host.lower(), port)
         with self._lock:
+            if self._require_public_addresses and not require_public_addresses:
+                try:
+                    for address in addresses:
+                        _validated_public_connection_address(address)
+                except ValueError as exc:
+                    return f"remote target DNS resolution rejected an address: {exc}"
             pinned = self._pins.setdefault(key, addresses)
             if pinned != addresses:
                 return "remote target DNS resolution changed after pinning"
@@ -623,6 +657,11 @@ class ProbeSession:
                 traffic_policy_reference,
                 require_existing=True,
             )
+        if (
+            self._traffic_policy is not None
+            and self._traffic_policy.config.require_public_addresses
+        ):
+            self._network_context.require_public_addresses()
         self._traffic_lane = str(traffic_lane).strip() or "probe"
         self._traffic_cacheable = bool(traffic_cacheable)
         self._traffic_retryable = bool(traffic_retryable)

@@ -481,6 +481,17 @@ def _validated_transport_address(
     return parsed
 
 
+def _validated_public_transport_address(
+    address: str,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    parsed = _validated_transport_address(address)
+    effective = parsed.ipv4_mapped if isinstance(parsed, ipaddress.IPv6Address) else None
+    candidate = effective or parsed
+    if not candidate.is_global or candidate.is_multicast:
+        raise OSError("remote HTTP resolver returned a non-public address")
+    return parsed
+
+
 class UrllibScopedHttpTransport:
     """One stable cookie session with redirects disabled for external validation."""
 
@@ -710,6 +721,10 @@ class ScopedGraphHttpExecutor:
         ):
             raise ScopedHttpError("traffic policy belongs to a different target origin")
         self.authentication = authentication
+        policy_config = getattr(bound_traffic_policy, "config", None)
+        self._require_public_addresses = bool(
+            getattr(policy_config, "require_public_addresses", False)
+        )
         # Managed ProbeSession owns the same controller and accounts each auth,
         # health, refresh, redirect, and action dispatch. Do not double-wrap it.
         self.traffic_policy = None if authentication is not None else bound_traffic_policy
@@ -1224,6 +1239,15 @@ class ScopedGraphHttpExecutor:
             raise ScopedHttpError(f"remote HTTP DNS resolution failed: {exc}") from exc
         if not addresses:
             raise ScopedHttpError("remote HTTP DNS resolution returned no addresses")
+        if self._require_public_addresses:
+            try:
+                addresses = tuple(
+                    str(_validated_public_transport_address(address)) for address in addresses
+                )
+            except OSError as exc:
+                raise ScopedHttpError(
+                    f"remote HTTP DNS resolution rejected an address: {exc}"
+                ) from exc
         key = (host.lower(), port)
         with self._pin_lock:
             pinned = self._pins.setdefault(key, addresses)

@@ -239,6 +239,10 @@ _MAX_SCAN_PROOF_NODES = 20_000
 _MAX_SCAN_OBSERVATION_CHARS = 10_000
 _MAX_SCAN_TRANSCRIPT_CHARS = 80_000
 _MAX_SCAN_COVERAGE_REASON_CODES = 8
+_TESTFIRE_MAX_PHYSICAL_REQUESTS = 24
+_TESTFIRE_MAX_REQUEST_BODY_BYTES = 1_024
+_TESTFIRE_MAX_RPS = 0.5
+_TESTFIRE_REQUEST_PROFILE = "testfire-login-demo"
 
 _TOP_LEVEL_COMMANDS = (
     "attack",
@@ -360,7 +364,7 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
         _competitors(args_list[1:])
         return
     if args_list[:1] == ["demo"]:
-        handle_demo_command(args_list[1:])
+        handle_demo_command(args_list[1:], attack_runner=_attack)
         return
     if args_list[:1] in (["xben"], ["benchmark"]):
         _xben(args_list[1:])
@@ -423,6 +427,11 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
         "--traffic-max-rps",
         type=float,
         help="strictly sub-1 whole-run HTTP dispatch rate in low-noise mode (default: 0.5)",
+    )
+    parser.add_argument(
+        "--traffic-request-profile",
+        choices=[_TESTFIRE_REQUEST_PROFILE],
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--recovery-profile",
@@ -669,6 +678,7 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
             traffic_policy_mode=args.traffic_policy,
             traffic_policy_max_physical_requests=args.max_physical_requests,
             traffic_policy_max_rps=args.traffic_max_rps,
+            traffic_policy_config=traffic_policy.config,
             traffic_policy_reference=traffic_policy.to_reference(),
         )
         if args.autonomous_route:
@@ -814,6 +824,7 @@ def _top_level_help() -> None:
                 "  ravage auth add BRIEF.yaml --type form --health /account --marker Logout",
                 "  ravage traffic capture http://127.0.0.1:3000",
                 "  ravage demo xben",
+                "  ravage demo testfire --authorized-remote-target",
                 "  ravage lab list",
                 "  ravage authbench",
                 "",
@@ -841,7 +852,7 @@ def _top_level_help() -> None:
                 "  ravage skills {list,validate} [PATH|builtin]",
                 "  ravage satcom inspect ARTIFACT --format {tle,ccsds-space-packets}",
                 "  ravage competitors {preflight,run,report,adapt-ravage}",
-                "  ravage demo xben",
+                "  ravage demo {xben,testfire}",
                 "  ravage lab {list,show,up,down}",
                 "  ravage observe RUN_DIR",
                 "  ravage report RUN_DIR --brief BRIEF.yaml",
@@ -1801,7 +1812,7 @@ def _pin_parsed_knowledge_pack(
     parsed.knowledge_pack_sha256 = None if metadata is None else metadata.sha256
 
 
-def _resolve_traffic_policy_args(
+def _resolve_traffic_policy_args(  # noqa: C901, PLR0912 - fail-closed profile checks.
     parser: argparse.ArgumentParser,
     parsed: argparse.Namespace,
     *,
@@ -1811,6 +1822,22 @@ def _resolve_traffic_policy_args(
     mode = str(getattr(parsed, "traffic_policy", None) or default_mode)
     request_limit = getattr(parsed, "max_physical_requests", None)
     requested_rps = getattr(parsed, "traffic_max_rps", None)
+    request_profile = getattr(parsed, "traffic_request_profile", None)
+    if request_profile == _TESTFIRE_REQUEST_PROFILE:
+        if getattr(parsed, "autonomous_route", False):
+            parser.error("the TestFire request profile disables autonomous routing")
+        if getattr(parsed, "recovery_profile", "off") != "off":
+            parser.error("the TestFire request profile disables recovery roles")
+        if mode != "low-noise":
+            parser.error("the TestFire request profile requires --traffic-policy low-noise")
+        if request_limit is None:
+            request_limit = _TESTFIRE_MAX_PHYSICAL_REQUESTS
+        elif request_limit > _TESTFIRE_MAX_PHYSICAL_REQUESTS:
+            parser.error("the TestFire request profile permits at most 24 physical requests")
+        if requested_rps is None:
+            requested_rps = _TESTFIRE_MAX_RPS
+        elif requested_rps > _TESTFIRE_MAX_RPS:
+            parser.error("the TestFire request profile permits at most 0.5 RPS")
     if request_limit is not None and request_limit <= 0:
         parser.error("--max-physical-requests must be a positive integer")
     if requested_rps is not None and (
@@ -1838,10 +1865,33 @@ def _resolve_traffic_policy_args(
 
 def _traffic_policy_config(parsed: argparse.Namespace) -> TrafficPolicyConfig:
     if parsed.traffic_policy == "low-noise":
-        return TrafficPolicyConfig.low_noise(
+        config = TrafficPolicyConfig.low_noise(
             max_physical_requests=int(parsed.max_physical_requests),
             max_rps=float(parsed.traffic_max_rps),
         )
+        if getattr(parsed, "traffic_request_profile", None) == _TESTFIRE_REQUEST_PROFILE:
+            return replace(
+                config,
+                allowed_request_routes=(
+                    "GET /bank/main.jsp",
+                    "GET /login.jsp",
+                    "HEAD /bank/main.jsp",
+                    "HEAD /login.jsp",
+                    "POST /doLogin",
+                ),
+                allowed_query_fields=("mode",),
+                allowed_explicit_headers=(
+                    "accept",
+                    "accept-encoding",
+                    "content-type",
+                    "user-agent",
+                ),
+                allowed_form_fields=("btnSubmit", "passw", "uid"),
+                max_request_body_bytes=_TESTFIRE_MAX_REQUEST_BODY_BYTES,
+                request_value_profile=_TESTFIRE_REQUEST_PROFILE,
+                require_public_addresses=True,
+            )
+        return config
     return TrafficPolicyConfig()
 
 
@@ -1991,6 +2041,11 @@ def _attack(  # noqa: C901, PLR0912, PLR0915 - CLI options are intentionally exp
         "--traffic-max-rps",
         type=float,
         help="strictly sub-1 whole-run HTTP dispatch rate in low-noise mode (default: 0.5)",
+    )
+    parser.add_argument(
+        "--traffic-request-profile",
+        choices=[_TESTFIRE_REQUEST_PROFILE],
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--recovery-profile",
@@ -2687,6 +2742,8 @@ def _local_attack_command(  # noqa: C901, PLR0912, PLR0913
                 str(parsed.traffic_max_rps),
             ]
         )
+    if parsed.traffic_request_profile:
+        command.extend(["--traffic-request-profile", parsed.traffic_request_profile])
     if parsed.model_config is not None:
         command.extend(["--model-config", str(parsed.model_config)])
     if parsed.identity:

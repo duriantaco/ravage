@@ -317,6 +317,7 @@ class AIWebAgentSettings:
     traffic_policy_mode: Literal["observe", "low-noise"] = "observe"
     traffic_policy_max_physical_requests: int | None = None
     traffic_policy_max_rps: float | None = None
+    traffic_policy_config: TrafficPolicyConfig | None = None
     traffic_policy_reference: dict[str, object] | None = None
 
 
@@ -366,6 +367,7 @@ def run_ai_web_agent(
 ) -> None:
     brief = load_engagement_brief(brief_path)
     flag_objective = _brief_has_flag_objective(brief)
+    stop_after_first_finding = _brief_stops_after_first_finding(brief)
     assert_authorized_target(
         target_url,
         scope=brief.scope,
@@ -397,6 +399,7 @@ def run_ai_web_agent(
     audit = AuditStore(settings.db_path or workspace.root / "audit.db", scope=brief.scope)
     runtime = _make_tool_runtime(settings, brief, target_url=target_url)
     state.surface["flag_objective"] = flag_objective
+    state.surface["stop_after_first_finding"] = stop_after_first_finding
     recovery_state_path = workspace.root / "recovery-state.json"
     recovery = _initial_recovery_campaign(
         settings=settings,
@@ -423,6 +426,7 @@ def run_ai_web_agent(
         "reference_architecture": "planner-executor with working memory",
         "knowledge_pack": knowledge_pack_metadata,
         "flag_objective": flag_objective,
+        "stop_after_first_finding": stop_after_first_finding,
         "traffic_policy": traffic_policy.config.to_json(),
         "traffic_policy_snapshot": traffic_policy.snapshot().to_json(),
     }
@@ -450,6 +454,7 @@ def run_ai_web_agent(
         "tool_runtime": settings.tool_runtime_mode,
         "autonomous_route": settings.autonomous_route,
         "flag_objective": flag_objective,
+        "stop_after_first_finding": stop_after_first_finding,
     }
     if session_mode:
         workspace_started_payload["session_mode"] = session_mode
@@ -505,6 +510,7 @@ def run_ai_web_agent(
         state.surface["scope_max_rps"] = brief.roe.max_rps
         state.surface["allow_remote_target"] = settings.allow_remote_target
         state.surface["continue_after_proof"] = _brief_requests_multiple_proofs(brief)
+        state.surface["stop_after_first_finding"] = stop_after_first_finding
         expected_proof_count = _brief_expected_proof_count(brief)
         if expected_proof_count is None:
             state.surface.pop("expected_proof_count", None)
@@ -837,6 +843,7 @@ def run_ai_web_agent(
             if settings.authentication is not None and not outcome.session_mode:
                 outcome = replace(outcome, session_mode=session_mode)
             outcome = _continue_after_proof_outcome(state, outcome)
+            outcome = _stop_after_finding_outcome(state, outcome)
             outcome_json = outcome.to_json()
             _update_state_from_action(state, action=action, outcome=outcome_json)
             post_action_state_trace = state_trace_snapshot(state)
@@ -2514,6 +2521,8 @@ def _premature_final_action(action: Mapping[str, object]) -> dict[str, object]:
 
 def _brief_requests_multiple_proofs(brief: EngagementBrief) -> bool:
     context = dict(brief.context or {})
+    if context.get("stop_after_first_finding") is True:
+        return False
     if context.get("continue_after_proof") is True:
         return True
     if context.get("stop_after_first_proof") is False:
@@ -2540,6 +2549,10 @@ def _brief_expected_proof_count(brief: EngagementBrief) -> int | None:
     if isinstance(expected_count, bool) or not isinstance(expected_count, int):
         return None
     return expected_count if expected_count > 0 else None
+
+
+def _brief_stops_after_first_finding(brief: EngagementBrief) -> bool:
+    return dict(brief.context or {}).get("stop_after_first_finding") is True
 
 
 def _brief_has_flag_objective(brief: EngagementBrief) -> bool:
@@ -2579,6 +2592,15 @@ def _continue_after_proof_outcome(state: AgentState, outcome: ActionResult) -> A
     if not outcome.stop or outcome.outcome != "flag_candidate":
         return outcome
     return replace(outcome, stop=False)
+
+
+def _stop_after_finding_outcome(state: AgentState, outcome: ActionResult) -> ActionResult:
+    if (
+        state.surface.get("stop_after_first_finding") is True
+        and outcome.outcome == "finding_confirmed"
+    ):
+        return replace(outcome, stop=True)
+    return outcome
 
 
 def _make_tool_runtime(
@@ -2648,6 +2670,23 @@ def _open_run_traffic_policy(
         )
     else:
         raise ValueError(f"unsupported traffic policy mode: {settings.traffic_policy_mode}")
+    if settings.traffic_policy_config is not None:
+        configured = settings.traffic_policy_config
+        baseline = replace(
+            configured,
+            allowed_request_routes=(),
+            allowed_query_fields=None,
+            allowed_explicit_headers=None,
+            allowed_form_fields=None,
+            max_request_body_bytes=None,
+            request_value_profile=None,
+            require_public_addresses=False,
+        )
+        if baseline != config:
+            raise TrafficPolicyError(
+                "traffic policy configuration does not match agent settings"
+            )
+        config = configured
     if settings.traffic_policy_reference is not None:
         referenced = TrafficPolicyController.from_reference(
             settings.traffic_policy_reference,

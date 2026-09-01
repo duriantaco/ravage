@@ -1,13 +1,6 @@
 from __future__ import annotations
 
 from ravage.agent_core.agent_state import AgentState
-from ravage.web_core.http_probe import (
-    ProbeResponse,
-    ProbeSession,
-    ResponseDelta,
-    compare_responses,
-    response_secrets,
-)
 from ravage.probe_suite_parts.general import input_payload_probe
 from ravage.probe_suite_parts.result import ProbeRunResult
 from ravage.probe_suite_parts.sqli.sqli_detection import (
@@ -56,9 +49,15 @@ from ravage.probe_suite_parts.support import (
     _url_looks_static_oauth_redirect,
 )
 from ravage.probes.sqli_extractor import run_sqli_exploit
-from ravage.web_core.proof_recognizer import recognize_proofs
 from ravage.runtime.common import clip
-
+from ravage.web_core.http_probe import (
+    ProbeResponse,
+    ProbeSession,
+    ResponseDelta,
+    compare_responses,
+    response_secrets,
+)
+from ravage.web_core.proof_recognizer import recognize_proofs
 
 _SQLI_REQUEST_BUDGET = 90
 _SQLI_AUTH_BYPASS_PAYLOADS = (
@@ -694,16 +693,27 @@ def _target_looks_auth_bypass_candidate(target: dict[str, object]) -> bool:
     if kind not in {"form", "replay"}:
         return False
     input_name = str(target.get("input") or "").lower()
-    if input_name not in {"username", "user", "login", "log", "email"} and not _contains_word(
+    if input_name not in {
+        "username",
+        "user",
+        "userid",
+        "user_id",
+        "uid",
+        "login",
+        "log",
+        "email",
+    } and not _contains_word(
         input_name,
         ("user", "login", "email"),
     ):
         return False
 
     form = _dict_value(target.get("form"))
+    raw_hints = target.get("hints")
+    hints = raw_hints if isinstance(raw_hints, (list, tuple)) else ()
     text = (
         f"{kind} {target.get('url') or ''} {input_name} "
-        f"{' '.join(str(item) for item in target.get('hints') or [])} {form!r}"
+        f"{' '.join(str(item) for item in hints)} {form!r}"
     ).lower()
     if _contains_word(text, ("password", "passwd", "pwd", "login", "signin", "admin", "auth")):
         return True
