@@ -3,10 +3,17 @@ from __future__ import annotations
 import json
 import math
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ravage.agent_core.agent_state import AgentState
+from ravage.agent_core.live_events import (
+    PROBE_HTTP_EVENT_PREFIX,
+    probe_http_exchange_payload,
+)
 from ravage.probe_suite import run_builtin_probe
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 def main() -> None:
@@ -16,8 +23,10 @@ def main() -> None:
             raise TypeError("probe runner input must be a JSON object")
         if "traffic_policy" in payload:
             raise ValueError("traffic_policy is unsupported; use traffic_policy_reference")
+        probe = str(payload.get("probe") or "")
+        traffic_observer = _http_event_emitter(probe) if payload.get("trace_http") is True else None
         result = run_builtin_probe(
-            str(payload.get("probe") or ""),
+            probe,
             target_url=str(payload.get("target_url") or ""),
             state=AgentState.from_json(_dict(payload.get("state"))),
             timeout_seconds=_int(payload.get("timeout_seconds"), default=10),
@@ -25,12 +34,26 @@ def main() -> None:
             in_scope=_strings(payload.get("in_scope")),
             out_of_scope=_strings(payload.get("out_of_scope")),
             max_rps=_optional_float(payload.get("max_rps")),
+            traffic_observer=traffic_observer,
             traffic_policy_reference=_optional_dict(payload.get("traffic_policy_reference")),
         )
         response = {"status": "ok", "ok": result.ok, "text": result.to_text()}
     except BaseException as exc:  # noqa: BLE001
         response = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
     sys.stdout.write(json.dumps(response, sort_keys=True))
+
+
+def _http_event_emitter(probe: str) -> Callable[[dict[str, object]], None]:
+    index = 0
+
+    def emit(event: dict[str, object]) -> None:
+        nonlocal index
+        index += 1
+        payload = probe_http_exchange_payload(event, index=index, probe=probe)
+        sys.stderr.write(PROBE_HTTP_EVENT_PREFIX + json.dumps(payload, sort_keys=True) + "\n")
+        sys.stderr.flush()
+
+    return emit
 
 
 def _dict(value: object) -> dict[str, Any]:

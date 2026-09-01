@@ -10,11 +10,18 @@ reconnaissance and validation with an optional model-driven attack loop, while
 keeping scope, authentication, traffic accounting, and evidence in code-owned
 boundaries.
 
+<p align="center">
+  <img src="assets/demo.gif" alt="Ravage running an authorized local XBEN benchmark" width="997">
+  <br>
+  <sub>Illustrative local XBEN run; paths and lifecycle options vary by preset.</sub>
+</p>
+
 Ravage is a pre-1.0 research alpha. Use disposable environments and a written
 rules of engagement. Security testing can change application state; Ravage
 does not remediate findings or deploy fixes.
 
 [Quickstart](#five-minute-local-quickstart) ·
+[Live demo](#live-xben-demo) ·
 [Authentication](#authenticated-testing) ·
 [Results](#understand-the-results) ·
 [Capabilities](#capabilities) ·
@@ -102,6 +109,21 @@ information leaves your machine and is handled under the provider's terms and
 retention controls. Do not use a hosted route for sensitive customer or
 production data unless the engagement permits that disclosure. Use a local
 model route when target evidence must remain local.
+
+## Live XBEN demo
+
+For a short live demo, set <code>XBEN_ROOT</code> to the <code>benchmarks</code>
+directory in an XBEN checkout, start Docker, and export
+<code>OPENAI_API_KEY</code>. Then run:
+
+~~~bash
+ravage demo xben
+~~~
+
+Ravage builds a fresh local XBEN-009 target, attacks it with the pinned
+GPT-5.4 high profile, scores the result, saves the evidence under
+<code>runs/demo</code>, and removes the target and its local image. The preset
+limits the run to ten model requests, ten turns, ten minutes, and $1.50.
 
 ## Authenticated testing
 
@@ -235,7 +257,7 @@ model assertion as a confirmed finding.
 | Traffic inspection and replay | <code>ravage traffic</code> | Scoped artifacts |
 | Knowledge skills | <code>ravage skills</code>, <code>ravage code-bug</code> | Advisory |
 | Passive SATCOM inspection | <code>ravage satcom inspect</code> | No transmit |
-| XBEN evaluation | <code>ravage xben</code> | Docker-based research harness |
+| XBEN evaluation | <code>ravage xben</code>, <code>ravage demo xben</code> | Docker-based research harness and live demo |
 | Improvement Lab | <code>scripts/improvement_lab.py</code> | Isolated archive |
 
 Knowledge skills can guide prioritization, but cannot add tools, expand scope,

@@ -17,7 +17,7 @@ from ravage.agent_core.ai_agent import AIWebAgentSettings
 from ravage.run_data.audit import AuditStore
 from ravage.run_data.workspace import AgentWorkspace
 from ravage.runtime import FakeToolRuntime, ToolResult
-from ravage.xben_parts.agent import _run_agent_subprocess
+from ravage.xben_parts.agent import _run_agent_subprocess, _styled_live_output_line
 from ravage.xben_parts.logs import (
     _case_solution_route,
     _count_case_model_routes,
@@ -32,6 +32,12 @@ if TYPE_CHECKING:
 TARGET_URL = "http://127.0.0.1:8765"
 BASE_TURN_BUDGET = 40
 ROUTE_REQUEST_BUDGET = 12
+DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 1_800
+
+
+class _TTYStringIO(StringIO):
+    def isatty(self) -> bool:
+        return True
 
 
 def _capture_flag_brief(tmp_path: Path) -> Path:
@@ -167,7 +173,144 @@ def test_xben_child_invokes_the_public_attack_command(
     assert cmd[cmd.index("--max-turns") + 1] == "7"
     assert "--allow-degraded" in cmd
     assert "--benchmark-proof-recognition" not in cmd
-    assert captured["timeout"] == 1_800
+    assert captured["timeout"] == DEFAULT_SUBPROCESS_TIMEOUT_SECONDS
+
+
+def test_xben_child_live_output_is_streamed_and_captured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = StringIO("[run] Mapping the target\n[ok] Flag found\n")
+
+        def wait(self, timeout: int | None = None) -> int:
+            captured["timeout"] = timeout
+            return 0
+
+        def poll(self) -> int:
+            return 0
+
+        def kill(self) -> None:
+            raise AssertionError("successful child must not be killed")
+
+    def fake_popen(cmd: list[str], **kwargs: object) -> FakeProcess:
+        captured["cmd"] = cmd
+        captured["popen"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr("ravage.xben_parts.agent.subprocess.Popen", fake_popen)
+    artifact = StringIO()
+    terminal = StringIO()
+
+    _run_agent_subprocess(
+        settings=XbenSettings(
+            output_dir=tmp_path / "runs",
+            stream_agent_output=True,
+        ),
+        brief_path=tmp_path / "brief.yaml",
+        target_url=TARGET_URL,
+        db_path=tmp_path / "audit.db",
+        workspace_path=tmp_path / "workspace",
+        stdout=artifact,
+        live_stdout=terminal,
+    )
+
+    expected = "[run] Mapping the target\n[ok] Flag found\n"
+    assert artifact.getvalue() == expected
+    assert terminal.getvalue() == expected
+    assert captured["timeout"] == DEFAULT_SUBPROCESS_TIMEOUT_SECONDS
+    popen = cast("dict[str, object]", captured["popen"])
+    assert popen["stdout"] == subprocess.PIPE
+    assert popen["stderr"] == subprocess.STDOUT
+    cmd = cast("list[str]", captured["cmd"])
+    assert "--show-agent-actions" in cmd
+
+
+@pytest.mark.parametrize(
+    ("line", "color"),
+    [
+        ("[agent] Now I'm testing the reflected input.\n", "\x1b[33;1m"),
+        ("[ok] Flag found · value masked\n", "\x1b[32;1m"),
+        ("[fail] Model request failed\n", "\x1b[31;1m"),
+        ("[warn] Response · 500\n", "\x1b[31;1m"),
+    ],
+)
+def test_xben_live_agent_output_uses_semantic_colors(
+    line: str,
+    color: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("RAVAGE_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+
+    rendered = _styled_live_output_line(line, stream=_TTYStringIO())
+
+    assert rendered.startswith(color)
+    assert rendered.endswith("\x1b[0m\n")
+    assert line.strip() in rendered
+
+
+def test_xben_child_live_output_kills_the_agent_on_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TimedOutProcess:
+        def __init__(self) -> None:
+            self.stdout = StringIO()
+            self.killed = False
+
+        def wait(self, timeout: int | None = None) -> int:
+            if not self.killed:
+                raise subprocess.TimeoutExpired(cmd="ravage", timeout=timeout)
+            return -9
+
+        def poll(self) -> int | None:
+            return None if not self.killed else -9
+
+        def kill(self) -> None:
+            self.killed = True
+
+    process = TimedOutProcess()
+    monkeypatch.setattr(
+        "ravage.xben_parts.agent.subprocess.Popen",
+        lambda *_args, **_kwargs: process,
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_agent_subprocess(
+            settings=XbenSettings(output_dir=tmp_path / "runs"),
+            brief_path=tmp_path / "brief.yaml",
+            target_url=TARGET_URL,
+            db_path=tmp_path / "audit.db",
+            workspace_path=tmp_path / "workspace",
+            stdout=StringIO(),
+            live_stdout=StringIO(),
+        )
+
+    assert process.killed is True
+
+
+def test_xben_cli_enables_live_output_and_cockpit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, XbenSettings] = {}
+
+    def capture_settings(settings: XbenSettings) -> dict[str, object]:
+        captured["settings"] = settings
+        return {}
+
+    monkeypatch.setattr(cli, "run_xben", capture_settings)
+
+    cli.main(["xben", "--stream-agent-output", "--cockpit"])
+
+    settings = captured["settings"]
+    assert settings.stream_agent_output is True
+    assert settings.cockpit is True
+    assert settings.keep_target is True
 
 
 def test_xben_child_forwards_the_opt_in_autonomous_route(

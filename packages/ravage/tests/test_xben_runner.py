@@ -63,6 +63,7 @@ from ravage.xben_parts.runner import (
     _require_autonomous_runtime_cleanup,
     _require_scoped_tool_network_evidence,
     _run_agent_and_find_flag,
+    _run_case_lifecycle,
     _start_case_target,
     _status_for_exception,
     preflight_xben,
@@ -1200,11 +1201,12 @@ def test_xben_start_target_restarts_web_service_once_after_5xx_readiness(
     monkeypatch.setattr("ravage.xben_parts.runner._wait_for_target", fake_wait)
     monkeypatch.setattr("ravage.xben_parts.runner._restart_case_web_service", fake_restart)
 
+    stdout = StringIO()
     target_url = _start_case_target(
         settings=settings,
         case=case,
         identity=Identity(),  # type: ignore[arg-type]
-        stdout=StringIO(),
+        stdout=stdout,
     )
 
     assert target_url == "http://localhost:12345"
@@ -1213,6 +1215,73 @@ def test_xben_start_target_restarts_web_service_once_after_5xx_readiness(
         "restart:test-project",
         "wait:http://localhost:12345",
     ]
+    rendered = stdout.getvalue()
+    assert "[xben:build] id=XBEN-001-24 status=running" in rendered
+    assert "[xben:build] id=XBEN-001-24 status=complete" in rendered
+    assert "[xben:target] id=XBEN-001-24 status=restarting" in rendered
+    assert (
+        "[xben:target] id=XBEN-001-24 status=ready url=http://localhost:12345" in rendered
+    )
+
+
+def test_xben_case_lifecycle_announces_agent_and_teardown_stages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "benchmarks"
+    _write_case(root, "XBEN-001-24", level=1, tags=["idor"])
+    settings = XbenSettings(benchmarks_root=root, output_dir=tmp_path / "runs")
+    case = selected_xben_cases(settings)[0]
+    case_dir = settings.output_dir / case.benchmark_id
+    paths = _CasePaths(
+        case_dir=case_dir,
+        stdout_path=case_dir / "agent.stdout",
+        db_path=case_dir / "audit.db",
+        workspace_path=case_dir / "workspace",
+        docker_log_path=case_dir / "docker.log",
+    )
+    identity = _CaseRunIdentity(project="demo-project", flag="flag{expected}")
+    stdout = StringIO()
+    received_stdout: list[object] = []
+
+    def ignore_update(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    def ready_target(**_kwargs: object) -> str:
+        return "http://localhost:18080"
+
+    def ignore_teardown(**_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr("ravage.xben_parts.runner.update_manifest", ignore_update)
+    monkeypatch.setattr(
+        "ravage.xben_parts.runner._start_case_target",
+        ready_target,
+    )
+
+    def run_agent(**kwargs: object) -> str:
+        received_stdout.append(kwargs["stdout"])
+        return identity.flag
+
+    monkeypatch.setattr("ravage.xben_parts.runner._run_agent_and_find_flag", run_agent)
+    monkeypatch.setattr("ravage.xben_parts.runner._teardown_case", ignore_teardown)
+
+    outcome = _run_case_lifecycle(
+        settings=settings,
+        case=case,
+        identity=identity,
+        paths=paths,
+        stdout=stdout,
+        cost_limit_usd=1.0,
+    )
+
+    assert outcome.solved is True
+    assert received_stdout == [stdout]
+    rendered = stdout.getvalue()
+    assert "[xben:agent] id=XBEN-001-24 status=running" in rendered
+    assert "[xben:agent] id=XBEN-001-24 status=complete solved=true" in rendered
+    assert "[xben:teardown] id=XBEN-001-24 status=running" in rendered
+    assert "[xben:teardown] id=XBEN-001-24 status=complete" in rendered
 
 
 def test_xben_preflight_blocks_paid_routes_without_explicit_allowance(tmp_path: Path) -> None:

@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from typing import TextIO
 
 
-Tone = Literal["ok", "fail", "warn", "run", "info"]
+Tone = Literal["ok", "fail", "warn", "run", "info", "agent"]
 
 _TONE_STYLE = {
     "ok": "bold bright_green",
@@ -24,6 +24,7 @@ _TONE_STYLE = {
     "warn": "bold bright_yellow",
     "run": "bold bright_cyan",
     "info": "dim",
+    "agent": "bold bright_yellow",
 }
 _TONE_SYMBOL = {
     "ok": "✓",
@@ -31,6 +32,7 @@ _TONE_SYMBOL = {
     "warn": "!",
     "run": "›",  # noqa: RUF001 - intentional terminal status glyph
     "info": "·",
+    "agent": "◆",
 }
 
 _COMPACT_WIDTH = 72
@@ -300,10 +302,14 @@ def _subtitle(snapshot: RunDashboardSnapshot, *, compact: bool, width: int) -> s
 
 
 def _ascii_symbol(tone: Tone) -> str:
-    return {"ok": "+", "fail": "x", "warn": "!", "run": ">", "info": "."}.get(
-        tone,
-        ".",
-    )
+    return {
+        "ok": "+",
+        "fail": "x",
+        "warn": "!",
+        "run": ">",
+        "info": ".",
+        "agent": "*",
+    }.get(tone, ".")
 
 
 def _terminal_text(value: str, *, unicode: bool) -> str:

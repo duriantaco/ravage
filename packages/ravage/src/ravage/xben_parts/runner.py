@@ -671,14 +671,33 @@ def _run_case_lifecycle(
             target_url=target_url,
             target_ready_at=datetime.now(UTC).isoformat(),
         )
-        found_flag = _run_agent_and_find_flag(
-            settings=settings,
-            case=case,
-            identity=identity,
-            paths=paths,
-            target_url=target_url,
-            cost_limit_usd=cost_limit_usd,
+        _line(
+            stdout,
+            "xben:agent",
+            f"id={case.benchmark_id} status=running log={paths.stdout_path}",
         )
+        try:
+            found_flag = _run_agent_and_find_flag(
+                settings=settings,
+                case=case,
+                identity=identity,
+                paths=paths,
+                target_url=target_url,
+                cost_limit_usd=cost_limit_usd,
+                stdout=stdout,
+            )
+        except Exception:
+            _line(stdout, "xben:agent", f"id={case.benchmark_id} status=failed")
+            raise
+        else:
+            _line(
+                stdout,
+                "xben:agent",
+                (
+                    f"id={case.benchmark_id} status=complete "
+                    f"solved={str(found_flag is not None).lower()}"
+                ),
+            )
         solved = found_flag is not None
         return _CaseExecutionOutcome(
             target_url=target_url,
@@ -698,7 +717,19 @@ def _run_case_lifecycle(
         return _failed_case_outcome(exc, target_url=target_url, stdout_path=paths.stdout_path)
     finally:
         if not interrupted:
-            _teardown_case(settings=settings, case=case, identity=identity, paths=paths)
+            _line(stdout, "xben:teardown", f"id={case.benchmark_id} status=running")
+            try:
+                _teardown_case(settings=settings, case=case, identity=identity, paths=paths)
+            except Exception:
+                _line(stdout, "xben:teardown", f"id={case.benchmark_id} status=failed")
+                raise
+            else:
+                teardown_status = "target-kept" if settings.keep_target else "complete"
+                _line(
+                    stdout,
+                    "xben:teardown",
+                    f"id={case.benchmark_id} status={teardown_status}",
+                )
 
 
 def _finalize_interrupted_case(
@@ -769,17 +800,31 @@ def _start_case_target(
     stdout: TextIO,
 ) -> str:
     _line(stdout, "xben:case", f"id={case.benchmark_id} status=starting")
+    _line(stdout, "xben:build", f"id={case.benchmark_id} status=running")
     _build_case(settings=settings, case=case, project=identity.project, flag=identity.flag)
+    _line(stdout, "xben:build", f"id={case.benchmark_id} status=complete")
+    _line(stdout, "xben:target", f"id={case.benchmark_id} status=starting")
     _up_case(settings=settings, case=case, project=identity.project)
     target_url = _target_url_for(settings=settings, case=case, project=identity.project)
+    _line(
+        stdout,
+        "xben:target",
+        f"id={case.benchmark_id} status=waiting url={target_url}",
+    )
     try:
         _wait_for_target(settings=settings, target_url=target_url)
     except RuntimeError as exc:
         if not should_restart_web_service_after_readiness_error(exc):
             raise
+        _line(stdout, "xben:target", f"id={case.benchmark_id} status=restarting")
         _restart_case_web_service(settings=settings, case=case, project=identity.project)
         target_url = _target_url_for(settings=settings, case=case, project=identity.project)
         _wait_for_target(settings=settings, target_url=target_url)
+    _line(
+        stdout,
+        "xben:target",
+        f"id={case.benchmark_id} status=ready url={target_url}",
+    )
     return target_url
 
 
@@ -791,6 +836,7 @@ def _run_agent_and_find_flag(
     paths: _CasePaths,
     target_url: str,
     cost_limit_usd: float | None,
+    stdout: TextIO | None = None,
 ) -> str | None:
     tool_network_session_id = str(uuid4())
     tool_network_evidence_path = paths.case_dir / "tool-network.json"
@@ -817,6 +863,7 @@ def _run_agent_and_find_flag(
                 db_path=paths.db_path,
                 workspace_path=paths.workspace_path,
                 stdout=case_stdout,
+                live_stdout=(stdout if settings.stream_agent_output else None),
                 tool_network_evidence_path=(
                     tool_network_evidence_path if settings.tool_runtime == "docker" else None
                 ),

@@ -6,6 +6,7 @@ import math
 import os
 import re
 import sys
+import textwrap
 import threading
 import time
 import unicodedata
@@ -43,6 +44,8 @@ _MAX_DNS_LABEL_CHARS = 63
 _SHORT_ID_CHARS = 12
 _MIN_DYNAMIC_NUMERIC_SEGMENT_CHARS = 2
 _MIN_ENTROPY_PATH_SEGMENT_CHARS = 20
+_HTTP_CLIENT_ERROR_STATUS = 400
+_HTTP_SERVER_ERROR_STATUS = 500
 _THOUSAND = 1_000
 _MILLION = 1_000_000
 _TENTH_SECOND = 0.1
@@ -144,7 +147,7 @@ class _Activity:
 
 @dataclass(frozen=True)
 class _Line:
-    tone: Literal["ok", "fail", "warn", "run", "info"]
+    tone: Literal["ok", "fail", "warn", "run", "info", "agent"]
     text: str
 
 
@@ -157,6 +160,7 @@ class RunDisplay:
         *,
         stream: TextIO | None = None,
         clock: Callable[[], float] | None = None,
+        show_agent_actions: bool = False,
     ) -> None:
         if mode not in _DISPLAY_MODES:
             choices = ", ".join(sorted(_DISPLAY_MODES))
@@ -166,6 +170,7 @@ class RunDisplay:
         self.mode: DisplayMode = _resolve_mode(mode, self.stream)
         self._unicode = _unicode_supported(self.stream)
         self.clock = clock or time.monotonic
+        self.show_agent_actions = show_agent_actions
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._closed = False
@@ -310,6 +315,10 @@ class RunDisplay:
             return
         if kind == "action_started":
             self._action_started(payload)
+            return
+        if kind == "probe_http_exchange":
+            if self.show_agent_actions:
+                self._probe_http_exchange(payload)
             return
         if kind in {
             "tool_run_command",
@@ -488,6 +497,8 @@ class RunDisplay:
             self._emit(_Line("warn", _join("Recon degraded", [elapsed, error_type])))
             return
         self._emit(_Line("ok", _join("Recon complete", [elapsed, *_recon_details(payload)])))
+        if self.show_agent_actions:
+            self._recon_actions(payload)
 
     def _model_started(self, payload: Mapping[str, Any]) -> None:
         key = _model_key(payload)
@@ -498,6 +509,10 @@ class RunDisplay:
         self._start(key)
         if self.mode == "plain":
             self._emit(_Line("run", label))
+        if self.show_agent_actions:
+            self._narrate(
+                "I'm reviewing the mapped inputs and choosing the smallest safe test."
+            )
         self._set_activity(key, label)
 
     def _model_finished(self, payload: Mapping[str, Any]) -> None:
@@ -515,7 +530,7 @@ class RunDisplay:
         error_type = _safe_identifier(payload.get("error_type"))
         self._emit(_Line("fail", _join("Model request failed", [turn, elapsed, error_type])))
 
-    def _selection(self, payload: Mapping[str, Any]) -> None:
+    def _selection(self, payload: Mapping[str, Any]) -> None:  # noqa: C901, PLR0912
         action = _object(payload.get("selected_action"))
         route = _object(payload.get("selected_route"))
         turn = _turn_label(payload)
@@ -535,6 +550,28 @@ class RunDisplay:
         self._emit(_Line("run", _join("Plan", details)))
         if override_reason:
             self._emit(_Line("warn", _join("Plan adjusted by harness", [override_reason])))
+
+        if self.show_agent_actions:
+            hypotheses = action.get("hypotheses")
+            if isinstance(hypotheses, list):
+                for value in hypotheses[:3]:
+                    hypothesis = _safe_narrative(value)
+                    if hypothesis:
+                        self._narrate("I suspect " + _sentence_fragment(hypothesis))
+            notes = _safe_narrative(action.get("notes"))
+            if notes:
+                self._narrate("Next I'll " + _sentence_fragment(notes))
+            else:
+                planned = _planned_action_narrative(action)
+                if planned:
+                    self._narrate("Next I'll " + planned)
+            expected = _safe_narrative(action.get("expected_signal"))
+            if expected:
+                self._narrate("I'm looking for this signal: " + expected)
+            fallback = _safe_narrative(action.get("fallback"))
+            if fallback:
+                self._narrate("If that signal is absent, my fallback is: " + fallback)
+            return
 
         notes = _safe_narrative(action.get("notes"))
         if notes:
@@ -561,6 +598,10 @@ class RunDisplay:
         self._start(key)
         if self.mode == "plain":
             self._emit(_Line("run", label))
+        if self.show_agent_actions:
+            narrative = _probe_start_narrative(probe)
+            if narrative:
+                self._narrate(narrative)
         self._set_activity(key, label)
 
     def _tool_finished(  # noqa: C901, PLR0912
@@ -602,7 +643,7 @@ class RunDisplay:
             details.insert(0, elapsed)
         tone: Literal["ok", "fail", "warn", "info"] = "info"
         if timed_out:
-            tone = "warn"
+            tone = "fail"
             details.append("timed out")
         elif ok_value is False:
             tone = "fail"
@@ -632,6 +673,125 @@ class RunDisplay:
         elif ok is False:
             tone = "fail"
         self._emit(_Line(tone, "  " + _join(f"{method} request", details)))
+
+    def _probe_http_exchange(self, payload: Mapping[str, Any]) -> None:
+        before, after = _probe_exchange_narrative(payload)
+        if before:
+            self._narrate(before)
+        index = _positive_int(payload.get("index"))
+        method = _http_method(payload.get("method"))
+        target = _probe_request_target(payload)
+        request_body = _safe_narrative(payload.get("request_body"))
+        request_label = _join(
+            f"Request {index:02d}" if index else "Request",
+            [method],
+        )
+        if target:
+            request_label += " · " + target
+        if request_body:
+            request_label += " · body=" + request_body
+        self._emit(_Line("run", "  " + request_label))
+
+        status = _positive_int(payload.get("status"))
+        elapsed_ms = _non_negative_int(payload.get("elapsed_ms"))
+        disposition = _safe_identifier(payload.get("disposition"))
+        error = _safe_narrative(payload.get("error"))
+        response = _safe_narrative(payload.get("response_summary"))
+        details = [str(status) if status else disposition, f"{elapsed_ms}ms"]
+        if error:
+            details.append(error)
+        elif response:
+            details.append(response)
+        tone: Literal["ok", "fail", "info"] = "info"
+        if status and status < _HTTP_CLIENT_ERROR_STATUS:
+            tone = "ok"
+        elif error or disposition == "blocked" or status >= _HTTP_SERVER_ERROR_STATUS:
+            tone = "fail"
+        self._emit(_Line(tone, "    " + _join("Response", details)))
+        if after:
+            self._narrate(after)
+
+    def _recon_actions(self, payload: Mapping[str, Any]) -> None:  # noqa: C901
+        pages = payload.get("pages")
+        if not isinstance(pages, list):
+            return
+        for raw_page in pages[:8]:
+            if not isinstance(raw_page, dict):
+                continue
+            page = raw_page
+            path, _query_names = _safe_url_shape(
+                str(page.get("final_url") or page.get("url") or "")
+            )
+            status = _positive_int(page.get("status"))
+            title = _safe_narrative(page.get("title"))
+            self._emit(
+                _Line(
+                    "info",
+                    "  "
+                    + _join(
+                        "Mapped", ["GET " + (path or "/"), str(status) if status else "", title]
+                    ),
+                )
+            )
+            reflections = page.get("reflected_parameters")
+            if isinstance(reflections, list):
+                for raw_reflection in reflections[:6]:
+                    if not isinstance(raw_reflection, dict):
+                        continue
+                    name = _safe_parameter_name(raw_reflection.get("name"))
+                    reflection_path, _names = _safe_url_shape(str(raw_reflection.get("url") or ""))
+                    if name:
+                        self._emit(
+                            _Line(
+                                "ok",
+                                "  "
+                                + _join(
+                                    "Reflection",
+                                    [name, f"GET {reflection_path or path or '/'}"],
+                                ),
+                            )
+                        )
+                        self._narrate(
+                            _sentence(
+                                f"I found the {name} input reflected by "
+                                f"GET {reflection_path or path or '/'}"
+                            )
+                        )
+                        self._narrate(
+                            "I should compare a normal value with harmless, "
+                            "context-specific probes."
+                        )
+            forms = page.get("forms")
+            if not isinstance(forms, list):
+                continue
+            for raw_form in forms[:6]:
+                if not isinstance(raw_form, dict):
+                    continue
+                form = raw_form
+                method = _http_method(form.get("method"))
+                form_path, _names = _safe_url_shape(str(form.get("action") or ""))
+                inputs = form.get("inputs")
+                fields = _form_input_names(inputs)
+                details = [f"{method} {form_path or '/'}"]
+                if fields:
+                    details.append("fields=" + ",".join(fields))
+                self._emit(_Line("info", "  " + _join("Form", details)))
+
+    def _narrate(self, value: str) -> None:
+        narrative = _safe_narrative(_sentence(value))
+        if not narrative:
+            return
+        prefix_width = 2 if self._dashboard is not None else len("[agent] ")
+        width = max(24, _terminal_width(self.stream) - prefix_width)
+        sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z])", narrative)
+        for sentence in sentences:
+            for line in textwrap.wrap(
+                sentence,
+                width=width,
+                break_long_words=False,
+                break_on_hyphens=False,
+            ):
+                self._emit(_Line("agent", line))
 
     def _attempt_finished(self, payload: Mapping[str, Any]) -> None:
         action_id = str(payload.get("action_id") or "").strip()
@@ -701,11 +861,11 @@ class RunDisplay:
         if kind == "invalid_action":
             error = _safe_narrative(payload.get("error"))
             detail = error or "asking for a corrected action"
-            self._emit(_Line("warn", _join("Invalid model action", [detail])))
+            self._emit(_Line("fail", _join("Invalid model action", [detail])))
         else:
             repeats = _positive_int(payload.get("repeat_count"))
             detail = f"repeat {repeats}" if repeats else ""
-            self._emit(_Line("warn", _join("Repeated action blocked", [detail])))
+            self._emit(_Line("fail", _join("Repeated action blocked", [detail])))
         fallback = self._action_fallbacks.get(action_id, "")
         if fallback:
             self._emit(_Line("info", "  " + _join("Suggested next", [fallback])))
@@ -758,7 +918,7 @@ class RunDisplay:
         check_summary = evidence[0] if evidence and "checks passed" in evidence[0] else ""
         self._emit(
             _Line(
-                "warn",
+                "fail",
                 _join(
                     "Candidate not confirmed",
                     [vuln_class, "evidence gate failed", check_summary],
@@ -786,7 +946,7 @@ class RunDisplay:
                 self._flag_record_path = record_path
             fingerprint = _value_fingerprint(payload.get("flag"))
             if not fingerprint:
-                self._emit(_Line("warn", "Flag event ignored · validated value missing"))
+                self._emit(_Line("fail", "Flag event ignored · validated value missing"))
                 return
             if fingerprint in self._proof_fingerprints:
                 self._announce_flag_location()
@@ -807,7 +967,7 @@ class RunDisplay:
         error = _safe_narrative(payload.get("error"))
         self._emit(
             _Line(
-                "warn",
+                "fail",
                 _join("Proof candidate rejected by the evidence gate", [error]),
             )
         )
@@ -1401,6 +1561,7 @@ def _plain_prefix(tone: str) -> str:
         "warn": "[warn]",
         "run": "[run]",
         "info": "[info]",
+        "agent": "[agent]",
     }.get(tone, "[info]")
 
 
@@ -1590,6 +1751,214 @@ def _planned_action_label(action: Mapping[str, Any]) -> str:
         return f"probe {probe}" if probe else "probe"
     label = _ACTION_LABELS.get(action_kind, "Action")
     return label[:1].lower() + label[1:]
+
+
+def _planned_action_narrative(action: Mapping[str, Any]) -> str:
+    action_kind = _safe_identifier(action.get("action"))
+    if action_kind == "run_probe":
+        probe = _human_identifier(action.get("probe"))
+        if probe:
+            return f"run the {probe} probe against the mapped input"
+        return "run a bounded probe against the mapped input"
+    label = _ACTION_LABELS.get(action_kind, "")
+    return _sentence_fragment(label) if label else ""
+
+
+def _probe_start_narrative(probe: str) -> str:
+    if probe == "ssti_fingerprint":
+        return "I'm starting with a baseline, then harmless SSTI fingerprints, stopping on proof."
+    label = _human_identifier(probe)
+    if not label:
+        return ""
+    return (
+        f"I'm starting the {label} probe. I'll compare each response with the "
+        "mapped baseline before choosing the next check."
+    )
+
+
+def _probe_exchange_narrative(payload: Mapping[str, Any]) -> tuple[str, str]:
+    probe = _safe_identifier(payload.get("probe"))
+    if probe == "ssti_fingerprint":
+        return _ssti_exchange_narrative(payload)
+
+    index = _positive_int(payload.get("index"))
+    method = _http_method(payload.get("method"))
+    path = _safe_path_shape(str(payload.get("path") or "/")) or "/"
+    probe_label = _human_identifier(probe) or "probe"
+    request_label = f"request {index}" if index else "the next request"
+    before = (
+        f"I'm sending {request_label} from the {probe_label} probe to "
+        f"{method} {path}."
+    )
+    return before, _generic_probe_response_narrative(payload)
+
+
+def _ssti_exchange_narrative(payload: Mapping[str, Any]) -> tuple[str, str]:
+    method = _http_method(payload.get("method"))
+    path = _safe_path_shape(str(payload.get("path") or "/")) or "/"
+    parameter, value = _primary_probe_input(payload)
+    location = f"{method} {path}"
+    input_label = f" through {parameter}" if parameter else ""
+
+    if not value or not _looks_like_template_expression(value):
+        before = (
+            f"I'm establishing a baseline for {location} with an ordinary "
+            f"value{input_label}."
+        )
+        response = _safe_narrative(payload.get("response_summary"))
+        if value and value in response:
+            after = (
+                "The ordinary value was reflected. I can now distinguish plain echo "
+                "from evaluation."
+            )
+        else:
+            after = (
+                "The baseline is recorded. I'll compare the template probes with "
+                "this response."
+            )
+        return before, _failed_probe_response_narrative(payload) or after
+
+    if _looks_like_ssti_proof_read(value):
+        before = (
+            "Template evaluation worked. Now I'm trying the smallest "
+            "engine-specific proof read."
+        )
+        response = _safe_narrative(payload.get("response_summary"))
+        if "[REDACTED-PROOF]" in response or MASK in response:
+            after = (
+                "A proof-shaped value came back. The objective is met, so I'm "
+                "stopping and recording it."
+            )
+        else:
+            after = (
+                "No proof-shaped value came back. I should try the next bounded "
+                "engine-specific read."
+            )
+        return before, _failed_probe_response_narrative(payload) or after
+
+    expected, engine = _ssti_fingerprint_expectation(value)
+    if expected:
+        engine_label = f"{engine} " if engine else ""
+        before = (
+            f"Now I'm trying harmless {engine_label}template arithmetic{input_label}; "
+            f"{expected} would prove evaluation."
+        )
+        response = _safe_narrative(payload.get("response_summary"))
+        if expected in response:
+            conclusion = (
+                f" and points to {engine}" if engine else ""
+            )
+            after = (
+                f"The response became {expected}, not the literal expression. "
+                f"That matches the template-evaluation signal{conclusion}. "
+                "I'm waiting for probe validation before calling it confirmed."
+            )
+        else:
+            after = (
+                f"That signature did not evaluate to {expected}, so I should try "
+                "the next template-engine fingerprint."
+            )
+        return before, _failed_probe_response_narrative(payload) or after
+
+    before = (
+        f"Now I'm testing one bounded template expression{input_label} against "
+        "the baseline."
+    )
+    return before, _generic_probe_response_narrative(payload)
+
+
+def _primary_probe_input(payload: Mapping[str, Any]) -> tuple[str, str]:
+    query = payload.get("query")
+    if not isinstance(query, list):
+        return "", ""
+    for raw_item in query[:12]:
+        if not isinstance(raw_item, dict):
+            continue
+        name = _safe_parameter_name(raw_item.get("name"))
+        value = _safe_narrative(raw_item.get("value"))
+        if name and value and value not in {MASK, "[REDACTED]"}:
+            return name, value
+    return "", ""
+
+
+def _looks_like_template_expression(value: str) -> bool:
+    return any(marker in value for marker in ("{{", "{%", "${", "#{", "<%=", "[[${", "*{"))
+
+
+def _looks_like_ssti_proof_read(value: str) -> bool:
+    lowered = value.casefold()
+    return any(
+        marker in lowered
+        for marker in (
+            "flag",
+            "secret_key",
+            "popen",
+            "printenv",
+            "system(",
+        )
+    )
+
+
+def _ssti_fingerprint_expectation(value: str) -> tuple[str, str]:
+    compact = re.sub(r"\s+", "", value)
+    fingerprints = (
+        (('|add:"42"',), "49", "Django"),
+        (("7*'7'",), "7777777", "Jinja-style"),
+        (("|upper", ".upper()"), "RAVAGE", "Jinja-style"),
+        (("1==1",), "True", "Jinja-style"),
+        (("6*7",), "42", "Jinja-style"),
+        (("7*7",), "49", "Jinja-style"),
+    )
+    for markers, expected, engine in fingerprints:
+        if any(marker in compact for marker in markers):
+            return expected, engine
+    return "", ""
+
+
+def _failed_probe_response_narrative(payload: Mapping[str, Any]) -> str:
+    status = _positive_int(payload.get("status"))
+    disposition = _safe_identifier(payload.get("disposition"))
+    error = _safe_narrative(payload.get("error"))
+    if error or disposition == "blocked":
+        return (
+            "That request was blocked or failed before producing a usable result. "
+            "I should stay within the bounded fallback path."
+        )
+    if status >= _HTTP_CLIENT_ERROR_STATUS:
+        return (
+            f"HTTP {status} is not a usable signal here. I should move to the next "
+            "bounded check."
+        )
+    return ""
+
+
+def _generic_probe_response_narrative(payload: Mapping[str, Any]) -> str:
+    failure = _failed_probe_response_narrative(payload)
+    if failure:
+        return failure
+    status = _positive_int(payload.get("status"))
+    if status:
+        return (
+            f"HTTP {status} came back. I'm comparing it with earlier responses "
+            "before the next check."
+        )
+    return "The request completed without a comparable HTTP response."
+
+
+def _sentence_fragment(value: str) -> str:
+    text = value.strip()
+    if text.startswith(("A ", "An ", "The ")):
+        return text[0].lower() + text[1:]
+    if len(text) > 1 and text[0].isupper() and text[1].islower():
+        return text[0].lower() + text[1:]
+    return text
+
+
+def _sentence(value: str) -> str:
+    text = value.strip()
+    if not text or text.endswith((".", "!", "?")):
+        return text
+    return text + "."
 
 
 def _action_started_label(action_kind: str, *, probe: str) -> str:
@@ -1876,6 +2245,36 @@ def _safe_parameter_name(value: object) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_.\[\]-]{1,64}", text):
         return ""
     return text
+
+
+def _probe_request_target(payload: Mapping[str, Any]) -> str:
+    path = _safe_path_shape(str(payload.get("path") or "/")) or "/"
+    query_value = payload.get("query")
+    pairs: list[str] = []
+    if isinstance(query_value, list):
+        for raw_item in query_value[:12]:
+            if not isinstance(raw_item, dict):
+                continue
+            name = _safe_parameter_name(raw_item.get("name"))
+            value = _safe_narrative(raw_item.get("value"))
+            if name:
+                pairs.append(f"{name}={value}")
+    if pairs:
+        return _clip(path + "?" + "&".join(pairs), _MAX_DETAIL_CHARS)
+    return path
+
+
+def _form_input_names(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    names: list[str] = []
+    for raw_input in value[:12]:
+        if not isinstance(raw_input, dict):
+            continue
+        name = _safe_parameter_name(raw_input.get("name"))
+        if name and name not in names:
+            names.append(name)
+    return names[:6]
 
 
 def _finding_evidence_details(payload: Mapping[str, Any]) -> list[str]:

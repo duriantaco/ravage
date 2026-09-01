@@ -24,6 +24,7 @@ _TONE = {
     "info": ("cyan", "bold"),
     "muted": ("dim",),
     "accent": ("green", "bold"),
+    "agent": ("yellow", "bold"),
 }
 
 

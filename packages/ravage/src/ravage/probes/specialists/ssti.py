@@ -208,6 +208,8 @@ def probe_ssti_fingerprint(
                 requests.extend(extraction_requests)
                 findings.append(extraction or finding)
                 break
+        if _has_extracted_ssti_proof(findings):
+            break
         if slow_target and not findings:
             break
     if not findings and not slow_target:
@@ -358,6 +360,13 @@ def _extraction_budget_for_target(slow_target: bool) -> int:
     if slow_target:
         return 4
     return _SSTI_EXTRACTION_REQUEST_BUDGET
+
+
+def _has_extracted_ssti_proof(findings: list[dict[str, object]]) -> bool:
+    return any(
+        finding.get("type") == "ssti_extracted_proof" and bool(finding.get("proofs"))
+        for finding in findings
+    )
 
 
 def _ssti_fingerprint_cases() -> list[dict[str, object]]:

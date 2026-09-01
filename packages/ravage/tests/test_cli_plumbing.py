@@ -1526,12 +1526,14 @@ def test_cli_attack_forwards_display_mode_to_agent_process(
             str(tmp_path / "display-run"),
             "--display",
             "quiet",
+            "--show-agent-actions",
             "--no-tool-recon",
         ]
     )
 
     command = calls[0]
     assert command[command.index("--display") + 1] == "quiet"
+    assert "--show-agent-actions" in command
 
 
 def test_attack_result_distinguishes_confirmed_findings_from_candidate_signals(
