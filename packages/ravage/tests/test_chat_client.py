@@ -5,11 +5,47 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import pytest
-from ravage.agent_core.ai_agent import ChatClient
+from ravage.agent_core.ai_agent import ChatClient, ChatMessage, ModelReply, _complete_model
 from ravage.model_core.providers import ProviderKind, ResolvedModelRoute
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+
+def test_complete_model_requires_typed_reply_from_dynamic_client() -> None:
+    class InvalidClient:
+        def chat(self, _messages: list[dict[str, str]]) -> object:
+            return object()
+
+    with pytest.raises(TypeError, match="must return ModelReply"):
+        _complete_model(
+            InvalidClient(),
+            messages=[{"role": "user", "content": "return json"}],
+            route=_route(),
+        )
+
+
+def test_complete_model_preserves_valid_typed_complete_reply() -> None:
+    expected = ModelReply(content='{"action":"final"}')
+
+    class ValidClient:
+        def complete(
+            self,
+            *,
+            messages: list[ChatMessage],
+            route: ResolvedModelRoute,
+        ) -> object:
+            assert messages == [ChatMessage(role="user", content="return json")]
+            assert route == _route()
+            return expected
+
+    reply = _complete_model(
+        ValidClient(),
+        messages=[{"role": "user", "content": "return json"}],
+        route=_route(),
+    )
+
+    assert reply is expected
 
 
 def test_openai_compatible_chat_client_requests_json_object_response() -> None:
