@@ -222,6 +222,37 @@ and [pricing table](https://platform.claude.com/docs/en/about-claude/pricing).
 An unknown `RAVAGE_ANTHROPIC_*_MODEL` override is not ready until its prices are
 provided explicitly in a custom model config.
 
+## Hosted abliteration.ai Routes
+
+Ravage can call abliteration.ai through its OpenAI-compatible Chat Completions
+API. Create a provider key, then set it beside the engagement brief:
+
+```dotenv
+# .env.ravage
+ABLIT_KEY=your_key_here
+RAVAGE_ABLITERATION_MID_MODEL=abliterated-model-large
+```
+
+Use:
+
+```text
+--model-profile hosted-abliteration --model-tier mid
+```
+
+The built-in tiers select `abliterated-model-large-v2` for high,
+`abliterated-model-large` for mid, and `abliterated-model` for low. Ravage calls
+`https://api.abliteration.ai/v1/chat/completions`, requests structured JSON,
+and keeps its normal scope, authorization, traffic, evidence, and cost gates in
+control of execution.
+
+These are hosted paid-risk routes. Their standard list prices were verified on
+2026-09-02 against the provider's [pricing
+table](https://abliteration.ai/pricing). Discounts and separately billed web
+search are not included in Ravage's token estimate. An unknown
+`RAVAGE_ABLITERATION_*_MODEL` override remains unpriced and is rejected before
+a paid request. Review the provider's [data-handling
+terms](https://abliteration.ai/data-handling) before sending target evidence.
+
 ## Attack Example
 
 Run the local Acme lab first:

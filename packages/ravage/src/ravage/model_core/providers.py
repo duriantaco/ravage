@@ -18,6 +18,7 @@ type ModelTier = Literal["high", "mid", "low"]
 type ProviderKind = Literal[
     "openai",
     "anthropic",
+    "abliteration",
     "gemini",
     "openrouter",
     "litellm",
@@ -43,6 +44,7 @@ LOCAL_PROVIDERS: frozenset[ProviderKind] = frozenset({"ollama", "lmstudio", "lla
 DEFAULT_API_KEY_ENV: dict[ProviderKind, str] = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
+    "abliteration": "ABLIT_KEY",
     "gemini": "GOOGLE_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
     "azure": "AZURE_OPENAI_API_KEY",
@@ -54,6 +56,7 @@ DEFAULT_API_KEY_ENV: dict[ProviderKind, str] = {
 }
 DEFAULT_BASE_URL: dict[ProviderKind, str] = {
     "anthropic": "https://api.anthropic.com",
+    "abliteration": "https://api.abliteration.ai/v1",
     "ollama": "http://localhost:11434/v1",
     "lmstudio": "http://localhost:1234/v1",
     "llamacpp": "http://localhost:8080/v1",
@@ -62,10 +65,12 @@ DEFAULT_BASE_URL: dict[ProviderKind, str] = {
 }
 OPENAI_NATIVE_BASE_URL = "https://api.openai.com/v1"
 ANTHROPIC_NATIVE_BASE_URL = "https://api.anthropic.com"
+ABLITERATION_NATIVE_BASE_URL = "https://api.abliteration.ai/v1"
 DIRECT_CHAT_PROVIDERS: frozenset[ProviderKind] = frozenset(
     {
         "openai",
         "anthropic",
+        "abliteration",
         "litellm",
         "custom_openai",
         *LOCAL_PROVIDERS,
@@ -124,6 +129,19 @@ ANTHROPIC_STANDARD_TOKEN_PRICES: dict[str, TokenPrices] = {
 
 def anthropic_standard_token_prices(model: str) -> TokenPrices | None:
     return ANTHROPIC_STANDARD_TOKEN_PRICES.get(model)
+
+
+# abliteration.ai list pricing per 1M tokens, verified 2026-09-02.
+# https://abliteration.ai/pricing
+ABLITERATION_STANDARD_TOKEN_PRICES: dict[str, TokenPrices] = {
+    "abliterated-model": TokenPrices(3.0, 0.3, 3.0),
+    "abliterated-model-large": TokenPrices(5.0, 0.5, 5.0),
+    "abliterated-model-large-v2": TokenPrices(5.0, 0.5, 5.0),
+}
+
+
+def abliteration_standard_token_prices(model: str) -> TokenPrices | None:
+    return ABLITERATION_STANDARD_TOKEN_PRICES.get(model)
 
 
 DEFAULT_MODEL_CONFIG: dict[str, object] = {
@@ -318,6 +336,44 @@ DEFAULT_MODEL_CONFIG: dict[str, object] = {
                             "claude-haiku-4-5-20251001}"
                         ),
                         "api_key_env": "ANTHROPIC_API_KEY",
+                        "max_output_tokens": 4096,
+                    }
+                ],
+            },
+        },
+        "hosted-abliteration": {
+            "default_tier": "mid",
+            "routes": {
+                "high": [
+                    {
+                        "provider": "abliteration",
+                        "model": (
+                            "${RAVAGE_ABLITERATION_HIGH_MODEL:"
+                            "abliterated-model-large-v2}"
+                        ),
+                        "api_key_env": "ABLIT_KEY",
+                        "max_output_tokens": 4096,
+                    }
+                ],
+                "mid": [
+                    {
+                        "provider": "abliteration",
+                        "model": (
+                            "${RAVAGE_ABLITERATION_MID_MODEL:"
+                            "abliterated-model-large}"
+                        ),
+                        "api_key_env": "ABLIT_KEY",
+                        "max_output_tokens": 4096,
+                    }
+                ],
+                "low": [
+                    {
+                        "provider": "abliteration",
+                        "model": (
+                            "${RAVAGE_ABLITERATION_LOW_MODEL:"
+                            "abliterated-model}"
+                        ),
+                        "api_key_env": "ABLIT_KEY",
                         "max_output_tokens": 4096,
                     }
                 ],
@@ -646,6 +702,8 @@ def _effective_token_prices(
         known = openai_standard_token_prices(route.model)
     elif route.provider == "anthropic":
         known = anthropic_standard_token_prices(route.model)
+    elif route.provider == "abliteration":
+        known = abliteration_standard_token_prices(route.model)
     else:
         known = None
     if known is None:
@@ -682,6 +740,8 @@ def model_route_transport_issue(route: ResolvedModelRoute) -> str | None:
         return "openai_native_base_url_required"
     if route.provider == "anthropic" and base_url != ANTHROPIC_NATIVE_BASE_URL:
         return "anthropic_native_base_url_required"
+    if route.provider == "abliteration" and base_url != ABLITERATION_NATIVE_BASE_URL:
+        return "abliteration_native_base_url_required"
     return None
 
 
@@ -703,6 +763,11 @@ def model_route_transport_error(route: ResolvedModelRoute) -> str | None:
         return (
             f"provider=anthropic only supports {ANTHROPIC_NATIVE_BASE_URL}; "
             "use provider=litellm for a gateway"
+        )
+    if issue == "abliteration_native_base_url_required":
+        return (
+            f"provider=abliteration only supports {ABLITERATION_NATIVE_BASE_URL}; "
+            "use provider=custom_openai for a gateway"
         )
     return None
 

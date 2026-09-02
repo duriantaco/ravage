@@ -4332,10 +4332,13 @@ def _create_init_files(
             "# Ravage model provider settings\n"
             "OPENAI_API_KEY=\n"
             "ANTHROPIC_API_KEY=\n"
+            "ABLIT_KEY=\n"
             "RAVAGE_OPENAI_LOW_MODEL=gpt-5.4-mini-2026-03-17\n"
             "RAVAGE_OPENAI_MID_MODEL=gpt-5.4-2026-03-05\n"
             "RAVAGE_ANTHROPIC_LOW_MODEL=claude-haiku-4-5-20251001\n"
             "RAVAGE_ANTHROPIC_MID_MODEL=claude-sonnet-4-6\n"
+            "RAVAGE_ABLITERATION_LOW_MODEL=abliterated-model\n"
+            "RAVAGE_ABLITERATION_MID_MODEL=abliterated-model-large\n"
         )
     )
     auth_result = None
@@ -5618,6 +5621,8 @@ def _preferred_model_profile() -> str:
         return "hosted-openai"
     if os.environ.get("ANTHROPIC_API_KEY", "").strip():
         return "hosted-anthropic"
+    if os.environ.get("ABLIT_KEY", "").strip():
+        return "hosted-abliteration"
     return "local-ollama"
 
 

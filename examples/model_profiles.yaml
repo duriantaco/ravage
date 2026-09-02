@@ -113,6 +113,25 @@ profiles:
           api_key_env: ANTHROPIC_API_KEY
           max_output_tokens: 4096
 
+  hosted-abliteration:
+    default_tier: mid
+    routes:
+      high:
+        - provider: abliteration
+          model: ${RAVAGE_ABLITERATION_HIGH_MODEL:abliterated-model-large-v2}
+          api_key_env: ABLIT_KEY
+          max_output_tokens: 4096
+      mid:
+        - provider: abliteration
+          model: ${RAVAGE_ABLITERATION_MID_MODEL:abliterated-model-large}
+          api_key_env: ABLIT_KEY
+          max_output_tokens: 4096
+      low:
+        - provider: abliteration
+          model: ${RAVAGE_ABLITERATION_LOW_MODEL:abliterated-model}
+          api_key_env: ABLIT_KEY
+          max_output_tokens: 4096
+
   mixed-fallback:
     default_tier: mid
     routes:
