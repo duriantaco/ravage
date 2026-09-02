@@ -1984,7 +1984,10 @@ def _observed_structured_forms(state: AgentState) -> list[dict[str, object]]:
     forms = _list_of_dicts(state.surface.get("forms"))
     for raw_form in state.signals.get("forms", []):
         if isinstance(raw_form, dict):
-            forms.append(dict(raw_form))
+            normalized_form: dict[str, object] = {
+                str(key): value for key, value in raw_form.items()
+            }
+            forms.append(normalized_form)
         elif isinstance(raw_form, str):
             parsed = _json_object(raw_form)
             if parsed:
@@ -4115,13 +4118,20 @@ def _complete_model(
             )
             for message in messages
         ]
-        return complete(messages=chat_messages, route=route)
+        return _require_model_reply(complete(messages=chat_messages, route=route))
 
     chat = getattr(client, "chat", None)
     if callable(chat):
-        return chat(messages)
+        return _require_model_reply(chat(messages))
 
     raise TypeError("model client must define complete(...) or chat(...)")
+
+
+def _require_model_reply(value: object) -> ModelReply:
+    if isinstance(value, ModelReply):
+        return value
+    message = "model client complete(...) or chat(...) must return ModelReply"
+    raise TypeError(message)
 
 
 def _require_accountable_paid_reply(
