@@ -190,6 +190,7 @@ from ravage.traffic.manifest import (
     write_traffic_manifest,
 )
 from ravage.traffic.policy import (
+    PORTSWIGGER_DEMO_REQUEST_PROFILE,
     TrafficPolicyBlocked,
     TrafficPolicyConfig,
     TrafficPolicyController,
@@ -239,10 +240,10 @@ _MAX_SCAN_PROOF_NODES = 20_000
 _MAX_SCAN_OBSERVATION_CHARS = 10_000
 _MAX_SCAN_TRANSCRIPT_CHARS = 80_000
 _MAX_SCAN_COVERAGE_REASON_CODES = 8
-_TESTFIRE_MAX_PHYSICAL_REQUESTS = 24
-_TESTFIRE_MAX_REQUEST_BODY_BYTES = 1_024
-_TESTFIRE_MAX_RPS = 0.5
-_TESTFIRE_REQUEST_PROFILE = "testfire-login-demo"
+_PORTSWIGGER_MAX_PHYSICAL_REQUESTS = 24
+_PORTSWIGGER_MAX_REQUEST_BODY_BYTES = 1_024
+_PORTSWIGGER_MAX_RPS = 0.5
+_PORTSWIGGER_REQUEST_PROFILE = PORTSWIGGER_DEMO_REQUEST_PROFILE
 
 _TOP_LEVEL_COMMANDS = (
     "attack",
@@ -430,7 +431,7 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
     )
     parser.add_argument(
         "--traffic-request-profile",
-        choices=[_TESTFIRE_REQUEST_PROFILE],
+        choices=[_PORTSWIGGER_REQUEST_PROFILE],
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -824,7 +825,7 @@ def _top_level_help() -> None:
                 "  ravage auth add BRIEF.yaml --type form --health /account --marker Logout",
                 "  ravage traffic capture http://127.0.0.1:3000",
                 "  ravage demo xben",
-                "  ravage demo testfire --authorized-remote-target",
+                "  ravage demo portswigger --authorized-remote-target --allow-paid-models",
                 "  ravage lab list",
                 "  ravage authbench",
                 "",
@@ -852,7 +853,7 @@ def _top_level_help() -> None:
                 "  ravage skills {list,validate} [PATH|builtin]",
                 "  ravage satcom inspect ARTIFACT --format {tle,ccsds-space-packets}",
                 "  ravage competitors {preflight,run,report,adapt-ravage}",
-                "  ravage demo {xben,testfire}",
+                "  ravage demo {xben,portswigger}",
                 "  ravage lab {list,show,up,down}",
                 "  ravage observe RUN_DIR",
                 "  ravage report RUN_DIR --brief BRIEF.yaml",
@@ -1823,21 +1824,21 @@ def _resolve_traffic_policy_args(  # noqa: C901, PLR0912 - fail-closed profile c
     request_limit = getattr(parsed, "max_physical_requests", None)
     requested_rps = getattr(parsed, "traffic_max_rps", None)
     request_profile = getattr(parsed, "traffic_request_profile", None)
-    if request_profile == _TESTFIRE_REQUEST_PROFILE:
+    if request_profile == _PORTSWIGGER_REQUEST_PROFILE:
         if getattr(parsed, "autonomous_route", False):
-            parser.error("the TestFire request profile disables autonomous routing")
+            parser.error("the PortSwigger request profile disables autonomous routing")
         if getattr(parsed, "recovery_profile", "off") != "off":
-            parser.error("the TestFire request profile disables recovery roles")
+            parser.error("the PortSwigger request profile disables recovery roles")
         if mode != "low-noise":
-            parser.error("the TestFire request profile requires --traffic-policy low-noise")
+            parser.error("the PortSwigger request profile requires --traffic-policy low-noise")
         if request_limit is None:
-            request_limit = _TESTFIRE_MAX_PHYSICAL_REQUESTS
-        elif request_limit > _TESTFIRE_MAX_PHYSICAL_REQUESTS:
-            parser.error("the TestFire request profile permits at most 24 physical requests")
+            request_limit = _PORTSWIGGER_MAX_PHYSICAL_REQUESTS
+        elif request_limit > _PORTSWIGGER_MAX_PHYSICAL_REQUESTS:
+            parser.error("the PortSwigger request profile permits at most 24 physical requests")
         if requested_rps is None:
-            requested_rps = _TESTFIRE_MAX_RPS
-        elif requested_rps > _TESTFIRE_MAX_RPS:
-            parser.error("the TestFire request profile permits at most 0.5 RPS")
+            requested_rps = _PORTSWIGGER_MAX_RPS
+        elif requested_rps > _PORTSWIGGER_MAX_RPS:
+            parser.error("the PortSwigger request profile permits at most 0.5 RPS")
     if request_limit is not None and request_limit <= 0:
         parser.error("--max-physical-requests must be a positive integer")
     if requested_rps is not None and (
@@ -1869,26 +1870,22 @@ def _traffic_policy_config(parsed: argparse.Namespace) -> TrafficPolicyConfig:
             max_physical_requests=int(parsed.max_physical_requests),
             max_rps=float(parsed.traffic_max_rps),
         )
-        if getattr(parsed, "traffic_request_profile", None) == _TESTFIRE_REQUEST_PROFILE:
+        if getattr(parsed, "traffic_request_profile", None) == _PORTSWIGGER_REQUEST_PROFILE:
             return replace(
                 config,
                 allowed_request_routes=(
-                    "GET /bank/main.jsp",
-                    "GET /login.jsp",
-                    "HEAD /bank/main.jsp",
-                    "HEAD /login.jsp",
-                    "POST /doLogin",
+                    "GET /catalog",
+                    "HEAD /catalog",
                 ),
-                allowed_query_fields=("mode",),
+                allowed_query_fields=("category", "searchterm"),
                 allowed_explicit_headers=(
                     "accept",
                     "accept-encoding",
-                    "content-type",
                     "user-agent",
                 ),
-                allowed_form_fields=("btnSubmit", "passw", "uid"),
-                max_request_body_bytes=_TESTFIRE_MAX_REQUEST_BODY_BYTES,
-                request_value_profile=_TESTFIRE_REQUEST_PROFILE,
+                allowed_form_fields=(),
+                max_request_body_bytes=_PORTSWIGGER_MAX_REQUEST_BODY_BYTES,
+                request_value_profile=_PORTSWIGGER_REQUEST_PROFILE,
                 require_public_addresses=True,
             )
         return config
@@ -2044,7 +2041,7 @@ def _attack(  # noqa: C901, PLR0912, PLR0915 - CLI options are intentionally exp
     )
     parser.add_argument(
         "--traffic-request-profile",
-        choices=[_TESTFIRE_REQUEST_PROFILE],
+        choices=[_PORTSWIGGER_REQUEST_PROFILE],
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -5558,8 +5555,8 @@ def _load_env_file(path: Path) -> None:
 def _load_attack_environment(path: Path, *, excluded_keys: set[str]) -> None:
     """Load model/runtime variables while keeping selected auth secrets out of the process env."""
     for key, value in read_environment_file(path).items():
-        if key not in excluded_keys:
-            os.environ.setdefault(key, value)
+        if key not in excluded_keys and not os.environ.get(key, "").strip():
+            os.environ[key] = value
 
 
 def _selected_attack_identity(

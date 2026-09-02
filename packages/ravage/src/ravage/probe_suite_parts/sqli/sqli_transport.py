@@ -3,14 +3,23 @@ from __future__ import annotations
 import json
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from ravage.web_core.http_probe import ProbeResponse, ProbeSession, form_defaults, inject_query_param
 from ravage.probe_suite_parts.general import safe_get, submit_form
-from ravage.probe_suite_parts.sqli.sqli_forms import _form_requires_state_refresh, _source_form_for_sqli_replay
+from ravage.probe_suite_parts.sqli.sqli_forms import (
+    _form_requires_state_refresh,
+    _source_form_for_sqli_replay,
+)
 from ravage.probe_suite_parts.sqli.sqli_replay import _replay_headers
 from ravage.probe_suite_parts.sqli.sqli_targets import _graphql_sqli_query
 from ravage.probe_suite_parts.sqli.sqli_values import _sqli_baseline_value
-from ravage.probe_suite_parts.support import _dict_value
+from ravage.probe_suite_parts.support import _dict_value, _list_of_dicts
 from ravage.probes.captcha_form_state import prepare_stateful_form_fields
+from ravage.web_core.http_probe import (
+    ProbeResponse,
+    ProbeSession,
+    form_defaults,
+    inject_query_param,
+)
+
 
 def _send_sqli_target(session: ProbeSession, target: dict[str, object], value: str) -> ProbeResponse:
     kind = str(target.get("kind") or "")
@@ -25,6 +34,12 @@ def _send_sqli_target(session: ProbeSession, target: dict[str, object], value: s
             marker_name=input_name,
             marker=value,
         )
+        if not _form_requires_state_refresh(prepared.form):
+            _preserve_blank_form_companions(
+                prepared.fields,
+                prepared.form,
+                payload_field=input_name,
+            )
         return submit_form(session, prepared.form, prepared.fields)
     if kind == "heuristic_post":
         fields = _heuristic_post_fields(url, input_name, value)
@@ -157,6 +172,7 @@ def _sqli_replay(target: dict[str, object], value: str) -> dict[str, object]:
     if kind == "form" and isinstance(target.get("form"), dict):
         form = _dict_value(target.get("form"))
         fields = form_defaults(form, marker_name=input_name, marker=value)
+        _preserve_blank_form_companions(fields, form, payload_field=input_name)
         replay = {
             "method": str(form.get("method") or "GET").upper(),
             "url": str(form.get("action") or url),
@@ -224,6 +240,28 @@ def _sqli_replay(target: dict[str, object], value: str) -> dict[str, object]:
         "payload_field": input_name,
         "replay_hint": "GET request is fully encoded in url.",
     }
+
+
+def _preserve_blank_form_companions(
+    fields: dict[str, str],
+    form: dict[str, object],
+    *,
+    payload_field: str,
+) -> None:
+    """Change only the SQLi payload field; retain observed blank companions."""
+    generated_default_types = {"checkbox", "radio", "submit", "button"}
+    for input_field in _list_of_dicts(form.get("inputs")):
+        name = str(input_field.get("name") or "")
+        input_type = str(input_field.get("type") or "text").casefold()
+        if (
+            not name
+            or name == payload_field
+            or input_field.get("disabled")
+            or input_type in generated_default_types
+        ):
+            continue
+        if not str(input_field.get("value") or ""):
+            fields[name] = ""
 
 def _same_origin_redirect_location(session: ProbeSession, response: ProbeResponse) -> str:
     if response.status not in {301, 302, 303, 307, 308}:

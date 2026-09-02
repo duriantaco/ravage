@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 from collections.abc import Mapping
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from copy import copy
 from dataclasses import dataclass, field
 from http.client import (
@@ -49,7 +49,7 @@ from ravage.web_core.proof_recognizer import decoded_braced_fragments, recognize
 from ravage.web_core.scope_policy import same_origin, url_in_scope_entries
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Sequence
     from http.client import HTTPMessage
     from typing import IO
 
@@ -60,6 +60,8 @@ MAX_REQUEST_BODY_BYTES = 32_000_000
 DEFAULT_USER_AGENT = "ravage-probe/1.0"
 _HTTP_PROTOCOL_ERROR = "HTTP protocol error"
 _IPV6_VERSION = 6
+_PROBE_POLICY_BLOCK_REPEAT_LIMIT = 3
+_WHOLE_RUN_REQUEST_LIMIT_REACHED = "whole-run physical request limit reached"
 _HTTP_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _TRAFFIC_IDENTITY_ALIAS_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 _SENSITIVE_SUMMARY_HEADERS = frozenset(
@@ -438,6 +440,7 @@ class ProbeResponse:
     body_bytes: bytes = b""
     error: str = ""
     truncated: bool = False
+    policy_blocked: bool = field(default=False, repr=False, compare=False)
 
     def __init__(  # noqa: PLR0913
         self,
@@ -452,6 +455,7 @@ class ProbeResponse:
         *,
         body_bytes: bytes | None = None,
         truncated: bool = False,
+        policy_blocked: bool = False,
     ) -> None:
         if body_bytes is not None and not isinstance(body_bytes, bytes):
             raise TypeError("body_bytes must be bytes")
@@ -469,6 +473,7 @@ class ProbeResponse:
         )
         object.__setattr__(self, "error", error)
         object.__setattr__(self, "truncated", truncated)
+        object.__setattr__(self, "policy_blocked", bool(policy_blocked))
 
     @property
     def ok(self) -> bool:
@@ -492,11 +497,158 @@ class ProbeResponse:
         }
 
 
+class ProbeTrafficPolicyStopError(RuntimeError):
+    """Stop one probe after policy makes its remaining request loop futile."""
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        consecutive_blocks: int,
+        blocked_responses: Sequence[Mapping[str, object]],
+    ) -> None:
+        self.reason = str(reason).strip() or "traffic policy blocked request"
+        self.consecutive_blocks = max(1, int(consecutive_blocks))
+        self.blocked_responses = tuple(dict(item) for item in blocked_responses)
+        super().__init__(self.reason)
+
+
+class _SharedProbePolicyBlockGuard:
+    """Fork-shared, opt-in cutoff for one synchronous probe execution."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active = 0
+        self._last_family: tuple[object, ...] | None = None
+        self._consecutive_blocks = 0
+        self._blocked_responses: list[dict[str, object]] = []
+        self._stopped_reason = ""
+
+    @contextmanager
+    def activate(self) -> Iterator[None]:
+        with self._lock:
+            if self._active == 0:
+                self._reset_locked()
+            self._active += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._active = max(0, self._active - 1)
+                if self._active == 0:
+                    self._reset_locked()
+
+    def before_request(self) -> None:
+        with self._lock:
+            if not self._active or not self._stopped_reason:
+                return
+            reason = self._stopped_reason
+            consecutive_blocks = self._consecutive_blocks
+            blocked_responses = tuple(dict(item) for item in self._blocked_responses)
+        raise ProbeTrafficPolicyStopError(
+            reason,
+            consecutive_blocks=consecutive_blocks,
+            blocked_responses=blocked_responses,
+        )
+
+    def observe_response(
+        self,
+        response: ProbeResponse,
+        *,
+        family: tuple[object, ...],
+    ) -> None:
+        with self._lock:
+            if not self._active or self._stopped_reason:
+                return
+            if not response.policy_blocked:
+                self._reset_streak_locked()
+                return
+            if family == self._last_family:
+                self._consecutive_blocks += 1
+                self._blocked_responses.append(response.summary())
+            else:
+                self._last_family = family
+                self._consecutive_blocks = 1
+                self._blocked_responses = [response.summary()]
+            if _probe_policy_block_is_terminal(response.error) or (
+                self._consecutive_blocks >= _PROBE_POLICY_BLOCK_REPEAT_LIMIT
+            ):
+                self._stopped_reason = response.error.strip() or "traffic policy blocked request"
+
+    def _reset_streak_locked(self) -> None:
+        self._last_family = None
+        self._consecutive_blocks = 0
+        self._blocked_responses = []
+
+    def _reset_locked(self) -> None:
+        self._reset_streak_locked()
+        self._stopped_reason = ""
+
+
 def _summary_headers(headers: dict[str, str]) -> dict[str, str]:
     return {
         name: "[REDACTED]" if name.lower() in _SENSITIVE_SUMMARY_HEADERS else value
         for name, value in headers.items()
     }
+
+
+def _probe_policy_block_is_terminal(reason: str) -> bool:
+    normalized = str(reason).strip().casefold()
+    return normalized == _WHOLE_RUN_REQUEST_LIMIT_REACHED or normalized.startswith(
+        "traffic circuit "
+    )
+
+
+def _probe_policy_block_family(
+    response: ProbeResponse,
+    *,
+    data: bytes | None,
+    headers: Mapping[str, str] | None,
+) -> tuple[object, ...]:
+    parsed = urlsplit(response.url)
+    try:
+        query_fields = tuple(
+            sorted(
+                {
+                    str(name).casefold()
+                    for name, _value in parse_qsl(
+                        parsed.query,
+                        keep_blank_values=True,
+                        max_num_fields=64,
+                    )
+                }
+            )
+        )
+    except ValueError:
+        query_fields = ("<malformed-query>",)
+    header_fields = tuple(sorted({str(name).casefold() for name in (headers or {})}))
+    form_fields = _probe_policy_body_field_names(data)
+    return (
+        response.error.strip().casefold(),
+        response.method.strip().upper(),
+        parsed.path or "/",
+        query_fields,
+        header_fields,
+        form_fields,
+    )
+
+
+def _probe_policy_body_field_names(data: bytes | None) -> tuple[str, ...]:
+    if not data:
+        return ()
+    if len(data) > 65_536:
+        return ("<oversized-body>",)
+    try:
+        decoded = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return ("<opaque-body>",)
+    try:
+        fields = parse_qsl(decoded, keep_blank_values=True, max_num_fields=64)
+    except ValueError:
+        return ("<malformed-body>",)
+    if not fields:
+        return ("<opaque-body>",)
+    return tuple(sorted({str(name).casefold() for name, _value in fields}))
 
 
 @dataclass(frozen=True)
@@ -603,6 +755,7 @@ class ProbeSession:
         network_context: ProbeNetworkContext | None = None,
         _request_pacer: _RequestPacer | None = None,
         _physical_request_counter: _SharedPhysicalRequestCounter | None = None,
+        _probe_policy_block_guard: _SharedProbePolicyBlockGuard | None = None,
         _dns_pins: dict[tuple[str, int], tuple[str, ...]] | None = None,
         _dns_pin_lock: threading.Lock | None = None,
         traffic_observer: Callable[[dict[str, object]], None] | None = None,
@@ -637,6 +790,7 @@ class ProbeSession:
         self._physical_request_counter = (
             _physical_request_counter or _SharedPhysicalRequestCounter()
         )
+        self._probe_policy_block_guard = _probe_policy_block_guard or _SharedProbePolicyBlockGuard()
         if network_context is not None and (
             resolver is not None or _dns_pins is not None or _dns_pin_lock is not None
         ):
@@ -753,6 +907,17 @@ class ProbeSession:
         """Install owner preflight with an optional post-dispatch accounting commit."""
         self._request_gate = gate
 
+    @contextmanager
+    def stop_on_repeated_policy_blocks(self) -> Iterator[None]:
+        """
+        Stop only this probe after terminal or repeated policy denials.
+
+        Ordinary ``ProbeSession`` callers retain response-returning behavior because
+        the guard is active only while a probe execution boundary opts in.
+        """
+        with self._probe_policy_block_guard.activate():
+            yield
+
     def add_traffic_observer(
         self,
         observer: Callable[[dict[str, object]], None],
@@ -859,6 +1024,7 @@ class ProbeSession:
             network_context=self._network_context,
             _request_pacer=self._request_pacer,
             _physical_request_counter=self._physical_request_counter,
+            _probe_policy_block_guard=self._probe_policy_block_guard,
             traffic_observer=self._traffic_observer,
             traffic_policy=self._traffic_policy,
             traffic_lane=self._traffic_lane,
@@ -925,6 +1091,7 @@ class ProbeSession:
         max_bytes: int = MAX_BODY_BYTES,
     ) -> bytes:
         """Return exact bounded response bytes for a clean 2xx request."""
+        self._probe_policy_block_guard.before_request()
         if self._managed_request_delegate is not None:
             raise RuntimeError("managed binary downloads require an owner-controlled adapter")
         response = self._request_direct(
@@ -933,6 +1100,7 @@ class ProbeSession:
             headers=headers,
             max_body_bytes=max_bytes,
         )
+        self._observe_probe_policy_response(response, data=None, headers=headers)
         if response.error or response.status is None or not 200 <= response.status < 300:
             return b""
         return response.body_bytes
@@ -1115,6 +1283,7 @@ class ProbeSession:
         timeout_seconds: float | None = None,
         max_body_bytes: int | None = None,
     ) -> ProbeResponse:
+        self._probe_policy_block_guard.before_request()
         delegate = self._managed_request_delegate
         if delegate is not None:
             if max_body_bytes is not None:
@@ -1123,7 +1292,7 @@ class ProbeSession:
                     raise RuntimeError(
                         "managed requests require the owner-controlled response body limit"
                     )
-            return delegate(
+            response = delegate(
                 self,
                 method,
                 url,
@@ -1131,22 +1300,25 @@ class ProbeSession:
                 headers=headers,
                 timeout_seconds=timeout_seconds,
             )
-        if max_body_bytes is None:
-            return self._request_direct(
+        elif max_body_bytes is None:
+            response = self._request_direct(
                 method,
                 url,
                 data=data,
                 headers=headers,
                 timeout_seconds=timeout_seconds,
             )
-        return self._request_direct(
-            method,
-            url,
-            data=data,
-            headers=headers,
-            timeout_seconds=timeout_seconds,
-            max_body_bytes=max_body_bytes,
-        )
+        else:
+            response = self._request_direct(
+                method,
+                url,
+                data=data,
+                headers=headers,
+                timeout_seconds=timeout_seconds,
+                max_body_bytes=max_body_bytes,
+            )
+        self._observe_probe_policy_response(response, data=data, headers=headers)
+        return response
 
     def _request_direct(
         self,
@@ -1450,9 +1622,23 @@ class ProbeSession:
             final_url=absolute_url,
             elapsed_ms=0,
             error=reason or "traffic policy blocked request",
+            policy_blocked=True,
         )
         self._observe_traffic(response, disposition="blocked", reason=response.error)
         return response
+
+    def _observe_probe_policy_response(
+        self,
+        response: ProbeResponse,
+        *,
+        data: bytes | None,
+        headers: Mapping[str, str] | None,
+    ) -> None:
+        if not response.policy_blocked:
+            self._probe_policy_block_guard.observe_response(response, family=())
+            return
+        family = _probe_policy_block_family(response, data=data, headers=headers)
+        self._probe_policy_block_guard.observe_response(response, family=family)
 
     def _observe_traffic(
         self,

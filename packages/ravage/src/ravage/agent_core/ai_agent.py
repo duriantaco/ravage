@@ -108,6 +108,7 @@ from ravage.runtime import (
     ToolRuntimeMode,
 )
 from ravage.traffic.policy import (
+    PORTSWIGGER_DEMO_REQUEST_PROFILE,
     TrafficPolicyConfig,
     TrafficPolicyController,
     TrafficPolicyError,
@@ -128,6 +129,7 @@ MAX_OBSERVATION_CHARS = 10_000
 MAX_TRANSCRIPT_CHARS = 80_000
 MODEL_TIMEOUT_PADDING_SECONDS = 10
 DOCKER_SCOPE_GATEWAY_HOST = "ravage-target"
+_PORTSWIGGER_DEMO_PROBE = "sqli_differential"
 _CONTEXT_PROOF_RE = re.compile(r"\b(?:flag|FLAG|HTB|CTF)\{[^}\s]{3,512}\}")
 _AUTHENTICATED_ACTION_PROTOCOL_KEYS = (
     "action",
@@ -710,14 +712,29 @@ def run_ai_web_agent(
                 )
             action_id = str(uuid4())
             allow_premature_final = settings.model_client is not None and recovery is None
-            shadow_action, shadow_reason = _shadow_harness_action(
-                state=state,
+            profile_action = _request_profile_probe_action(
+                settings=settings,
                 proposed_action=proposed_action,
-                turn=turn,
-                max_turns=max(settings.max_turns, 1),
-                allow_premature_final=allow_premature_final,
             )
-            if recovery is not None and recovery.scheduler.role is not RecoveryRole.CORE:
+            shadow_action: dict[str, object] | None
+            if profile_action is not None:
+                if profile_action == dict(proposed_action):
+                    shadow_action = None
+                    shadow_reason = "request_profile_compatible"
+                else:
+                    shadow_action = profile_action
+                    shadow_reason = "request_profile_route"
+            else:
+                shadow_action, shadow_reason = _shadow_harness_action(
+                    state=state,
+                    proposed_action=proposed_action,
+                    turn=turn,
+                    max_turns=max(settings.max_turns, 1),
+                    allow_premature_final=allow_premature_final,
+                )
+            if profile_action is not None:
+                action = profile_action
+            elif recovery is not None and recovery.scheduler.role is not RecoveryRole.CORE:
                 action = select_recovery_branch_action(
                     proposed_action,
                     role=recovery.scheduler.role,
@@ -732,7 +749,7 @@ def run_ai_web_agent(
                     max_turns=max(settings.max_turns, 1),
                     allow_premature_final=allow_premature_final,
                 )
-            if recovery is None:
+            if recovery is None and profile_action is None:
                 resolved_action, resolution_reason = _resolve_same_turn_harness_action(
                     state=state,
                     proposed_action=proposed_action,
@@ -1128,6 +1145,42 @@ def _model_action_from_parsed(
     if forced:
         return forced
     return dict(action)
+
+
+def _request_profile_probe_action(
+    *,
+    settings: AIWebAgentSettings,
+    proposed_action: Mapping[str, object],
+) -> dict[str, object] | None:
+    """Keep a code-owned request profile on its one compatible specialist."""
+    config = settings.traffic_policy_config
+    if config is None or config.request_value_profile != PORTSWIGGER_DEMO_REQUEST_PROFILE:
+        return None
+    if (
+        proposed_action.get("action") == "run_probe"
+        and str(proposed_action.get("probe") or "") == _PORTSWIGGER_DEMO_PROBE
+    ):
+        return dict(proposed_action)
+    return {
+        "action": "run_probe",
+        "task_id": "data-query",
+        "probe": _PORTSWIGGER_DEMO_PROBE,
+        "strategy": "scope_locked_request_profile",
+        "notes": (
+            "The request profile permits only the bounded catalog SQL differential "
+            "specialist; unrelated page-chrome signals cannot expand the demo scope."
+        ),
+        "expected_signal": (
+            "SQL error evidence or a paired boolean response differential on category"
+        ),
+        "fallback": (
+            "If the bounded specialist cannot confirm the issue, stop and retain the "
+            "run artifacts without broadening scope."
+        ),
+        "memory_updates": [
+            "scope-locked request profile selected sqli_differential"
+        ],
+    }
 
 
 def _shadow_harness_action(
@@ -4637,8 +4690,9 @@ class ChatClient:
             "model": self.route.model,
             "messages": messages,
             "response_format": {"type": "json_object"},
-            "temperature": 0,
         }
+        if _supports_temperature_override(self.route):
+            body["temperature"] = 0
         if self.route.provider == "openai" and self.route.base_url is None:
             body["service_tier"] = "default"
         if self.route.output_token_limit_parameter != "none":
@@ -4745,6 +4799,13 @@ class ChatClient:
 
 def _model_retry_delay(attempt: int) -> float:
     return float(min(8, 2 ** max(attempt - 1, 0)))
+
+
+def _supports_temperature_override(route: ResolvedModelRoute) -> bool:
+    if route.reasoning_effort is not None:
+        return False
+    model = route.model.rsplit("/", 1)[-1].lower()
+    return not model.startswith(("gpt-5", "o1", "o3", "o4"))
 
 
 def _openai_content(data: Mapping[str, object]) -> str:

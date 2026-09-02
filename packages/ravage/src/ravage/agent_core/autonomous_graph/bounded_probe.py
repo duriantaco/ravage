@@ -15,6 +15,7 @@ from ravage.agent_core.autonomous_graph.template_form_closure import (
 )
 from ravage.probe_suite import (
     _canonical_host_default_headers,
+    _execute_probe_handler,
     _probe_handlers,
 )
 from ravage.probe_suite_parts.result import ProbeRunResult
@@ -114,7 +115,7 @@ class BoundedGraphProbeSession(ProbeSession):
         max_body_bytes: int | None = None,
     ) -> BoundedGraphProbeSession:
         del inherit_identity
-        return type(self)(
+        forked = type(self)(
             self.target_url,
             timeout_seconds=(self.timeout_seconds if timeout_seconds is None else timeout_seconds),
             request_budget=self._request_budget,
@@ -129,6 +130,8 @@ class BoundedGraphProbeSession(ProbeSession):
             traffic_policy_reference=self.traffic_policy_reference(),
             max_body_bytes=self.max_body_bytes if max_body_bytes is None else max_body_bytes,
         )
+        forked._probe_policy_block_guard = self._probe_policy_block_guard
+        return forked
 
     def request(
         self,
@@ -140,6 +143,8 @@ class BoundedGraphProbeSession(ProbeSession):
         timeout_seconds: float | None = None,
         max_body_bytes: int | None = None,
     ) -> ProbeResponse:
+        # Check the probe-local guard before consuming a graph request grant.
+        self._probe_policy_block_guard.before_request()
         rewritten = self._rewrite_canonical_url(url)
         absolute = self.absolute(rewritten)
         if self.in_scope(absolute) and not self._request_budget.acquire():
@@ -223,7 +228,12 @@ def run_bounded_graph_probe(  # noqa: PLR0913 - explicit subprocess contract.
             errors=[f"unknown probe: {probe}"],
         )
     else:
-        result = handler(session, state)
+        result = _execute_probe_handler(
+            probe,
+            handler=handler,
+            session=session,
+            state=state,
+        )
     receipt = budget.receipt()
     if receipt["denied"]:
         result = ProbeRunResult(

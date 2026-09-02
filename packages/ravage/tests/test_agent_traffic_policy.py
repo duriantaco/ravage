@@ -9,11 +9,20 @@ from uuid import uuid4
 import pytest
 from ravage.agent_core.action_executor import ActionResult, execute_action
 from ravage.agent_core.agent_state import AgentState
-from ravage.agent_core.ai_agent import AIWebAgentSettings, _open_run_traffic_policy
+from ravage.agent_core.ai_agent import (
+    AIWebAgentSettings,
+    _open_run_traffic_policy,
+    _request_profile_probe_action,
+)
 from ravage.run_data.audit import AuditStore
 from ravage.run_data.workspace import AgentWorkspace
 from ravage.runtime import ToolResult, ToolRuntime
-from ravage.traffic.policy import TrafficPolicyConfig, TrafficPolicyController, TrafficPolicyError
+from ravage.traffic.policy import (
+    PORTSWIGGER_DEMO_REQUEST_PROFILE,
+    TrafficPolicyConfig,
+    TrafficPolicyController,
+    TrafficPolicyError,
+)
 
 
 class _TrackingRuntime(ToolRuntime):
@@ -257,21 +266,25 @@ def test_policy_reference_cannot_weaken_settings(tmp_path: Path) -> None:
         )
 
 
-def test_policy_reference_preserves_code_owned_request_restrictions(tmp_path: Path) -> None:
-    workspace = AgentWorkspace.open(tmp_path / "workspace")
-    config = replace(
+def _portswigger_profile_config() -> TrafficPolicyConfig:
+    return replace(
         TrafficPolicyConfig.low_noise(max_physical_requests=24, max_rps=0.5),
-        allowed_request_routes=("GET /login.jsp", "POST /doLogin"),
-        allowed_query_fields=("mode",),
-        allowed_explicit_headers=("content-type", "user-agent"),
-        allowed_form_fields=("passw", "uid"),
+        allowed_request_routes=("GET /catalog", "HEAD /catalog"),
+        allowed_query_fields=("category", "searchterm"),
+        allowed_explicit_headers=("accept", "accept-encoding", "user-agent"),
+        allowed_form_fields=(),
         max_request_body_bytes=1_024,
-        request_value_profile="testfire-login-demo",
+        request_value_profile=PORTSWIGGER_DEMO_REQUEST_PROFILE,
         require_public_addresses=True,
     )
+
+
+def test_policy_reference_preserves_code_owned_request_restrictions(tmp_path: Path) -> None:
+    workspace = AgentWorkspace.open(tmp_path / "workspace")
+    config = _portswigger_profile_config()
     expected = TrafficPolicyController.open(
         workspace.root / "traffic-policy.json",
-        target_url="https://demo.testfire.net/login.jsp?mode=demo",
+        target_url="https://vulnerable-website.com/catalog?category=Accessories",
         config=config,
     )
     settings = AIWebAgentSettings(
@@ -285,11 +298,53 @@ def test_policy_reference_preserves_code_owned_request_restrictions(tmp_path: Pa
     opened = _open_run_traffic_policy(
         settings=settings,
         workspace=workspace,
-        target_url="https://demo.testfire.net/login.jsp?mode=demo",
+        target_url="https://vulnerable-website.com/catalog?category=Accessories",
         roe_max_rps=0.5,
     )
 
     assert opened.config == config
+
+
+def test_portswigger_profile_preserves_the_models_compatible_sql_probe() -> None:
+    proposed = {
+        "action": "run_probe",
+        "probe": "sqli_differential",
+        "notes": "test category only",
+    }
+    settings = AIWebAgentSettings(
+        traffic_policy_config=_portswigger_profile_config()
+    )
+
+    selected = _request_profile_probe_action(
+        settings=settings,
+        proposed_action=proposed,
+    )
+
+    assert selected == proposed
+
+
+def test_portswigger_profile_rejects_unrelated_harness_probe_routing() -> None:
+    settings = AIWebAgentSettings(
+        traffic_policy_config=_portswigger_profile_config()
+    )
+
+    selected = _request_profile_probe_action(
+        settings=settings,
+        proposed_action={"action": "run_probe", "probe": "xss_context"},
+    )
+
+    assert selected is not None
+    assert selected["probe"] == "sqli_differential"
+    assert selected["strategy"] == "scope_locked_request_profile"
+
+
+def test_ordinary_policy_does_not_lock_agent_probe_selection() -> None:
+    selected = _request_profile_probe_action(
+        settings=AIWebAgentSettings(traffic_policy_config=TrafficPolicyConfig()),
+        proposed_action={"action": "run_probe", "probe": "xss_context"},
+    )
+
+    assert selected is None
 
 
 def test_resume_rejects_missing_workspace_policy_ledger(tmp_path: Path) -> None:

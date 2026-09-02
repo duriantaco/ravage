@@ -34,27 +34,72 @@ if TYPE_CHECKING:
 
 TRAFFIC_POLICY_SCHEMA = "ravage.traffic-policy"
 TRAFFIC_POLICY_VERSION = 1
+PORTSWIGGER_DEMO_REQUEST_PROFILE = "portswigger-scanme-demo"
+_PORTSWIGGER_DEMO_ORIGIN = "https://vulnerable-website.com"
+_PORTSWIGGER_DEMO_ROUTES = ("GET /catalog", "HEAD /catalog")
+_PORTSWIGGER_DEMO_QUERY_FIELDS = ("category", "searchterm")
+_PORTSWIGGER_DEMO_HEADERS = ("accept", "accept-encoding", "user-agent")
+_PORTSWIGGER_DEMO_MAX_REQUESTS = 24
+_PORTSWIGGER_DEMO_MAX_RPS = 0.5
+_PORTSWIGGER_DEMO_MAX_BODY_BYTES = 1_024
 _MAX_LEDGER_BYTES = 8_000_000
 _CACHE_FILE_SUFFIX = ".json"
 _OVERLOAD_STATUSES = frozenset({429, 502, 503, 504})
-_REQUEST_VALUE_PROFILES = frozenset({"testfire-login-demo"})
-_TESTFIRE_SAFE_QUERY_VALUES = {"mode": frozenset({"demo"})}
-_TESTFIRE_SAFE_FORM_VALUES = {
-    "btnsubmit": frozenset({"Login", "Submit", "btnSubmit"}),
-    "passw": frozenset({"", "RavagePass123!"}),
-    "uid": frozenset(
+_REQUEST_VALUE_PROFILES = frozenset({PORTSWIGGER_DEMO_REQUEST_PROFILE})
+_PORTSWIGGER_SAFE_QUERY_VALUES = {
+    "category": frozenset(
         {
-            "",
-            "ravage",
-            "admin' -- ",
-            "admin' -- -",
-            "admin'#",
-            "' OR '1'='1' -- ",
+            "Accessories",
+            "'",
+            '"',
+            "\\",
+            "Accessories'",
+            'Accessories"',
+            "')",
+            '")',
+            "1) OR (1=1",
+            "1) AND (1=2",
+            "1' OR '1'='1",
+            "1' AND '1'='2",
             "1' OR '1'='1' -- ",
-            "admin' OR '1'='1' -- ",
-            "admin') OR ('1'='1' -- ",
+            "1' AND '1'='2' -- ",
+            "1'/**/OR/**/'1'='1'-- -",
+            "1'/**/AND/**/'1'='2'-- -",
+            '1" OR "1"="1',
+            '1" AND "1"="2',
+            '1" OR "1"="1" -- ',
+            '1" AND "1"="2" -- ',
+            "Accessories' OR '1'='1",
+            "Accessories' AND '1'='2",
+            "Accessories' OR '1'='1' -- ",
+            "Accessories' AND '1'='2' -- ",
+            "Accessories'/**/OR/**/'1'='1'-- -",
+            "Accessories'/**/AND/**/'1'='2'-- -",
+            "Accessories') OR ('1'='1",
+            "Accessories') AND ('1'='2",
+            'Accessories" OR "1"="1',
+            'Accessories" AND "1"="2',
+            'Accessories" OR "1"="1" -- ',
+            'Accessories" AND "1"="2" -- ',
+            "') OR ('1'='1",
+            "') AND ('1'='2",
         }
     ),
+    # The catalog form's observed blank search field is preserved alongside
+    # ``category`` and may never be mutated by the demo probe.
+    "searchterm": frozenset({""}),
+}
+_PORTSWIGGER_SAFE_HEADER_VALUES = {
+    "accept": frozenset(
+        {
+            (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "application/json;q=0.8,text/plain;q=0.7,*/*;q=0.1"
+            ),
+        }
+    ),
+    "accept-encoding": frozenset({"identity"}),
+    "user-agent": frozenset({"ravage-probe/1.0", "ravage-recon/1.0"}),
 }
 _SENSITIVE_REQUEST_HEADERS = frozenset(
     {
@@ -197,6 +242,8 @@ class TrafficPolicyConfig:
             raise ValueError("request_value_profile is unsupported")
         if not isinstance(self.require_public_addresses, bool):
             raise ValueError("require_public_addresses must be a boolean")
+        if self.request_value_profile == PORTSWIGGER_DEMO_REQUEST_PROFILE:
+            _validate_portswigger_demo_config(self)
 
     @classmethod
     def low_noise(
@@ -333,6 +380,29 @@ class TrafficPolicyConfig:
             require_public_addresses=_bool(
                 value.get("require_public_addresses", defaults.require_public_addresses)
             ),
+        )
+
+
+def _validate_portswigger_demo_config(config: TrafficPolicyConfig) -> None:
+    """Keep the named public-demo profile coupled to its fail-closed envelope."""
+    valid = (
+        config.mode is TrafficPolicyMode.ENFORCE
+        and config.max_physical_requests is not None
+        and config.max_physical_requests <= _PORTSWIGGER_DEMO_MAX_REQUESTS
+        and config.max_rps is not None
+        and config.max_rps <= _PORTSWIGGER_DEMO_MAX_RPS
+        and config.allowed_request_routes == _PORTSWIGGER_DEMO_ROUTES
+        and config.allowed_query_fields == _PORTSWIGGER_DEMO_QUERY_FIELDS
+        and config.allowed_explicit_headers == _PORTSWIGGER_DEMO_HEADERS
+        and config.allowed_form_fields == ()
+        and config.max_request_body_bytes is not None
+        and config.max_request_body_bytes <= _PORTSWIGGER_DEMO_MAX_BODY_BYTES
+        and config.require_public_addresses
+    )
+    if not valid:
+        raise ValueError(
+            "PortSwigger request profile requires its enforced routes, fields, "
+            "headers, public-address check, and bounded traffic limits"
         )
 
 
@@ -539,6 +609,13 @@ class TrafficPolicyController:
     ) -> Self:
         path = Path(state_path).expanduser().absolute()
         target_origin = _target_origin(target_url)
+        if (
+            config.request_value_profile == PORTSWIGGER_DEMO_REQUEST_PROFILE
+            and target_origin != _PORTSWIGGER_DEMO_ORIGIN
+        ):
+            raise TrafficPolicyError(
+                "PortSwigger request profile is locked to https://vulnerable-website.com"
+            )
         path.parent.mkdir(parents=True, exist_ok=True)
         controller = cls(path, target_origin, config, clock=clock, sleep=sleep)
         with controller._locked_state(create=not require_existing) as state:
@@ -1034,9 +1111,14 @@ class TrafficPolicyController:
             except ValueError:
                 return "traffic request query is malformed or too large"
         if config.allowed_query_fields is not None:
-            query_names = {str(name).casefold() for name, _value in query_fields}
+            normalized_query_names = [str(name).casefold() for name, _value in query_fields]
+            query_names = set(normalized_query_names)
             if not query_names.issubset(set(config.allowed_query_fields)):
                 return "traffic request query contains a field outside the permitted set"
+            if config.request_value_profile is not None and len(normalized_query_names) != len(
+                query_names
+            ):
+                return "traffic request query repeats a field"
         query_value_reason = _request_query_value_restriction_reason(
             config.request_value_profile,
             query_fields,
@@ -1048,6 +1130,12 @@ class TrafficPolicyController:
             header_names = {str(name).strip().casefold() for name in intent.headers}
             if not header_names.issubset(set(config.allowed_explicit_headers)):
                 return "traffic request contains an explicit header outside the permitted set"
+        header_value_reason = _request_header_value_restriction_reason(
+            config.request_value_profile,
+            intent.headers,
+        )
+        if header_value_reason:
+            return header_value_reason
 
         body = intent.body or b""
         if config.max_request_body_bytes is not None and len(body) > config.max_request_body_bytes:
@@ -1399,9 +1487,9 @@ def _request_query_value_restriction_reason(
 ) -> str:
     if profile is None:
         return ""
-    if profile == "testfire-login-demo":
+    if profile == PORTSWIGGER_DEMO_REQUEST_PROFILE:
         for raw_name, value in fields:
-            allowed = _TESTFIRE_SAFE_QUERY_VALUES.get(str(raw_name).casefold())
+            allowed = _PORTSWIGGER_SAFE_QUERY_VALUES.get(str(raw_name).casefold())
             if allowed is None or value not in allowed:
                 return "traffic request query contains a value outside the safe profile"
     return ""
@@ -1413,11 +1501,22 @@ def _request_form_value_restriction_reason(
 ) -> str:
     if profile is None:
         return ""
-    if profile == "testfire-login-demo":
-        for raw_name, value in fields:
-            allowed = _TESTFIRE_SAFE_FORM_VALUES.get(str(raw_name).casefold())
-            if allowed is None or value not in allowed:
-                return "traffic request form contains a value outside the safe profile"
+    if profile == PORTSWIGGER_DEMO_REQUEST_PROFILE and fields:
+        return "traffic request forms are disabled by the safe profile"
+    return ""
+
+
+def _request_header_value_restriction_reason(
+    profile: str | None,
+    headers: Mapping[str, str],
+) -> str:
+    if profile is None:
+        return ""
+    if profile == PORTSWIGGER_DEMO_REQUEST_PROFILE:
+        for raw_name, value in headers.items():
+            allowed = _PORTSWIGGER_SAFE_HEADER_VALUES.get(str(raw_name).strip().casefold())
+            if allowed is None or str(value) not in allowed:
+                return "traffic request header contains a value outside the safe profile"
     return ""
 
 
@@ -1696,6 +1795,7 @@ def _read_private_json(path: Path, *, maximum_bytes: int) -> dict[str, object]:
 
 
 __all__ = [
+    "PORTSWIGGER_DEMO_REQUEST_PROFILE",
     "TRAFFIC_POLICY_SCHEMA",
     "TRAFFIC_POLICY_VERSION",
     "DispatchLease",

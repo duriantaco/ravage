@@ -60,7 +60,7 @@ from ravage.probes.werkzeug_console import probe_werkzeug_console
 from ravage.probes.xxe import probe_xxe_boundary
 from ravage.runtime.browser import EXEC_BINDING, browser_backend_status, render_request, render_url
 from ravage.traffic.policy import TrafficPolicyController
-from ravage.web_core.http_probe import ProbeSession
+from ravage.web_core.http_probe import ProbeSession, ProbeTrafficPolicyStopError
 
 ProbeHandler = Callable[[ProbeSession, AgentState], ProbeRunResult]
 _ANONYMOUS_SESSION_PROBES = frozenset(
@@ -199,7 +199,12 @@ def run_builtin_probe(  # noqa: PLR0913
             summary=f"unknown probe: {probe}",
             errors=[f"unknown probe: {probe}"],
         )
-    result = handler(session, state)
+    result = _execute_probe_handler(
+        probe,
+        handler=handler,
+        session=session,
+        state=state,
+    )
     request_count_after = int(getattr(session, "physical_request_count", request_count_before))
     count_status = result.http_request_count_status
     if probe == "dom_execution":
@@ -211,6 +216,36 @@ def run_builtin_probe(  # noqa: PLR0913
         http_request_count=max(0, request_count_after - request_count_before),
         http_request_count_status=count_status,
     )
+
+
+def _execute_probe_handler(
+    probe: str,
+    *,
+    handler: ProbeHandler,
+    session: ProbeSession,
+    state: AgentState,
+) -> ProbeRunResult:
+    """Run one handler with a probe-local cutoff for futile policy blocks."""
+    try:
+        stop_on_blocks = getattr(session, "stop_on_repeated_policy_blocks", None)
+        if not callable(stop_on_blocks):
+            # Preserve compatibility with lightweight injected sessions used by
+            # deterministic consumers; the guard is an execution-harness feature.
+            return handler(session, state)
+        with stop_on_blocks():
+            return handler(session, state)
+    except ProbeTrafficPolicyStopError as exc:
+        block_word = "block" if exc.consecutive_blocks == 1 else "blocks"
+        return ProbeRunResult(
+            ok=False,
+            probe=probe,
+            summary=(
+                "traffic policy stopped the probe after "
+                f"{exc.consecutive_blocks} consecutive pre-dispatch {block_word}: "
+                f"{exc.reason}"
+            ),
+            requests=[dict(item) for item in exc.blocked_responses],
+        )
 
 
 def _validate_supplied_session(*, target_url: str, session: ProbeSession) -> None:

@@ -416,6 +416,352 @@ def test_policy_cap_blocks_second_request_before_transport(
     assert snapshot.completed_request_count == 1
 
 
+def test_manual_probe_session_keeps_returning_policy_block_responses(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    opener = _SequenceOpener()
+    monkeypatch.setattr(
+        "ravage.web_core.http_probe.build_opener",
+        lambda *_handlers: opener,
+    )
+    controller = _policy(
+        tmp_path,
+        TrafficPolicyConfig(
+            mode=TrafficPolicyMode.ENFORCE,
+            allowed_request_routes=("GET /allowed",),
+        ),
+    )
+    session = ProbeSession(
+        _TARGET_URL,
+        resolver=_loopback_resolver,
+        traffic_policy=controller,
+    )
+
+    responses = [session.get("/blocked?value=variant") for _index in range(5)]
+
+    assert all(response.status is None for response in responses)
+    assert all("permitted route" in response.error for response in responses)
+    assert opener.calls == 0
+    assert session.physical_request_count == 0
+    assert controller.snapshot().blocked_count == 5
+
+
+def test_probe_stops_after_three_identical_policy_block_families(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    opener = _SequenceOpener()
+    observed: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "ravage.web_core.http_probe.build_opener",
+        lambda *_handlers: opener,
+    )
+    controller = _policy(
+        tmp_path,
+        TrafficPolicyConfig(
+            mode=TrafficPolicyMode.ENFORCE,
+            allowed_request_routes=("GET /allowed",),
+        ),
+    )
+    session = ProbeSession(
+        _TARGET_URL,
+        resolver=_loopback_resolver,
+        traffic_observer=observed.append,
+        traffic_policy=controller,
+    )
+
+    def handler(probe_session: ProbeSession, _state: AgentState) -> ProbeRunResult:
+        requests = [probe_session.get(f"/blocked?value={index}").summary() for index in range(80)]
+        return ProbeRunResult(
+            ok=True,
+            probe="policy-loop",
+            summary="unexpectedly completed",
+            requests=requests,
+        )
+
+    monkeypatch.setattr(
+        "ravage.probe_suite._probe_handlers",
+        lambda: {"policy-loop": handler},
+    )
+
+    result = run_builtin_probe(
+        "policy-loop",
+        target_url=_TARGET_URL,
+        state=AgentState(),
+        session=session,
+    )
+
+    assert result.ok is False
+    assert "stopped the probe after 3 consecutive" in result.summary
+    assert len(result.requests) == 3
+    assert result.errors == []
+    assert result.http_request_count == 0
+    assert len(observed) == 3
+    assert all(event["disposition"] == "blocked" for event in observed)
+    assert opener.calls == 0
+    snapshot = controller.snapshot()
+    assert snapshot.blocked_count == 3
+    assert snapshot.physical_request_count == 0
+
+
+def test_probe_policy_block_streak_is_shared_by_forks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "ravage.web_core.http_probe.build_opener",
+        lambda *_handlers: _SuccessOpener(),
+    )
+    controller = _policy(
+        tmp_path,
+        TrafficPolicyConfig(
+            mode=TrafficPolicyMode.ENFORCE,
+            allowed_request_routes=("GET /allowed",),
+        ),
+    )
+    session = ProbeSession(
+        _TARGET_URL,
+        resolver=_loopback_resolver,
+        traffic_observer=observed.append,
+        traffic_policy=controller,
+    )
+
+    def handler(probe_session: ProbeSession, _state: AgentState) -> ProbeRunResult:
+        forked = probe_session.fork()
+        probe_session.get("/blocked?value=one")
+        forked.get("/blocked?value=two")
+        probe_session.get("/blocked?value=three")
+        forked.get("/blocked?value=four")
+        return ProbeRunResult(ok=True, probe="fork-loop", summary="unexpectedly completed")
+
+    monkeypatch.setattr(
+        "ravage.probe_suite._probe_handlers",
+        lambda: {"fork-loop": handler},
+    )
+
+    result = run_builtin_probe(
+        "fork-loop",
+        target_url=_TARGET_URL,
+        state=AgentState(),
+        session=session,
+    )
+
+    assert result.ok is False
+    assert len(result.requests) == 3
+    assert len(observed) == 3
+    assert controller.snapshot().blocked_count == 3
+
+
+def test_probe_policy_block_streak_resets_after_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    opener = _SequenceOpener()
+    monkeypatch.setattr(
+        "ravage.web_core.http_probe.build_opener",
+        lambda *_handlers: opener,
+    )
+    controller = _policy(
+        tmp_path,
+        TrafficPolicyConfig(
+            mode=TrafficPolicyMode.ENFORCE,
+            allowed_request_routes=("GET /allowed",),
+        ),
+    )
+    session = ProbeSession(
+        _TARGET_URL,
+        resolver=_loopback_resolver,
+        traffic_policy=controller,
+    )
+
+    def handler(probe_session: ProbeSession, _state: AgentState) -> ProbeRunResult:
+        probe_session.get("/blocked?value=one")
+        probe_session.get("/blocked?value=two")
+        probe_session.get("/allowed")
+        probe_session.get("/blocked?value=three")
+        probe_session.get("/blocked?value=four")
+        final = probe_session.get("/allowed")
+        return ProbeRunResult(
+            ok=final.ok,
+            probe="reset-loop",
+            summary="completed after admissions",
+        )
+
+    monkeypatch.setattr(
+        "ravage.probe_suite._probe_handlers",
+        lambda: {"reset-loop": handler},
+    )
+
+    result = run_builtin_probe(
+        "reset-loop",
+        target_url=_TARGET_URL,
+        state=AgentState(),
+        session=session,
+    )
+
+    assert result.ok is True
+    assert result.summary == "completed after admissions"
+    assert result.http_request_count == 2
+    assert opener.calls == 2
+    snapshot = controller.snapshot()
+    assert snapshot.blocked_count == 4
+    assert snapshot.physical_request_count == 2
+
+
+def test_probe_policy_block_streak_resets_for_a_different_request_family(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "ravage.web_core.http_probe.build_opener",
+        lambda *_handlers: _SuccessOpener(),
+    )
+    controller = _policy(
+        tmp_path,
+        TrafficPolicyConfig(
+            mode=TrafficPolicyMode.ENFORCE,
+            allowed_request_routes=("GET /allowed",),
+        ),
+    )
+    session = ProbeSession(
+        _TARGET_URL,
+        resolver=_loopback_resolver,
+        traffic_policy=controller,
+    )
+
+    def handler(probe_session: ProbeSession, _state: AgentState) -> ProbeRunResult:
+        probe_session.get("/blocked-one?value=one")
+        probe_session.get("/blocked-one?value=two")
+        probe_session.get("/blocked-two?value=three")
+        probe_session.get("/blocked-two?value=four")
+        return ProbeRunResult(ok=True, probe="family-reset", summary="families exhausted")
+
+    monkeypatch.setattr(
+        "ravage.probe_suite._probe_handlers",
+        lambda: {"family-reset": handler},
+    )
+
+    result = run_builtin_probe(
+        "family-reset",
+        target_url=_TARGET_URL,
+        state=AgentState(),
+        session=session,
+    )
+
+    assert result.ok is True
+    assert result.summary == "families exhausted"
+    assert result.http_request_count == 0
+    assert controller.snapshot().blocked_count == 4
+
+
+def test_probe_stops_after_terminal_circuit_block_without_extra_accounting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "ravage.web_core.http_probe.build_opener",
+        lambda *_handlers: _TransportErrorOpener(),
+    )
+    controller = _policy(
+        tmp_path,
+        TrafficPolicyConfig(
+            mode=TrafficPolicyMode.ENFORCE,
+            circuit_failure_threshold=1,
+            circuit_open_seconds=60,
+        ),
+    )
+    session = ProbeSession(
+        _TARGET_URL,
+        resolver=_loopback_resolver,
+        traffic_observer=observed.append,
+        traffic_policy=controller,
+    )
+
+    def handler(probe_session: ProbeSession, _state: AgentState) -> ProbeRunResult:
+        requests = [probe_session.get(f"/request-{index}").summary() for index in range(80)]
+        return ProbeRunResult(
+            ok=True,
+            probe="circuit-loop",
+            summary="unexpectedly completed",
+            requests=requests,
+        )
+
+    monkeypatch.setattr(
+        "ravage.probe_suite._probe_handlers",
+        lambda: {"circuit-loop": handler},
+    )
+
+    result = run_builtin_probe(
+        "circuit-loop",
+        target_url=_TARGET_URL,
+        state=AgentState(),
+        session=session,
+    )
+
+    assert result.ok is False
+    assert "after 1 consecutive pre-dispatch block" in result.summary
+    assert "traffic circuit is open" in result.summary
+    assert len(result.requests) == 1
+    assert result.http_request_count == 1
+    assert [event["disposition"] for event in observed] == ["sent", "blocked"]
+    snapshot = controller.snapshot()
+    assert snapshot.physical_request_count == 1
+    assert snapshot.completed_request_count == 1
+    assert snapshot.blocked_count == 1
+
+
+def test_probe_runner_serializes_policy_stop_as_normal_failed_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "ravage.web_core.http_probe.build_opener",
+        lambda *_handlers: _SuccessOpener(),
+    )
+    monkeypatch.setattr(
+        "ravage.web_core.http_probe._resolve_addresses",
+        _loopback_resolver,
+    )
+    controller = _policy(
+        tmp_path,
+        TrafficPolicyConfig(
+            mode=TrafficPolicyMode.ENFORCE,
+            allowed_request_routes=("GET /allowed",),
+        ),
+    )
+
+    def handler(probe_session: ProbeSession, _state: AgentState) -> ProbeRunResult:
+        for index in range(80):
+            probe_session.get(f"/blocked?value={index}")
+        return ProbeRunResult(ok=True, probe="runner-loop", summary="unexpectedly completed")
+
+    monkeypatch.setattr(
+        "ravage.probe_suite._probe_handlers",
+        lambda: {"runner-loop": handler},
+    )
+
+    envelope = _invoke_probe_runner(
+        monkeypatch,
+        {
+            "probe": "runner-loop",
+            "target_url": _TARGET_URL,
+            "state": AgentState().to_json(),
+            "traffic_policy_reference": controller.to_reference(),
+        },
+    )
+
+    assert envelope["status"] == "ok"
+    assert envelope["ok"] is False
+    result = json.loads(str(envelope["text"]))
+    assert result["ok"] is False
+    assert "stopped the probe after 3 consecutive" in result["summary"]
+    assert result["http_request_count"] == 0
+    assert len(result["requests"]) == 3
+
+
 def test_policy_cache_hit_avoids_dispatch_and_preserves_raw_bytes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

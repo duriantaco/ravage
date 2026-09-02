@@ -696,6 +696,24 @@ def test_cli_init_refuses_to_overwrite_existing_files(tmp_path: Path) -> None:
         cli.main(["init", "--env-file", str(env_path), "--brief", str(brief_path)])
 
 
+def test_attack_environment_file_replaces_blank_process_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_path = tmp_path / ".env.ravage"
+    env_path.write_text(
+        "OPENAI_API_KEY=file-key\nRAVAGE_TEST_SETTING=file-setting\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+    monkeypatch.setenv("RAVAGE_TEST_SETTING", "process-setting")
+
+    cli._load_attack_environment(env_path, excluded_keys=set())
+
+    assert os.environ["OPENAI_API_KEY"] == "file-key"
+    assert os.environ["RAVAGE_TEST_SETTING"] == "process-setting"
+
+
 def test_cli_setup_check_reports_ready_setup(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

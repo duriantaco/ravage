@@ -256,6 +256,60 @@ def test_bounded_probe_receipt_reports_actual_requests_not_denied_attempts(
     assert "grant exhausted at 2/2" in result.summary
 
 
+def test_bounded_probe_policy_stop_precedes_an_extra_graph_grant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = TrafficPolicyController.open(
+        tmp_path / "traffic-policy.json",
+        target_url=TARGET_URL,
+        config=TrafficPolicyConfig(
+            mode="enforce",
+            allowed_request_routes=("GET /allowed",),
+        ),
+    )
+
+    def policy_block_loop(
+        session: ProbeSession,
+        _state: AgentState,
+    ) -> ProbeRunResult:
+        requests = [session.get(f"/blocked?value={index}").summary() for index in range(80)]
+        return ProbeRunResult(
+            ok=True,
+            probe="policy-block-loop",
+            summary="unexpectedly completed",
+            requests=requests,
+        )
+
+    monkeypatch.setattr(
+        "ravage.web_core.http_probe._resolve_addresses",
+        lambda _host, _port: ("127.0.0.1",),
+    )
+    monkeypatch.setattr(
+        bounded_probe,
+        "_probe_handlers",
+        lambda: {"policy-block-loop": policy_block_loop},
+    )
+
+    result, receipt = run_bounded_graph_probe(
+        "policy-block-loop",
+        target_url=TARGET_URL,
+        state=AgentState(),
+        timeout_seconds=5,
+        target_request_limit=10,
+        traffic_policy_reference=policy.to_reference(),
+    )
+
+    assert result.ok is False
+    assert "stopped the probe after 3 consecutive" in result.summary
+    assert len(result.requests) == 3
+    assert receipt["used"] == 3
+    assert receipt["denied"] == 0
+    snapshot = policy.snapshot()
+    assert snapshot.blocked_count == 3
+    assert snapshot.physical_request_count == 0
+
+
 def test_graph_action_executor_uses_bounded_subprocess_and_records_actual_count(
     tmp_path: Path,
 ) -> None:

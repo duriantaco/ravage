@@ -496,7 +496,13 @@ class RunDisplay:
             error_type = _safe_identifier(payload.get("error_type"))
             self._emit(_Line("warn", _join("Recon degraded", [elapsed, error_type])))
             return
-        self._emit(_Line("ok", _join("Recon complete", [elapsed, *_recon_details(payload)])))
+        outcome = _recon_outcome(payload)
+        if outcome == "failed":
+            self._emit(_Line("fail", _join("Recon failed", [elapsed, *_recon_details(payload)])))
+        elif outcome == "degraded":
+            self._emit(_Line("warn", _join("Recon degraded", [elapsed, *_recon_details(payload)])))
+        else:
+            self._emit(_Line("ok", _join("Recon complete", [elapsed, *_recon_details(payload)])))
         if self.show_agent_actions:
             self._recon_actions(payload)
 
@@ -1637,6 +1643,11 @@ def _token_usage(payload: Mapping[str, Any]) -> str:
 def _recon_details(payload: Mapping[str, Any]) -> list[str]:
     pages = payload.get("pages")
     page_items = pages if isinstance(pages, list) else []
+    response_pages = [
+        page
+        for page in page_items
+        if isinstance(page, dict) and _positive_int(page.get("status"))
+    ]
     parameters = payload.get("query_parameter_names")
     parameter_items = parameters if isinstance(parameters, list) else []
     reflection_count = 0
@@ -1653,7 +1664,7 @@ def _recon_details(payload: Mapping[str, Any]) -> list[str]:
     errors = payload.get("errors")
     error_count = len(errors) if isinstance(errors, list) else 0
     details = [
-        _count(len(page_items), "page") if page_items else "",
+        _count(len(response_pages), "page") if response_pages else "",
         _count(len(parameter_items), "parameter") if parameter_items else "",
         _count(reflection_count, "reflection") if reflection_count else "",
         _count(form_count, "form") if form_count else "",
@@ -1661,6 +1672,26 @@ def _recon_details(payload: Mapping[str, Any]) -> list[str]:
     if error_count:
         details.append(_count(error_count, "error"))
     return details
+
+
+def _recon_outcome(payload: Mapping[str, Any]) -> Literal["complete", "degraded", "failed"]:
+    pages = payload.get("pages")
+    page_items = pages if isinstance(pages, list) else []
+    errors = payload.get("errors")
+    has_errors = bool(errors) if isinstance(errors, list) else False
+    has_errors = has_errors or any(
+        bool(_safe_narrative(page.get("error")))
+        for page in page_items
+        if isinstance(page, dict)
+    )
+    if not has_errors:
+        return "complete"
+    has_response = any(
+        _positive_int(page.get("status"))
+        for page in page_items
+        if isinstance(page, dict)
+    )
+    return "degraded" if has_response else "failed"
 
 
 def _tool_label(
@@ -2150,10 +2181,13 @@ def _finding_location(payload: Mapping[str, Any]) -> list[str]:
     method = _http_method(method_value) if str(method_value or "").strip() else ""
     url = str(endpoint.get("url") or payload.get("url") or "").strip()
     path, query_names = _safe_url_shape(url)
-    parameter_names = _parameter_names(endpoint.get("params"))
-    for name in query_names:
-        if name not in parameter_names:
-            parameter_names.append(name)
+    finding_input = _object(payload.get("input"))
+    parameter_names = _parameter_names(finding_input.get("affected_parameters"))
+    if not parameter_names:
+        parameter_names = _parameter_names(endpoint.get("params"))
+        for name in query_names:
+            if name not in parameter_names:
+                parameter_names.append(name)
 
     request = " ".join(item for item in (method, path) if item)
     details = [request]

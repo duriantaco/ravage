@@ -129,6 +129,8 @@ def probe_sqli_differential(session: ProbeSession, state: AgentState) -> ProbeRu
         requests.extend(objective_requests)
         if objective_finding:
             findings.append(objective_finding)
+            if _stop_after_first_finding(state):
+                return _sqli_differential_result(targets, findings, requests, budget)
             continue
 
         error_finding, error_requests, budget = _probe_sqli_errors(
@@ -140,6 +142,8 @@ def probe_sqli_differential(session: ProbeSession, state: AgentState) -> ProbeRu
         requests.extend(error_requests)
         if error_finding:
             findings.append(error_finding)
+            if _stop_after_first_finding(state):
+                return _sqli_differential_result(targets, findings, requests, budget)
             continue
 
         boolean_finding, boolean_requests, budget = _probe_sqli_booleans(
@@ -151,6 +155,8 @@ def probe_sqli_differential(session: ProbeSession, state: AgentState) -> ProbeRu
         requests.extend(boolean_requests)
         if boolean_finding:
             findings.append(boolean_finding)
+            if _stop_after_first_finding(state):
+                return _sqli_differential_result(targets, findings, requests, budget)
             continue
 
         timing_finding, timing_requests, budget = _probe_sqli_timing(
@@ -162,6 +168,8 @@ def probe_sqli_differential(session: ProbeSession, state: AgentState) -> ProbeRu
         requests.extend(timing_requests)
         if timing_finding:
             findings.append(timing_finding)
+            if _stop_after_first_finding(state):
+                return _sqli_differential_result(targets, findings, requests, budget)
             continue
 
         literal_finding, literal_requests, budget = _probe_sqli_literal_comment_bypasses(
@@ -173,8 +181,14 @@ def probe_sqli_differential(session: ProbeSession, state: AgentState) -> ProbeRu
         requests.extend(literal_requests)
         if literal_finding:
             findings.append(literal_finding)
+            if _stop_after_first_finding(state):
+                return _sqli_differential_result(targets, findings, requests, budget)
 
     return _sqli_differential_result(targets, findings, requests, budget)
+
+
+def _stop_after_first_finding(state: AgentState) -> bool:
+    return state.surface.get("stop_after_first_finding") is True
 
 
 def _sqli_differential_result(

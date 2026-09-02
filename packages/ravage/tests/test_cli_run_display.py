@@ -169,6 +169,55 @@ def test_agent_action_trace_shows_reasoning_and_real_http_exchanges() -> None:
     assert "flag{do-not-print-this}" not in text
 
 
+def test_recon_total_transport_failure_is_not_rendered_as_success() -> None:
+    output = io.StringIO()
+    display = RunDisplay(mode="plain", stream=output)
+
+    display(
+        _event(
+            "recon_completed",
+            {
+                "pages": [
+                    {
+                        "status": None,
+                        "error": "certificate verify failed: certificate has expired",
+                    }
+                ],
+                "errors": ["certificate verify failed: certificate has expired"],
+            },
+        )
+    )
+    display.close()
+
+    text = output.getvalue()
+    assert "[fail] Recon failed · 1 error" in text
+    assert "Recon complete" not in text
+    assert "1 page" not in text
+
+
+def test_recon_mixed_responses_and_errors_is_rendered_as_degraded() -> None:
+    output = io.StringIO()
+    display = RunDisplay(mode="plain", stream=output)
+
+    display(
+        _event(
+            "recon_completed",
+            {
+                "pages": [
+                    {"status": 200, "error": ""},
+                    {"status": None, "error": "connection reset"},
+                ],
+                "errors": ["connection reset"],
+            },
+        )
+    )
+    display.close()
+
+    text = output.getvalue()
+    assert "[warn] Recon degraded · 1 page · 1 error" in text
+    assert "Recon complete" not in text
+
+
 def test_agent_action_trace_redacts_proof_bodies() -> None:
     payload = probe_http_exchange_payload(
         {
@@ -681,6 +730,52 @@ def test_confirmed_finding_renders_safe_location_evidence_and_result_paths() -> 
         "raw-proof-secret",
     ):
         assert secret not in text
+
+
+def test_confirmed_finding_location_prefers_proven_affected_parameters() -> None:
+    output = io.StringIO()
+    display = RunDisplay(mode="plain", stream=output)
+
+    display(
+        _event(
+            "finding_confirmed",
+            {
+                "finding_id": "finding-sqli",
+                "status": "confirmed",
+                "vuln_class": "sql_injection",
+                "severity": "high",
+                "endpoint": {
+                    "method": "GET",
+                    "url": "https://vulnerable-website.com/catalog",
+                    "params": [
+                        {"name": "category", "location": "query"},
+                        {"name": "searchTerm", "location": "query"},
+                    ],
+                },
+                "input": {
+                    "affected_parameters": [
+                        {"name": "category", "location": "query"}
+                    ]
+                },
+                "exploit_steps": [
+                    {"http_request": "GET /catalog", "indicator": "boolean delta"}
+                ],
+                "proof": {
+                    "http_request_final": "GET /catalog",
+                    "response_final": "paired response delta",
+                    "impact_description": "Database query behavior changed.",
+                },
+                "evidence_kind": "http_poc_replay",
+                "evidence_checks": {"passed": 2, "required": 2},
+                "source_kind": "tool_validate_poc",
+            },
+        )
+    )
+    display.close()
+
+    text = output.getvalue()
+    assert "Location · GET /catalog · parameters=category" in text
+    assert "searchTerm" not in text
 
 
 def test_confirmed_finding_requires_evidence_and_redacts_dynamic_path_segments() -> None:

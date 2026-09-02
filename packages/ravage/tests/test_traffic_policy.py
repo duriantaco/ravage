@@ -10,7 +10,6 @@ from threading import Event, Thread
 from urllib.parse import urlencode
 
 import pytest
-from ravage.probe_suite_parts.sqli.sqli import _SQLI_AUTH_BYPASS_PAYLOADS
 from ravage.traffic import policy as traffic_policy_module
 from ravage.traffic.policy import (
     RequestIntent,
@@ -70,27 +69,41 @@ def test_config_rejects_rate_with_infinite_interval() -> None:
         TrafficPolicyConfig(max_rps=5e-324)
 
 
-def _testfire_request_config() -> TrafficPolicyConfig:
+def _portswigger_request_config() -> TrafficPolicyConfig:
     return TrafficPolicyConfig(
         mode=TrafficPolicyMode.ENFORCE,
+        max_rps=0.5,
         max_physical_requests=24,
-        allowed_request_routes=("GET /", "GET /login.jsp", "POST /doLogin"),
-        allowed_query_fields=("mode",),
+        allowed_request_routes=("GET /catalog", "HEAD /catalog"),
+        allowed_query_fields=("category", "searchterm"),
         allowed_explicit_headers=(
             "accept",
             "accept-encoding",
-            "content-type",
             "user-agent",
         ),
-        allowed_form_fields=("uid", "passw", "btnSubmit"),
+        allowed_form_fields=(),
         max_request_body_bytes=1_024,
-        request_value_profile="testfire-login-demo",
+        request_value_profile="portswigger-scanme-demo",
         require_public_addresses=True,
     )
 
 
+def test_portswigger_profile_rejects_partial_policy_configuration() -> None:
+    with pytest.raises(ValueError, match="requires its enforced routes"):
+        TrafficPolicyConfig(request_value_profile="portswigger-scanme-demo")
+
+
+def test_portswigger_profile_is_locked_to_the_published_test_origin(tmp_path: Path) -> None:
+    with pytest.raises(TrafficPolicyError, match="locked to"):
+        TrafficPolicyController.open(
+            tmp_path / "traffic.json",
+            target_url="https://example.com/catalog?category=Accessories",
+            config=_portswigger_request_config(),
+        )
+
+
 def test_request_restrictions_round_trip_through_durable_reference(tmp_path: Path) -> None:
-    config = _testfire_request_config()
+    config = _portswigger_request_config()
     controller = _controller(tmp_path, config)
 
     restored = TrafficPolicyController.from_reference(controller.to_reference())
@@ -98,53 +111,49 @@ def test_request_restrictions_round_trip_through_durable_reference(tmp_path: Pat
     assert restored.config == config
 
 
-def test_request_restrictions_allow_only_curated_login_traffic(tmp_path: Path) -> None:
-    controller = _controller(tmp_path, _testfire_request_config())
-    get_login = RequestIntent(
+def test_request_restrictions_allow_only_curated_catalog_traffic(tmp_path: Path) -> None:
+    controller = _controller(tmp_path, _portswigger_request_config())
+    baseline = RequestIntent(
         "GET",
-        "http://127.0.0.1/login.jsp?mode=demo",
-        headers={"Accept": "text/html", "User-Agent": "ravage"},
+        "https://vulnerable-website.com/catalog?searchTerm=&category=Accessories",
+        headers={
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "application/json;q=0.8,text/plain;q=0.7,*/*;q=0.1"
+            ),
+            "Accept-Encoding": "identity",
+            "User-Agent": "ravage-probe/1.0",
+        },
     )
-    post_login = RequestIntent(
-        "POST",
-        "http://127.0.0.1/doLogin",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        body=b"uid=ravage&passw=RavagePass123%21&btnSubmit=Login",
+    boolean_true = RequestIntent(
+        "GET",
+        "https://vulnerable-website.com/catalog?category=Accessories%27+OR+%271%27%3D%271",
     )
-    safe_auth_bypass = RequestIntent(
-        "POST",
-        "http://127.0.0.1/doLogin",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        body=b"uid=admin%27+--+&passw=RavagePass123%21&btnSubmit=Login",
+    boolean_false = RequestIntent(
+        "GET",
+        "https://vulnerable-website.com/catalog?category=Accessories%27+AND+%271%27%3D%272",
     )
 
-    for intent in (get_login, post_login, safe_auth_bypass):
+    for intent in (baseline, boolean_true, boolean_false):
         decision = controller.acquire(intent)
         assert decision.kind is TrafficDecisionKind.DISPATCH
         assert decision.lease is not None
         controller.cancel(decision.lease)
 
 
-@pytest.mark.parametrize("uid", _SQLI_AUTH_BYPASS_PAYLOADS)
-def test_testfire_profile_admits_every_code_owned_auth_bypass_value(
+@pytest.mark.parametrize(
+    "category",
+    sorted(traffic_policy_module._PORTSWIGGER_SAFE_QUERY_VALUES["category"]),  # noqa: SLF001
+)
+def test_portswigger_profile_admits_every_code_owned_category_value(
     tmp_path: Path,
-    uid: str,
+    category: str,
 ) -> None:
-    controller = _controller(tmp_path, _testfire_request_config())
-    body = urlencode(
-        {
-            "uid": uid,
-            "passw": "RavagePass123!",
-            "btnSubmit": "Login",
-        }
-    ).encode()
-
+    controller = _controller(tmp_path, _portswigger_request_config())
     decision = controller.acquire(
         RequestIntent(
-            "POST",
-            "http://127.0.0.1/doLogin",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            body=body,
+            "GET",
+            f"https://vulnerable-website.com/catalog?{urlencode({'category': category})}",
         )
     )
 
@@ -153,54 +162,151 @@ def test_testfire_profile_admits_every_code_owned_auth_bypass_value(
     controller.cancel(decision.lease)
 
 
+def test_portswigger_profile_preserves_only_the_observed_blank_search_term(
+    tmp_path: Path,
+) -> None:
+    controller = _controller(tmp_path, _portswigger_request_config())
+
+    allowed = controller.acquire(
+        RequestIntent(
+            "GET",
+            "https://vulnerable-website.com/catalog?searchTerm=&category=Accessories",
+        )
+    )
+    assert allowed.kind is TrafficDecisionKind.DISPATCH
+    assert allowed.lease is not None
+    controller.cancel(allowed.lease)
+
+    blocked = controller.acquire(
+        RequestIntent(
+            "GET",
+            "https://vulnerable-website.com/catalog?searchTerm=admin&category=Accessories",
+        )
+    )
+    assert blocked.kind is TrafficDecisionKind.BLOCKED
+    assert "value" in blocked.reason
+
+
+def test_portswigger_profile_blocks_duplicate_query_fields(tmp_path: Path) -> None:
+    controller = _controller(tmp_path, _portswigger_request_config())
+
+    decision = controller.acquire(
+        RequestIntent(
+            "GET",
+            (
+                "https://vulnerable-website.com/catalog?category=Accessories&"
+                "category=Accessories%27+OR+%271%27%3D%271%27+--+"
+            ),
+        )
+    )
+
+    assert decision.kind is TrafficDecisionKind.BLOCKED
+    assert "repeats" in decision.reason
+
+
+@pytest.mark.parametrize(  # type: ignore[untyped-decorator]
+    ("name", "value"),
+    [
+        (name, value)
+        for name, values in sorted(
+            traffic_policy_module._PORTSWIGGER_SAFE_HEADER_VALUES.items()  # noqa: SLF001
+        )
+        for value in sorted(values)
+    ],
+)
+def test_portswigger_profile_admits_every_code_owned_header_value(
+    tmp_path: Path,
+    name: str,
+    value: str,
+) -> None:
+    controller = _controller(tmp_path, _portswigger_request_config())
+
+    decision = controller.acquire(
+        RequestIntent(
+            "GET",
+            "https://vulnerable-website.com/catalog?category=Accessories",
+            headers={name: value},
+        )
+    )
+
+    assert decision.kind is TrafficDecisionKind.DISPATCH
+    assert decision.lease is not None
+    controller.cancel(decision.lease)
+
+
+@pytest.mark.parametrize(  # type: ignore[untyped-decorator]
+    "headers",
+    [
+        {"User-Agent": "ravage'; DROP TABLE products;--"},
+        {"Accept": "text/html OR SLEEP(10)"},
+        {"User-Agent": "UNION SELECT username, password FROM users"},
+        {"Accept-Encoding": "gzip"},
+    ],
+    ids=["destructive", "timing", "data-extraction", "unapproved-encoding"],
+)
+def test_portswigger_profile_blocks_unapproved_header_values_before_dispatch(
+    tmp_path: Path,
+    headers: dict[str, str],
+) -> None:
+    controller = _controller(tmp_path, _portswigger_request_config())
+
+    decision = controller.acquire(
+        RequestIntent(
+            "GET",
+            "https://vulnerable-website.com/catalog?category=Accessories",
+            headers=headers,
+        )
+    )
+
+    assert decision.kind is TrafficDecisionKind.BLOCKED
+    assert "header" in decision.reason
+    snapshot = controller.snapshot()
+    assert snapshot.physical_request_count == 0
+    assert snapshot.reservation_count == 0
+    assert snapshot.blocked_count == 1
+
+
 @pytest.mark.parametrize(
     "intent",
     [
-        RequestIntent("GET", "http://127.0.0.1/admin/admin.jsp"),
-        RequestIntent("GET", "http://127.0.0.1/ignored/../login.jsp"),
-        RequestIntent("GET", "http://127.0.0.1/login%2Ejsp"),
-        RequestIntent("DELETE", "http://127.0.0.1/login.jsp"),
-        RequestIntent("GET", "http://127.0.0.1/login.jsp?next=/admin"),
-        RequestIntent("GET", "http://127.0.0.1/login.jsp?mode=staging"),
+        RequestIntent("GET", "https://vulnerable-website.com/admin/admin.jsp"),
+        RequestIntent("GET", "https://vulnerable-website.com/ignored/../catalog"),
+        RequestIntent("GET", "https://vulnerable-website.com/cat%61log"),
+        RequestIntent("DELETE", "https://vulnerable-website.com/catalog"),
+        RequestIntent("GET", "https://vulnerable-website.com/catalog?role=admin"),
+        RequestIntent("GET", "https://vulnerable-website.com/catalog?category=Gifts"),
         RequestIntent(
             "GET",
-            "http://127.0.0.1/login.jsp",
+            "https://vulnerable-website.com/catalog?category=Accessories",
             headers={"Host": "normal.example"},
         ),
         RequestIntent(
             "GET",
-            "http://127.0.0.1/login.jsp",
+            "https://vulnerable-website.com/catalog?category=Accessories",
             headers={"Cookie": "session=attacker-controlled"},
         ),
         RequestIntent(
-            "POST",
-            "http://127.0.0.1/doLogin",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            body=b"uid=guest&passw=demo&role=admin",
+            "GET",
+            "https://vulnerable-website.com/catalog?category=Accessories&role=admin",
         ),
         RequestIntent(
-            "POST",
-            "http://127.0.0.1/doLogin",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            body=b"uid=admin%27%3B+DROP+TABLE+users%3B--&passw=RavagePass123%21",
+            "GET",
+            "https://vulnerable-website.com/catalog?category=Accessories%27%3B+DROP+TABLE+products%3B--",
         ),
         RequestIntent(
-            "POST",
-            "http://127.0.0.1/doLogin",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            body=b"uid=1%27+OR+SLEEP%2810%29--+&passw=RavagePass123%21",
+            "GET",
+            "https://vulnerable-website.com/catalog?category=Accessories%27+OR+SLEEP%2810%29--",
         ),
         RequestIntent(
-            "POST",
-            "http://127.0.0.1/doLogin",
+            "GET",
+            "https://vulnerable-website.com/catalog?category=Accessories",
             headers={"Content-Type": "application/json"},
-            body=b'{"uid":"guest","passw":"demo"}',
+            body=b'{"category":"Accessories"}',
         ),
         RequestIntent(
-            "POST",
-            "http://127.0.0.1/doLogin",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            body=b"uid=" + (b"x" * 1_024),
+            "GET",
+            "https://vulnerable-website.com/catalog?category=Accessories",
+            body=b"x" * 1_025,
         ),
     ],
     ids=[
@@ -223,7 +329,7 @@ def test_request_restrictions_block_before_dispatch(
     tmp_path: Path,
     intent: RequestIntent,
 ) -> None:
-    controller = _controller(tmp_path, _testfire_request_config())
+    controller = _controller(tmp_path, _portswigger_request_config())
 
     decision = controller.acquire(intent)
 
@@ -250,9 +356,12 @@ def _controller(
     *,
     clock: _Clock | None = None,
 ) -> TrafficPolicyController:
+    target_url = "http://127.0.0.1/"
+    if config.request_value_profile == "portswigger-scanme-demo":
+        target_url = "https://vulnerable-website.com/catalog?category=Accessories"
     return TrafficPolicyController.open(
         tmp_path / "traffic.json",
-        target_url="http://127.0.0.1/",
+        target_url=target_url,
         config=config,
         clock=clock or __import__("time").time,
         sleep=(clock.sleep if clock is not None else __import__("time").sleep),

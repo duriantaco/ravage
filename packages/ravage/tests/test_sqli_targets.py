@@ -5,19 +5,99 @@ import re
 import sqlite3
 from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 
+import pytest
 from ravage.agent_core.agent_state import AgentState
+from ravage.probe_suite_parts.sqli import sqli as sqli_module
 from ravage.probe_suite_parts.sqli.sqli import (
     _target_looks_auth_bypass_candidate,
     probe_filtered_query_bypass,
     probe_sqli_differential,
     probe_sqli_exploit_runner,
 )
+from ravage.probe_suite_parts.sqli.sqli_payloads import _sqli_boolean_payloads
 from ravage.probe_suite_parts.sqli.sqli_targets import _sqli_targets
+from ravage.probe_suite_parts.sqli.sqli_transport import _sqli_replay
 from ravage.probes.sqli_extractor.auth import _auth_bypass_cases
 from ravage.web_core.http_probe import ProbeResponse
 
 _MIN_LONG_EXTRACTION_OFFSET = 73
 _MAX_PARENTHESES_UNION_REQUESTS = 100
+
+
+def test_string_sqli_boolean_pairs_prioritize_the_observed_baseline() -> None:
+    pairs = _sqli_boolean_payloads("category", baseline="Accessories")
+
+    assert pairs[0] == (
+        "Accessories' OR '1'='1' -- ",
+        "Accessories' AND '1'='2' -- ",
+    )
+
+
+def test_sqli_form_replay_preserves_blank_companion_fields() -> None:
+    target = {
+        "kind": "form",
+        "url": "https://vulnerable-website.com/catalog",
+        "input": "category",
+        "form": {
+            "method": "GET",
+            "action": "https://vulnerable-website.com/catalog",
+            "inputs": [
+                {"name": "searchTerm", "type": "search", "value": ""},
+                {"name": "category", "type": "text", "value": "Accessories"},
+            ],
+        },
+    }
+
+    replay = _sqli_replay(target, "Accessories' OR '1'='1' -- ")
+
+    assert replay["form"] == {
+        "searchTerm": "",
+        "category": "Accessories' OR '1'='1' -- ",
+    }
+
+
+def test_sqli_differential_returns_before_next_target_when_brief_requests_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    targets = [
+        {"kind": "query_param", "url": "http://127.0.0.1/?category=A", "input": "category"},
+        {"kind": "query_param", "url": "http://127.0.0.1/?search=B", "input": "search"},
+    ]
+    sent: list[str] = []
+
+    def send(_session: object, target: dict[str, object], _value: str) -> ProbeResponse:
+        sent.append(str(target["input"]))
+        return ProbeResponse(
+            method="GET",
+            url=str(target["url"]),
+            status=200,
+            final_url=str(target["url"]),
+            elapsed_ms=1,
+            headers={},
+            body="baseline",
+        )
+
+    def objective(
+        _session: object,
+        _state: AgentState,
+        target: dict[str, object],
+        *,
+        baseline: ProbeResponse,
+        budget: int,
+    ) -> tuple[dict[str, object], list[dict[str, object]], int]:
+        del baseline
+        return {"type": "blind_sql_injection_boolean_signal", "input": target}, [], budget
+
+    monkeypatch.setattr(sqli_module, "_sqli_targets", lambda _state: targets)
+    monkeypatch.setattr(sqli_module, "_send_sqli_target", send)
+    monkeypatch.setattr(sqli_module, "_probe_sqli_objective_value_bypass", objective)
+    state = AgentState(surface={"stop_after_first_finding": True})
+
+    result = probe_sqli_differential(object(), state)
+
+    assert result.ok is True
+    assert len(result.findings) == 1
+    assert sent == ["category"]
 
 
 def test_testfire_uid_form_is_an_auth_bypass_candidate() -> None:

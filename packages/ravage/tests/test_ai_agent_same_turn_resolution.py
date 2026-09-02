@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
 from ai_agent_fixtures import BRIEF_YAML, ScriptedModelClient
@@ -13,6 +14,10 @@ from ravage.agent_core.ai_agent import (
     _final_is_premature,
     _resolve_same_turn_harness_action,
     run_ai_web_agent,
+)
+from ravage.traffic.policy import (
+    PORTSWIGGER_DEMO_REQUEST_PROFILE,
+    TrafficPolicyConfig,
 )
 
 if TYPE_CHECKING:
@@ -448,6 +453,74 @@ def test_completed_task_queue_synthesizes_terminal_without_another_model_turn(
     assert finished["payload"]["termination_reason"] == "agent_final"
     saved = json.loads((tmp_path / "workspace" / "working_state.json").read_text())
     assert saved["state"]["phase"] == "done"
+
+
+def test_portswigger_profile_overrides_unrelated_probe_inside_agent_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    executed: list[dict[str, object]] = []
+    monkeypatch.setattr(ai_agent, "_seed_recon", lambda **_kwargs: None)
+
+    def refresh(state: AgentState, **_kwargs: object) -> None:
+        if not state.tasks:
+            state.tasks = [_task("data-query", priority=100)]
+
+    def execute(action: Mapping[str, object], **_kwargs: object) -> ActionResult:
+        executed.append(dict(action))
+        return ActionResult(ok=True, observation="bounded no change", outcome="observed")
+
+    monkeypatch.setattr(ai_agent, "refresh_mission_board", refresh)
+    monkeypatch.setattr(ai_agent, "execute_action", execute)
+    model = ScriptedModelClient(
+        [{"action": "run_probe", "task_id": "data-query", "probe": "default_credentials"}]
+    )
+    brief_path = tmp_path / "brief.yaml"
+    brief_path.write_text(
+        BRIEF_YAML.replace(
+            "http://127.0.0.1:8765",
+            "https://vulnerable-website.com/catalog?category=Accessories",
+        ),
+        encoding="utf-8",
+    )
+    config = replace(
+        TrafficPolicyConfig.low_noise(max_physical_requests=24, max_rps=0.5),
+        allowed_request_routes=("GET /catalog", "HEAD /catalog"),
+        allowed_query_fields=("category", "searchterm"),
+        allowed_explicit_headers=("accept", "accept-encoding", "user-agent"),
+        allowed_form_fields=(),
+        max_request_body_bytes=1_024,
+        request_value_profile=PORTSWIGGER_DEMO_REQUEST_PROFILE,
+        require_public_addresses=True,
+    )
+
+    run_ai_web_agent(
+        brief_path=brief_path,
+        target_url="https://vulnerable-website.com/catalog?category=Accessories",
+        settings=AIWebAgentSettings(
+            tool_runtime_mode="host",
+            db_path=tmp_path / "audit.db",
+            workspace_dir=tmp_path / "workspace",
+            model_client=model,
+            max_turns=1,
+            allow_remote_target=True,
+            traffic_policy_mode="low-noise",
+            traffic_policy_max_physical_requests=24,
+            traffic_policy_max_rps=0.5,
+            traffic_policy_config=config,
+        ),
+    )
+
+    assert executed[0]["probe"] == "sqli_differential"
+    selection = next(
+        event
+        for event in _events(tmp_path / "workspace" / "events.jsonl")
+        if event["kind"] == "harness_selection"
+    )
+    payload = cast(dict[str, object], selection["payload"])
+    selected_action = cast(dict[str, object], payload["selected_action"])
+    assert selected_action["probe"] == "sqli_differential"
+    assert payload["selection_reason"] == "request_profile_route"
 
 
 def _patch_single_surface_task(monkeypatch: pytest.MonkeyPatch) -> None:

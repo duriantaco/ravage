@@ -82,7 +82,11 @@ def _sqli_boolean_payloads(name: str, *, baseline: str | None = None) -> list[tu
     ]
     if numeric:
         return pairs[:6]
-    return pairs[4:]
+    # String-valued filters are most faithfully exercised by keeping their
+    # observed value and closing the original quote. Try those paired controls
+    # before generic numeric-looking strings so bounded runs reach the strongest
+    # differential without wasting their request budget.
+    return [pairs[11], pairs[12], pairs[10], *pairs[13:16], *pairs[4:10], pairs[16]]
 
 def _sqli_timing_payloads_for_target(target: dict[str, object]) -> list[str]:
     return _sqli_timing_payloads(str(target.get("input") or ""), baseline=_target_baseline_value(target))

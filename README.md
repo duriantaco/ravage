@@ -21,7 +21,7 @@ rules of engagement. Security testing can change application state; Ravage
 does not remediate findings or deploy fixes.
 
 [Quickstart](#five-minute-local-quickstart) ·
-[Live demo](#live-xben-demo) ·
+[Live demos](#live-demos) ·
 [Authentication](#authenticated-testing) ·
 [Results](#understand-the-results) ·
 [Capabilities](#capabilities) ·
@@ -112,6 +112,10 @@ model route when target evidence must remain local.
 
 ## Live demos
 
+Curated demos are preset-driven: use the documented command and flags, not a
+hand-written engagement YAML. To assess an application you own, use the
+[authorized remote target workflow](#authorized-remote-targets) instead.
+
 ### Local XBEN
 
 For a short live demo, set <code>XBEN_ROOT</code> to the <code>benchmarks</code>
@@ -127,25 +131,76 @@ GPT-5.4 high profile, scores the result, saves the evidence under
 <code>runs/demo</code>, and removes the target and its local image. The preset
 limits the run to ten model requests, ten turns, ten minutes, and $1.50.
 
-### Authorized TestFire website
+### Authorized PortSwigger website
 
-For a live domain-name demo, Ravage can assess HCL AppScan's deliberately
-vulnerable TestFire banking site. HCL publishes
-<a href="https://help.hcl-software.com/appscan/ASoC/appseccloud_results_samplescans_2.html">demo.testfire.net as a dynamic scanning sample</a>.
-Review that authorization, export <code>OPENAI_API_KEY</code>, and explicitly
-acknowledge the remote target:
+For a live domain-name demo, Ravage can assess PortSwigger's deliberately
+vulnerable [Gin & Juice Shop](https://vulnerable-website.com/). PortSwigger
+publishes this domain as its
+[scanner-test site](https://portswigger.net/burp/documentation/dast/setup/trial-deployment/run-your-first-scan).
+It is the preset's only assessment target; the pinned hosted model separately
+contacts OpenAI.
+
+Setup once: if you do not already have <code>.env.ravage</code>, copy the
+example, restrict its permissions, then add your <code>OPENAI_API_KEY</code>.
+The file is ignored by Git and Ravage reads it directly; do not shell-source
+it. This native-HTTP preset needs no YAML or browser and does not launch
+process scanners.
 
 ~~~bash
-ravage demo testfire --authorized-remote-target
+cp .env.example .env.ravage
+chmod 600 .env.ravage
 ~~~
 
-This command cannot accept another hostname. It permits only the curated login
-routes, GET/HEAD plus the login POST, and a code-owned set of harmless login
-values; stacked, destructive, and time-delay payloads are rejected before
-dispatch. It also disables process, scanner, recovery, and autonomous lanes,
-caps the whole run at 24 physical requests and 0.5 RPS, and stops after one
-non-destructive, evidence-backed finding. The target is a shared public demo and
-may occasionally be unavailable or reset by its operator.
+Check local key presence, output-path usability, and the locked preset without
+contacting PortSwigger or OpenAI (this does not validate the key with OpenAI):
+
+~~~bash
+ravage demo portswigger --preflight
+~~~
+
+The exact target is
+<code>https://vulnerable-website.com/catalog?category=Accessories</code>. Review
+[PortSwigger's published scanner-test instructions](https://portswigger.net/burp/documentation/dast/setup/trial-deployment/run-your-first-scan),
+then run:
+
+~~~bash
+ravage demo portswigger --authorized-remote-target --allow-paid-models
+~~~
+
+That is the complete normal command. No YAML is required: the preset generates
+a locked <code>brief.yaml</code> inside the run directory. The two required
+flags acknowledge the authorized remote target and the paid model route. Use
+<code>--env-file PATH</code> only when your provider secrets are stored
+somewhere else, or <code>--output-dir PATH</code> to choose the artifact
+directory. See all user-facing options with
+<code>ravage demo portswigger --help</code>.
+
+Without <code>--env-file</code>, Ravage checks <code>.env.ravage</code> and then
+<code>.env</code> in the current directory. An explicit
+<code>--env-file</code> overrides that file discovery. A nonblank
+<code>OPENAI_API_KEY</code> already in the process environment wins over the
+selected file; a blank process value is filled from the file. Without
+<code>--output-dir</code>, artifacts go to a fresh
+<code>runs/demo/portswigger_&lt;UTC timestamp&gt;</code> directory. It contains the
+locked <code>brief.yaml</code>, <code>stdout.log</code>,
+<code>report.json</code>, <code>workspace/</code>, and <code>audit.db</code>.
+If no vulnerability is confirmed, the command exits nonzero and keeps those
+artifacts for diagnosis.
+
+The target URL, model, scope, and safety limits are intentionally not
+configurable. The preset pins GPT-5.4 high and permits only GET/HEAD requests
+to <code>/catalog</code>, mutations of the <code>category</code> query field,
+and the catalog form's unchanged blank <code>searchTerm</code> value. Its
+category values are a code-owned set of read-only error and
+boolean-differential probes. Stacked,
+destructive, data-extraction, and time-delay payloads are rejected before
+dispatch. Process, scanner, recovery, and autonomous lanes are disabled. The
+run allows at most four turns and 24 physical requests at 0.5 RPS, and stops
+after one non-destructive, evidence-backed finding. Its brief sets an
+eight-minute operator budget and a $1.50 accounting threshold; these are not
+hard pre-dispatch ceilings, so a slow or newly charged model call can cross a
+threshold before Ravage records it and stops. The target is a shared public
+demo and may occasionally be unavailable or reset by its operator.
 
 ## Authenticated testing
 
@@ -206,6 +261,12 @@ guess resource IDs. See the
 safety limits, the matrix plan format, receipt boundaries, and limitations.
 
 ## Authorized remote targets
+
+This section is for an application you own or have written authorization to
+test. Unlike the curated demos, normal assessments use YAML: the engagement
+brief defines the target scope, rules, objectives, and budget; the private
+<code>.env.ravage</code> file holds secrets; CLI flags provide explicit runtime
+acknowledgements and overrides.
 
 Remote execution is fail-closed and requires an explicit flag. Start with a
 low-impact surface scan:
@@ -279,7 +340,7 @@ model assertion as a confirmed finding.
 | Traffic inspection and replay | <code>ravage traffic</code> | Scoped artifacts |
 | Knowledge skills | <code>ravage skills</code>, <code>ravage code-bug</code> | Advisory |
 | Passive SATCOM inspection | <code>ravage satcom inspect</code> | No transmit |
-| Curated live demos | <code>ravage demo xben</code>, <code>ravage demo testfire</code> | Local XBEN or scope-locked HCL TestFire target |
+| Curated live demos | <code>ravage demo xben</code>, <code>ravage demo portswigger</code> | Local XBEN or scope-locked PortSwigger scanner-test target |
 | XBEN evaluation | <code>ravage xben</code> | Docker-based research harness |
 | Improvement Lab | <code>scripts/improvement_lab.py</code> | Isolated archive |
 
