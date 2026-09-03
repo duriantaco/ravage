@@ -646,8 +646,10 @@ def test_cli_init_writes_env_and_brief(
     payload = cli.yaml.safe_load(brief_path.read_text(encoding="utf-8"))
     output = capsys.readouterr().out
     assert "OPENAI_API_KEY=" in env_text
+    assert "ABLIT_KEY=" in env_text
     assert "RAVAGE_OPENAI_LOW_MODEL=gpt-5.4-mini-2026-03-17" in env_text
     assert "RAVAGE_ANTHROPIC_LOW_MODEL=claude-haiku-4-5-20251001" in env_text
+    assert "RAVAGE_ABLITERATION_LOW_MODEL=abliterated-model" in env_text
     assert payload["scope"]["in_scope"] == ["http://127.0.0.1:8080"]
     assert payload["objectives"] == ["web_application_assessment"]
     assert payload["context"]["description"].startswith("TODO:")
@@ -661,6 +663,16 @@ def test_cli_init_writes_env_and_brief(
     assert f"--env-file {env_path}" in output
     assert "--tool-runtime host" not in output
     assert "--model-profile hosted-openai" not in output
+
+
+def test_preferred_model_profile_selects_abliteration_when_it_is_only_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("ABLIT_KEY", "ak-test")
+
+    assert cli._preferred_model_profile() == "hosted-abliteration"  # noqa: SLF001
 
 
 def test_cli_init_remote_url_prints_authorized_attack_command(

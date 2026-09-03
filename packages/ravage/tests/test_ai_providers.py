@@ -23,6 +23,11 @@ ANTHROPIC_STANDARD_ROUTES = (
     ("mid", "claude-sonnet-4-6", (3.0, 0.3, 15.0)),
     ("low", "claude-haiku-4-5-20251001", (1.0, 0.1, 5.0)),
 )
+ABLITERATION_STANDARD_ROUTES = (
+    ("high", "abliterated-model-large-v2", (5.0, 0.5, 5.0)),
+    ("mid", "abliterated-model-large", (5.0, 0.5, 5.0)),
+    ("low", "abliterated-model", (3.0, 0.3, 3.0)),
+)
 UNSUPPORTED_DIRECT_PROVIDERS: tuple[ProviderKind, ...] = (
     "gemini",
     "openrouter",
@@ -281,6 +286,53 @@ def test_hosted_anthropic_unknown_override_is_not_ready_for_paid_call() -> None:
     assert route.missing_pricing
 
 
+@pytest.mark.parametrize(("tier", "model", "prices"), ABLITERATION_STANDARD_ROUTES)
+def test_hosted_abliteration_profile_has_accountable_pricing(
+    tier: ModelTier,
+    model: str,
+    prices: tuple[float, float, float],
+) -> None:
+    env = {"ABLIT_KEY": "ak-test"}
+    registry = load_model_registry(env=env)
+
+    route = resolve_model_routes(
+        registry,
+        profile_name="hosted-abliteration",
+        tier=tier,
+        env=env,
+    )[0]
+
+    assert route.ready
+    assert route.provider == "abliteration"
+    assert route.model == model
+    assert route.base_url == "https://api.abliteration.ai/v1"
+    assert route.api_key_env == "ABLIT_KEY"
+    assert (
+        route.input_cost_per_1m_tokens,
+        route.cached_input_cost_per_1m_tokens,
+        route.output_cost_per_1m_tokens,
+    ) == prices
+
+
+def test_hosted_abliteration_unknown_override_is_not_ready_for_paid_call() -> None:
+    env = {
+        "ABLIT_KEY": "ak-test",
+        "RAVAGE_ABLITERATION_LOW_MODEL": "future-abliterated-model",
+    }
+    registry = load_model_registry(env=env)
+
+    route = resolve_model_routes(
+        registry,
+        profile_name="hosted-abliteration",
+        tier="low",
+        env=env,
+    )[0]
+
+    assert not route.ready
+    assert route.missing_env == ()
+    assert route.missing_pricing
+
+
 def test_universal_litellm_requires_explicit_pricing_before_it_is_ready() -> None:
     registry = load_model_registry(env={})
 
@@ -429,6 +481,11 @@ profiles:
             "anthropic",
             "https://gateway.example",
             "anthropic_native_base_url_required",
+        ),
+        (
+            "abliteration",
+            "https://gateway.example/v1",
+            "abliteration_native_base_url_required",
         ),
     ],
 )

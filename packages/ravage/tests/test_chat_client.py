@@ -11,6 +11,8 @@ from ravage.model_core.providers import ProviderKind, ResolvedModelRoute
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+ABLITERATION_EXPECTED_COST_USD = 0.00222
+
 
 def test_complete_model_requires_typed_reply_from_dynamic_client() -> None:
     class InvalidClient:
@@ -250,6 +252,50 @@ def test_native_anthropic_client_rejects_unpriced_cache_creation() -> None:
     assert reply.cost_usd == 0.0
 
 
+def test_abliteration_chat_client_uses_published_prices() -> None:
+    route = replace(
+        _route(
+            input_cost_per_1m_tokens=3.0,
+            cached_input_cost_per_1m_tokens=0.3,
+            output_cost_per_1m_tokens=3.0,
+        ),
+        provider="abliteration",
+        model="abliterated-model",
+        base_url="https://api.abliteration.ai/v1",
+        api_key_env="ABLIT_KEY",
+    )
+    client = _CapturingChatClient(route)
+    client.response_model = "abliterated-model"
+
+    reply = client.chat([{"role": "user", "content": "return json"}])
+
+    assert client.request_body["max_tokens"] == route.max_output_tokens
+    assert "service_tier" not in client.request_body
+    assert reply.cost_known is True
+    assert reply.cost_usd == pytest.approx(ABLITERATION_EXPECTED_COST_USD)
+
+
+def test_abliteration_chat_client_rejects_different_price_band() -> None:
+    route = replace(
+        _route(
+            input_cost_per_1m_tokens=3.0,
+            cached_input_cost_per_1m_tokens=0.3,
+            output_cost_per_1m_tokens=3.0,
+        ),
+        provider="abliteration",
+        model="abliterated-model",
+        base_url="https://api.abliteration.ai/v1",
+        api_key_env="ABLIT_KEY",
+    )
+    client = _CapturingChatClient(route)
+    client.response_model = "abliterated-model-large"
+
+    reply = client.chat([{"role": "user", "content": "return json"}])
+
+    assert reply.cost_known is False
+    assert reply.cost_usd == 0.0
+
+
 @pytest.mark.parametrize(
     ("provider", "base_url"),
     [
@@ -257,6 +303,7 @@ def test_native_anthropic_client_rejects_unpriced_cache_creation() -> None:
         ("custom_openai", None),
         ("openai", "https://gateway.example/v1"),
         ("anthropic", "https://gateway.example"),
+        ("abliteration", "https://gateway.example/v1"),
     ],
 )
 def test_chat_client_rejects_unsupported_transport_before_dispatch(

@@ -8,6 +8,8 @@ before an entry is described as released.
 
 ### Changed
 
+- Added an opt-in, cost-accounted `hosted-abliteration` model profile using
+  abliteration.ai's OpenAI-compatible API.
 - Replaced the CLI's remote HTTP-only lane with the full `ai-web` base for
   explicitly authorized remote targets, forcing command-like tools through a
   DNS-pinned, target-scoped Docker network and extending URL scope to probes and

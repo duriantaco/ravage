@@ -80,6 +80,7 @@ from ravage.dry_run import RouteParam, RouteProbe
 from ravage.model_core.providers import (
     ModelTier,
     ResolvedModelRoute,
+    abliteration_standard_token_prices,
     anthropic_standard_token_prices,
     load_model_registry,
     model_route_transport_error,
@@ -4885,6 +4886,16 @@ def _response_cost_is_known(
         elif response_prices != requested_prices:
             return False
         if _usage_token_count(usage, "cache_creation_input_tokens") != 0:
+            return False
+    if route.provider == "abliteration":
+        if not response_model:
+            return False
+        requested_prices = abliteration_standard_token_prices(route.model)
+        response_prices = abliteration_standard_token_prices(response_model)
+        if requested_prices is None:
+            if response_model != route.model:
+                return False
+        elif response_prices != requested_prices:
             return False
     cached_input_tokens = _cached_input_tokens(route, usage)
     return cached_input_tokens == 0 or route.cached_input_cost_per_1m_tokens is not None
