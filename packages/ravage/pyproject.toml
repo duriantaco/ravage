@@ -1,11 +1,11 @@
 [project]
 name = "ravage"
-version = "0.5.0"
+version = "0.5.0" # x-release-please-version
 description = "Autonomous web security research agent for controlled authorized targets"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "ravage-schemas==0.5.0",
+    "ravage-schemas==0.5.0", # x-release-please-version
     "pyyaml>=6.0",
     "cryptography>=42.0",
     "rich>=14.1",

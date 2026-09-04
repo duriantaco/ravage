@@ -6,20 +6,69 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
 jobs:
   release-please:
     name: Release Please
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    env:
-      RELEASE_PLEASE_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
     permissions:
-      contents: write
-      issues: write
-      pull-requests: write
+      contents: write # Create releases and update the generated release branch.
+      issues: write # Maintain Release Please issue labels and references.
+      pull-requests: write # Create and update the version pull request.
     steps:
-      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7
+      - name: Require the release automation token
+        env:
+          TOKEN_CONFIGURED: ${{ secrets.RELEASE_PLEASE_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          if [ "${TOKEN_CONFIGURED}" != "true" ]; then
+            echo "RELEASE_PLEASE_TOKEN is required; GITHUB_TOKEN cannot trigger downstream release workflows." >&2
+            exit 1
+          fi
+
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN != '' && secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           config-file: tools/release/release-please-config.json
           manifest-file: tools/release/.release-please-manifest.json
+
+      - name: Check out the generated release PR
+        if: steps.release.outputs.prs_created == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: true # Required for the reviewed lockfile-only push below.
+
+      - name: Set up Python
+        if: steps.release.outputs.prs_created == 'true'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Synchronize and validate the release lockfile
+        if: steps.release.outputs.prs_created == 'true'
+        env:
+          RELEASE_PR_BRANCH: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+        run: |
+          set -euo pipefail
+          python -m pip install uv==0.12.5
+          uv lock
+          python scripts/check_release.py
+
+          if git diff --quiet -- uv.lock; then
+            echo "uv.lock is already synchronized."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add uv.lock
+          git commit -m "chore: synchronize release lockfile"
+          git push origin "HEAD:${RELEASE_PR_BRANCH}"

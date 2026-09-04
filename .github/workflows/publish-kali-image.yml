@@ -56,10 +56,60 @@ jobs:
           cache-from: type=gha,scope=ravage-kali-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=ravage-kali-${{ matrix.arch }},ignore-error=true
 
+  preflight:
+    name: Verify the immutable publication source
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'release' && github.event.release.prerelease == false) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require current main or its exact peeled release tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin \
+            "refs/heads/main:refs/remotes/origin/main"
+          event_commit="$(git rev-parse --verify "${GITHUB_SHA}^{commit}")"
+          main_commit="$(git rev-parse --verify "refs/remotes/origin/main^{commit}")"
+
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+              echo "Manual image publication must run from main." >&2
+              exit 1
+            fi
+            publication_commit="${event_commit}"
+          else
+            git fetch --force --no-tags origin \
+              "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            publication_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+            if [ "${event_commit}" != "${publication_commit}" ]; then
+              echo "Release event commit is not the peeled release-tag commit." >&2
+              exit 1
+            fi
+          fi
+
+          if [ "${publication_commit}" != "${main_commit}" ]; then
+            echo "Image publication commit is not current main." >&2
+            exit 1
+          fi
+
+      - name: Check release metadata
+        run: python scripts/check_release.py
+
   publish-platform:
     name: Publish ${{ matrix.platform }} digest
-    if: github.event_name != 'pull_request'
+    if: >-
+      ${{ github.event_name != 'pull_request' &&
+          (github.event_name != 'release' || github.event.release.prerelease == false) }}
     runs-on: ${{ matrix.runner }}
+    needs: preflight
     permissions:
       contents: read
       packages: write # Push the architecture-specific image digest to GHCR.
@@ -130,7 +180,9 @@ jobs:
 
   publish-manifest:
     name: Publish, sign, and attest multi-architecture image
-    if: github.event_name != 'pull_request'
+    if: >-
+      ${{ github.event_name != 'pull_request' &&
+          (github.event_name != 'release' || github.event.release.prerelease == false) }}
     needs:
       - publish-platform
     runs-on: ubuntu-24.04
@@ -166,7 +218,7 @@ jobs:
           tags: |
             type=sha,prefix=sha-,format=long
             type=raw,value=latest,enable=${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'release' && !github.event.release.prerelease) }}
-            type=semver,pattern={{version}},value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' }}
+            type=semver,pattern={{version}},value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' && !github.event.release.prerelease }}
             type=semver,pattern={{major}}.{{minor}},value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' && !github.event.release.prerelease }}
 
       - name: Create multi-architecture manifest

@@ -12,7 +12,7 @@ abstract: >-
 repository-code: https://github.com/duriantaco/ravage
 url: https://duriantaco.github.io/ravage/
 license: Apache-2.0
-version: 0.5.0
+version: 0.5.0 # x-release-please-version
 keywords:
   - web security
   - security evaluation

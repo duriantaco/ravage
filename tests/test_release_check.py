@@ -45,12 +45,33 @@ def test_published_release_accepts_exact_package_tag(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    version = _expected_tag().removeprefix("v")
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text(f"# Changelog\n\n## {version} - 2026-08-30\n", encoding="utf-8")
+    monkeypatch.setattr(check_release, "CHANGELOG_FILE", changelog)
     event_path = tmp_path / "event.json"
     _write_release_event(event_path, _expected_tag())
     monkeypatch.setenv("GITHUB_EVENT_NAME", "release")
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
 
     assert check_release.main() == 0
+
+
+def test_published_release_rejects_unreleased_changelog(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text("# Changelog\n\n## Unreleased\n\n- Pending.\n", encoding="utf-8")
+    monkeypatch.setattr(check_release, "CHANGELOG_FILE", changelog)
+    event_path = tmp_path / "event.json"
+    _write_release_event(event_path, _expected_tag())
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "release")
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
+
+    assert check_release.main() == 1
+    assert "missing a dated" in capsys.readouterr().err
 
 
 def test_published_release_rejects_non_v_tag(
@@ -125,3 +146,41 @@ def test_tag_push_rejects_non_release_tag(
     assert f"release tag {tag!r} does not match package version {_expected_tag()}" in (
         capsys.readouterr().err
     )
+
+
+def test_workspace_version_check_rejects_stale_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root_pyproject = tmp_path / "pyproject.toml"
+    root_pyproject.write_text(
+        '[project]\nname = "pentest-agent"\nversion = "0.6.0"\n',
+        encoding="utf-8",
+    )
+    citation = tmp_path / "CITATION.cff"
+    citation.write_text("version: 0.6.0\n", encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text('{".": "0.5.0"}\n', encoding="utf-8")
+    lock = tmp_path / "uv.lock"
+    lock.write_text(
+        """
+[[package]]
+name = "pentest-agent"
+version = "0.6.0"
+[[package]]
+name = "ravage"
+version = "0.6.0"
+[[package]]
+name = "ravage-schemas"
+version = "0.6.0"
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(check_release, "ROOT_PYPROJECT", root_pyproject)
+    monkeypatch.setattr(check_release, "CITATION_FILE", citation)
+    monkeypatch.setattr(check_release, "RELEASE_MANIFEST", manifest)
+    monkeypatch.setattr(check_release, "LOCK_FILE", lock)
+
+    assert check_release._workspace_version_errors("0.6.0") == [  # noqa: SLF001
+        "release-please manifest version '0.5.0' does not match package version '0.6.0'"
+    ]

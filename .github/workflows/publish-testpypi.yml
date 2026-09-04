@@ -1,0 +1,201 @@
+name: Rehearse TestPyPI Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact unused package version to rehearse
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-testpypi-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build TestPyPI rehearsal artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Install the pinned build toolchain
+        run: python -m pip install build==1.6.0 hatchling==1.32.0 twine==7.0.0
+
+      - name: Validate the requested release version
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          python scripts/check_release.py
+          actual_version="$(
+            python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          pyproject = Path("packages/ravage/pyproject.toml")
+          print(tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"])
+          PY
+          )"
+          if [ "${actual_version}" != "${EXPECTED_VERSION}" ]; then
+            echo "Requested ${EXPECTED_VERSION}, but the checkout contains ${actual_version}." >&2
+            exit 1
+          fi
+          python scripts/check_pypi_version.py --index-base https://test.pypi.org/pypi
+
+      - name: Build and validate both distributions
+        run: |
+          set -euo pipefail
+          python -m build --no-isolation packages/schemas --outdir dist/schemas
+          python -m build --no-isolation packages/ravage --outdir dist/ravage
+          python -m twine check dist/schemas/* dist/ravage/*
+          python -m pip hash dist/schemas/* dist/ravage/*
+
+      - name: Upload ravage-schemas rehearsal artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: testpypi-ravage-schemas-dist
+          path: dist/schemas/*
+          if-no-files-found: error
+
+      - name: Upload ravage rehearsal artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: testpypi-ravage-dist
+          path: dist/ravage/*
+          if-no-files-found: error
+
+  publish-schemas:
+    name: Publish ravage-schemas to TestPyPI
+    runs-on: ubuntu-latest
+    needs: build
+    environment: testpypi
+    permissions:
+      id-token: write # Mint the short-lived TestPyPI publishing credential.
+    steps:
+      - name: Download ravage-schemas rehearsal artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: testpypi-ravage-schemas-dist
+          path: dist/schemas
+
+      - name: Publish ravage-schemas to TestPyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist/schemas
+
+  publish-ravage:
+    name: Publish ravage to TestPyPI
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - publish-schemas
+    environment: testpypi
+    permissions:
+      id-token: write # Mint the short-lived TestPyPI publishing credential.
+    steps:
+      - name: Download ravage rehearsal artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: testpypi-ravage-dist
+          path: dist/ravage
+
+      - name: Publish ravage to TestPyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist/ravage
+
+  verify:
+    name: Verify the published TestPyPI wheels
+    runs-on: ubuntu-latest
+    needs: publish-ravage
+    timeout-minutes: 15
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Download and install only the published wheels
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          download_dir="$(mktemp -d)"
+          smoke_root="$(mktemp -d)"
+          echo "DOWNLOAD_DIR=${download_dir}" >>"${GITHUB_ENV}"
+          echo "SMOKE_ROOT=${smoke_root}" >>"${GITHUB_ENV}"
+
+          downloaded=false
+          for attempt in $(seq 1 12); do
+            rm -f "${download_dir}"/*.whl
+            if python -m pip download \
+              --index-url https://test.pypi.org/simple/ \
+              --only-binary=:all: \
+              --no-deps \
+              --dest "${download_dir}" \
+              "ravage-schemas==${EXPECTED_VERSION}" \
+              "ravage==${EXPECTED_VERSION}"; then
+              downloaded=true
+              break
+            fi
+            if [ "${attempt}" -lt 12 ]; then
+              sleep 10
+            fi
+          done
+          if [ "${downloaded}" != true ]; then
+            echo "The TestPyPI wheels did not become available in time." >&2
+            exit 1
+          fi
+
+          python -m venv "${smoke_root}/venv"
+          "${smoke_root}/venv/bin/python" -m pip install \
+            --index-url https://pypi.org/simple/ \
+            "cryptography>=42.0" \
+            "pydantic>=2.8" \
+            "PyYAML>=6.0" \
+            "rich>=14.1"
+          "${smoke_root}/venv/bin/python" -m pip install \
+            --no-index --no-deps "${download_dir}"/*.whl
+          "${smoke_root}/venv/bin/python" -m pip check
+
+      - name: Run a bounded model-free installed-wheel smoke test
+        env:
+          RAVAGE_COLOR: never
+        run: |
+          set -euo pipefail
+          ravage_bin="${SMOKE_ROOT}/venv/bin/ravage"
+          cleanup() {
+            "${ravage_bin}" lab down ravage-acme-box >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          cd "${SMOKE_ROOT}"
+          "${ravage_bin}" --help >/dev/null
+          "${ravage_bin}" doctor --json >doctor.json
+          "${ravage_bin}" lab list
+          "${ravage_bin}" lab up ravage-acme-box
+          "${ravage_bin}" init http://127.0.0.1:8088 \
+            --brief brief.yaml \
+            --env-file .env.ravage \
+            --description "Bundled local release smoke target"
+          "${ravage_bin}" scan brief.yaml \
+            --run-dir scan \
+            --probe surface_map \
+            --timeout-seconds 10 \
+            --report
+          "${ravage_bin}" audit verify scan
+          "${ravage_bin}" observe scan --json >observer.json

@@ -9,24 +9,62 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: publish-pypi-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
+
 jobs:
   test:
     name: Test release build
-    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'release' && github.event.release.prerelease == false) }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require the peeled release tag to equal current main
+        if: github.event_name == 'release' && github.event.release.prerelease == false
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin \
+            "refs/heads/main:refs/remotes/origin/main" \
+            "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          event_commit="$(git rev-parse --verify "${GITHUB_SHA}^{commit}")"
+          release_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          main_commit="$(git rev-parse --verify "refs/remotes/origin/main^{commit}")"
+          if [ "${event_commit}" != "${release_commit}" ]; then
+            echo "Release event commit ${event_commit} is not peeled tag commit ${release_commit}." >&2
+            exit 1
+          fi
+          if [ "${release_commit}" != "${main_commit}" ]; then
+            echo "Release tag commit ${release_commit} is not current main ${main_commit}." >&2
+            exit 1
+          fi
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
 
+      - name: Check release metadata
+        run: python scripts/check_release.py
+
+      - name: Refuse occupied PyPI versions
+        if: github.event_name == 'release' && github.event.release.prerelease == false
+        run: python scripts/check_pypi_version.py
+
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "22"
+          package-manager-cache: false
 
       - name: Install test dependencies
         run: |
@@ -39,9 +77,6 @@ jobs:
             pyyaml==6.0.3 \
             ruff==0.15.14
           python -m pip install -e packages/schemas -e packages/ravage
-
-      - name: Check release metadata
-        run: python scripts/check_release.py
 
       - name: Check maintained documentation
         run: python scripts/check_docs.py
@@ -117,20 +152,24 @@ jobs:
     needs: test
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
 
       - name: Build distribution
         run: |
-          python -m pip install --upgrade pip build
-          python -m build packages/schemas --outdir dist/schemas
+          python -m pip install build==1.6.0 hatchling==1.32.0 twine==7.0.0
+          python -m build --no-isolation packages/schemas --outdir dist/schemas
+          python -m twine check dist/schemas/*
+          python -m pip hash dist/schemas/*
 
       - name: Upload ravage-schemas artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ravage-schemas-dist
           path: dist/schemas/*
@@ -142,17 +181,20 @@ jobs:
     needs: test
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
 
       - name: Build distribution
         run: |
-          python -m pip install --upgrade pip build
-          python -m build packages/ravage --outdir dist/ravage
+          python -m pip install build==1.6.0 hatchling==1.32.0 twine==7.0.0
+          python -m build --no-isolation packages/ravage --outdir dist/ravage
+          python -m twine check dist/ravage/*
 
       - name: Verify wheel contract surface
         run: |
@@ -176,10 +218,10 @@ jobs:
               importlib.import_module(f"ravage.control_plane.{module}")
           assert (Path(ravage.__file__).parent / "py.typed").is_file()
           PY
-          sha256sum dist/ravage/*
+          python -m pip hash dist/ravage/*
 
       - name: Upload ravage artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ravage-dist
           path: dist/ravage/*
@@ -191,19 +233,19 @@ jobs:
     needs:
       - build-schemas
       - build-ravage
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' && github.event.release.prerelease == false
     environment: pypi
     permissions:
-      id-token: write
+      id-token: write # Mint the short-lived production PyPI credential.
     steps:
       - name: Download ravage-schemas artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: ravage-schemas-dist
           path: dist/schemas
 
       - name: Publish ravage-schemas
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: dist/schemas
 
@@ -213,18 +255,18 @@ jobs:
     needs:
       - build-ravage
       - publish-schemas
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' && github.event.release.prerelease == false
     environment: pypi
     permissions:
-      id-token: write
+      id-token: write # Mint the short-lived production PyPI credential.
     steps:
       - name: Download ravage artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: ravage-dist
           path: dist/ravage
 
       - name: Publish ravage
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: dist/ravage
