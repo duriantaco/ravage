@@ -6,6 +6,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+
+_NON_PERSISTED_FINGERPRINT_PREFIXES = (
+    "http_request:",
+    "validate_poc:",
+)
 
 
 @dataclass(frozen=True)
@@ -47,7 +53,14 @@ class ActionLedger:
         return max(self.fingerprints.get(item, 0) for item in fingerprints)
 
     def to_json(self) -> dict[str, int]:
-        return dict(sorted(self.fingerprints.items()))
+        # Exact HTTP fingerprints include caller-supplied bodies, credentials,
+        # and query values. Even a one-way digest becomes an offline verifier
+        # for low-entropy secrets, so keep those repeat checks in memory only.
+        return {
+            fingerprint: count
+            for fingerprint, count in sorted(self.fingerprints.items())
+            if not fingerprint.startswith(_NON_PERSISTED_FINGERPRINT_PREFIXES)
+        }
 
 
 STRATEGY_BOOK: tuple[StrategyCard, ...] = (
@@ -199,14 +212,35 @@ def action_fingerprint(action: Mapping[str, object], *, context: str = "") -> st
         # Only canonical dispatch material can cause physical requests. Mutable
         # expectations and report prose cannot disguise a third replay.
         body = json.dumps(
-            _validate_poc_dispatch_steps(action.get("steps")),
+            _validate_poc_dispatch_steps(action.get("steps"), context=context),
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    elif kind == "http_request":
+        body = json.dumps(
+            {
+                "method": _fingerprint_method(action.get("method")),
+                "url": _fingerprint_url(
+                    action.get("url") or action.get("path"),
+                    context=context,
+                ),
+                "headers": _fingerprint_request_headers(action),
+                "form": _fingerprint_string_dict(action.get("form")),
+                "json": action.get("json"),
+                "body": action.get("body"),
+            },
             sort_keys=True,
             separators=(",", ":"),
             default=str,
         )
     else:
         body = str(action)
-    normalized = body if kind == "validate_poc" else re.sub(r"\s+", " ", body.strip())
+    normalized = (
+        body
+        if kind in {"http_request", "validate_poc"}
+        else re.sub(r"\s+", " ", body.strip())
+    )
     normalized = re.sub(r"ravage-[a-z0-9_:-]+", "ravage-*", normalized, flags=re.I)
     material_digest = sha256(normalized.encode("utf-8")).hexdigest()
 
@@ -217,7 +251,11 @@ def action_fingerprint(action: Mapping[str, object], *, context: str = "") -> st
     return f"{kind}:sha256:{material_digest}{suffix}"
 
 
-def _validate_poc_dispatch_steps(value: object) -> list[dict[str, object]]:
+def _validate_poc_dispatch_steps(
+    value: object,
+    *,
+    context: str = "",
+) -> list[dict[str, object]]:
     if not isinstance(value, list):
         return []
     dispatch_steps: list[dict[str, object]] = []
@@ -226,27 +264,73 @@ def _validate_poc_dispatch_steps(value: object) -> list[dict[str, object]]:
             continue
         headers = _fingerprint_header_dict(raw_step.get("headers"))
         form = _fingerprint_string_dict(raw_step.get("form"))
-        if form:
-            method = "POST"
+        method = _fingerprint_method(raw_step.get("method"))
+        if isinstance(raw_step.get("form"), dict):
             body: str | None = None
             headers = {
                 "content-type": "application/x-www-form-urlencoded",
                 **headers,
             }
         else:
-            method = str(raw_step.get("method") or "GET").upper()
             raw_body = raw_step.get("body")
             body = None if raw_body is None else str(raw_body)
         dispatch_steps.append(
             {
                 "method": method,
-                "url": str(raw_step.get("url") or ""),
+                "url": _fingerprint_url(
+                    raw_step.get("url") or raw_step.get("path"),
+                    context=context,
+                ),
                 "headers": headers,
                 "form": form,
                 "body": body,
             }
         )
     return dispatch_steps
+
+
+def _fingerprint_method(value: object) -> str:
+    return str(value or "GET").strip().upper()
+
+
+def _fingerprint_url(value: object, *, context: str = "") -> str:
+    """Return only URL material that an HTTP client can put on the wire."""
+    raw = str(value or "").strip()
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return raw
+    path = parsed.path or ("/" if parsed.netloc else "")
+    target_origin = _fingerprint_context_origin(context)
+    if parsed.netloc and target_origin and _fingerprint_origin(raw) == target_origin:
+        return urlunsplit(("", "", path, parsed.query, ""))
+    return urlunsplit((parsed.scheme.casefold(), parsed.netloc, path, parsed.query, ""))
+
+
+def _fingerprint_context_origin(context: str) -> str:
+    for part in context.split("|"):
+        if part.startswith("origin:"):
+            return _fingerprint_origin(part.removeprefix("origin:"))
+    return ""
+
+
+def _fingerprint_origin(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return ""
+    scheme = parsed.scheme.casefold()
+    hostname = str(parsed.hostname or "").casefold().rstrip(".")
+    if scheme not in {"http", "https"} or not hostname:
+        return ""
+    if parsed.username is not None or parsed.password is not None:
+        return ""
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    default_port = 80 if scheme == "http" else 443
+    authority = hostname if port in {None, default_port} else f"{hostname}:{port}"
+    return f"{scheme}://{authority}"
 
 
 def _fingerprint_string_dict(value: object) -> dict[str, str]:
@@ -258,7 +342,25 @@ def _fingerprint_string_dict(value: object) -> dict[str, str]:
 def _fingerprint_header_dict(value: object) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
-    return {str(key).casefold(): str(item) for key, item in value.items()}
+    headers = {str(key).strip().casefold(): str(item) for key, item in value.items()}
+    content_type = headers.get("content-type")
+    if content_type is not None:
+        media_type, separator, parameters = content_type.partition(";")
+        headers["content-type"] = media_type.strip().casefold() + (
+            f";{parameters.strip()}" if separator else ""
+        )
+    return headers
+
+
+def _fingerprint_request_headers(action: Mapping[str, object]) -> dict[str, str]:
+    headers = _fingerprint_header_dict(action.get("headers"))
+    if "content-type" in headers:
+        return headers
+    if isinstance(action.get("form"), dict):
+        headers["content-type"] = "application/x-www-form-urlencoded"
+    elif action.get("json") is not None:
+        headers["content-type"] = "application/json"
+    return headers
 
 
 def _legacy_action_fingerprint(action: Mapping[str, object], *, context: str = "") -> str:

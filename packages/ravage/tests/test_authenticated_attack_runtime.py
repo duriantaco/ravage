@@ -1415,7 +1415,7 @@ def test_authenticated_run_error_report_never_persists_secret_details(
     assert b"correct-horse" not in audit_bytes
 
 
-def test_authenticated_poc_filters_tainted_proof_candidate_independently(
+def test_authenticated_poc_does_not_trust_validator_summary_proof_candidates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1458,9 +1458,9 @@ def test_authenticated_poc_filters_tainted_proof_candidate_independently(
         audit.close()
         owner.close()
 
-    assert result.flag == real_proof
-    assert state.flags == [real_proof]
-    assert state.last_observation["recognized_proofs"] == [real_proof]
+    assert result.flag == ""
+    assert state.flags == []
+    assert state.last_observation["recognized_proofs"] == []
     persisted = workspace.events_path.read_text(encoding="utf-8")
     assert "FLAG{alice}" not in persisted
     assert real_proof in persisted
@@ -1804,7 +1804,7 @@ def test_authenticated_prompt_exposes_only_managed_http_lanes(
     assert user["managed_http_identity"] == {
         "control_actions": ["final"],
         "identity_alias": "service",
-        "managed_http_actions": ["run_probe", "validate_poc"],
+        "managed_http_actions": ["http_request", "run_probe", "validate_poc"],
         "mode": "identity:service",
         "request_lane": "managed_http",
     }

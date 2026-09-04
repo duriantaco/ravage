@@ -13,8 +13,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
-from urllib.parse import urlparse
-from uuid import uuid4
+from urllib.parse import parse_qsl, urlparse
+from uuid import UUID, uuid4
 
 from ravage.agent_core.action_executor import (
     MAX_IDENTICAL_ACTION_EXECUTIONS,
@@ -40,6 +40,15 @@ from ravage.agent_core.agent_tasks import (
     update_mission_from_action,
 )
 from ravage.agent_core.attack_surface import merge_surface_state, surface_from_recon
+from ravage.agent_core.evidence_lead_lock import (
+    action_matches_lead,
+    awaiting_session_lead,
+    lead_replay_generation,
+    pending_lead,
+    record_aligned_outcome,
+    unresolved_lead,
+)
+from ravage.agent_core.evidence_lead_lock import directive as evidence_lead_directive
 from ravage.agent_core.frontier_closure_obligation import pending_closure_obligation
 from ravage.agent_core.harness_trace import (
     attempt_record_payload,
@@ -65,6 +74,7 @@ from ravage.agent_core.recovery_action_contract import select_recovery_branch_ac
 from ravage.agent_core.recovery_policy import RecoveryDecision, RecoveryRole, RecoveryStatus
 from ravage.agent_core.recovery_runtime import RecoveryCampaign, RecoveryTurnResult
 from ravage.agent_core.semantic_routes import semantic_action_fingerprint
+from ravage.agent_core.stateful_http import StatefulHttpActionSession
 from ravage.agent_core.surface_graph import SurfaceGraphState
 from ravage.agent_core.surface_graph_ingest import ingest_recon_surface, project_surface_graph
 from ravage.agent_knowledge import (
@@ -114,6 +124,7 @@ from ravage.traffic.policy import (
     TrafficPolicyError,
     TrafficPolicyMode,
 )
+from ravage.traffic.redaction import safe_field_names, semantic_url_shape
 from ravage.web_core.recon import run_recon
 from ravage.web_core.scope_policy import assert_authorized_target, is_local_url
 
@@ -129,6 +140,7 @@ MAX_OBSERVATION_CHARS = 10_000
 MAX_TRANSCRIPT_CHARS = 80_000
 MODEL_TIMEOUT_PADDING_SECONDS = 10
 DOCKER_SCOPE_GATEWAY_HOST = "ravage-target"
+_DEFAULT_STRUCTURED_HTTP_REQUEST_CEILING = 10_000
 _CONTEXT_PROOF_RE = re.compile(r"\b(?:flag|FLAG|HTB|CTF)\{[^}\s]{3,512}\}")
 _AUTHENTICATED_ACTION_PROTOCOL_KEYS = (
     "action",
@@ -145,6 +157,7 @@ _AUTHENTICATED_ACTION_PROTOCOL_KEYS = (
     "expected_signal",
     "exploit_steps",
     "fallback",
+    "field",
     "finding",
     "flag",
     "form",
@@ -398,87 +411,122 @@ def run_ai_web_agent(
             state_label="agent",
         )
     audit = AuditStore(settings.db_path or workspace.root / "audit.db", scope=brief.scope)
-    runtime = _make_tool_runtime(settings, brief, target_url=target_url)
-    state.surface["flag_objective"] = flag_objective
-    state.surface["stop_after_first_finding"] = stop_after_first_finding
-    recovery_state_path = workspace.root / "recovery-state.json"
-    recovery = _initial_recovery_campaign(
-        settings=settings,
-        state=state,
-        target_url=target_url,
-        state_path=recovery_state_path,
-    )
-    route = _select_model_route(settings)
-    client = settings.model_client or ChatClient(route)
+    runtime: ToolRuntime | None = None
+    http_session: StatefulHttpActionSession | None = None
+    recovery = None
+    route: ResolvedModelRoute | None = None
+    client: Any | None = None
     run_error: BaseException | None = None
     spent_cost_usd = 0.0
     cost_accounting_complete = True
     termination_reason: str | None = None
-    knowledge_pack_metadata = _knowledge_pack_metadata_payload(settings)
-    knowledge_pack_sha256 = (
-        str(knowledge_pack_metadata["sha256"]) if knowledge_pack_metadata is not None else None
-    )
-
-    started_payload: dict[str, object] = {
-        "target_url": target_url,
-        "model": route.model,
-        "provider": route.provider,
-        "agent_mode": settings.agent_mode,
-        "reference_architecture": "planner-executor with working memory",
-        "knowledge_pack": knowledge_pack_metadata,
-        "flag_objective": flag_objective,
-        "stop_after_first_finding": stop_after_first_finding,
-        "traffic_policy": traffic_policy.config.to_json(),
-        "traffic_policy_snapshot": traffic_policy.snapshot().to_json(),
-    }
-    session_mode = _authentication_session_mode(settings.authentication)
-    if session_mode:
-        started_payload["session_mode"] = session_mode
-    if recovery is not None:
-        started_payload["recovery_profile"] = settings.recovery_profile
-        started_payload["global_model_request_budget"] = (
-            recovery.scheduler.config.max_model_requests
-        )
-    _record(
-        audit,
-        brief.engagement_id,
-        actor="agent",
-        action="agent_started",
-        payload=started_payload,
-    )
-    workspace_started_payload: dict[str, object] = {
-        "target_url": target_url,
-        "provider": route.provider,
-        "model": route.model,
-        "agent_mode": settings.agent_mode,
-        "max_turns": settings.max_turns,
-        "tool_runtime": settings.tool_runtime_mode,
-        "autonomous_route": settings.autonomous_route,
-        "flag_objective": flag_objective,
-        "stop_after_first_finding": stop_after_first_finding,
-    }
-    if session_mode:
-        workspace_started_payload["session_mode"] = session_mode
-    if recovery is not None:
-        workspace_started_payload["recovery_profile"] = settings.recovery_profile
-    workspace.record_event(kind="agent_started", payload=workspace_started_payload)
-    traffic_started_payload = {
-        "state_path": str(traffic_policy.state_path),
-        "config": traffic_policy.config.to_json(),
-        "snapshot": traffic_policy.snapshot().to_json(),
-    }
-    _record(
-        audit,
-        brief.engagement_id,
-        actor="agent",
-        action="traffic_policy_started",
-        payload=traffic_started_payload,
-    )
-    workspace.record_event(kind="traffic_policy_started", payload=traffic_started_payload)
-    if knowledge_pack_metadata:
-        workspace.record_event(kind="knowledge_pack_loaded", payload=knowledge_pack_metadata)
-
+    recovery_state_path = workspace.root / "recovery-state.json"
     try:
+        runtime = _make_tool_runtime(settings, brief, target_url=target_url)
+        state.surface["flag_objective"] = flag_objective
+        state.surface["stop_after_first_finding"] = stop_after_first_finding
+        recovery = _initial_recovery_campaign(
+            settings=settings,
+            state=state,
+            target_url=target_url,
+            state_path=recovery_state_path,
+        )
+        http_session = StatefulHttpActionSession(
+            target_url=target_url,
+            scope=brief.scope,
+            allow_remote_target=settings.allow_remote_target,
+            roe_max_rps=brief.roe.max_rps,
+            max_total_requests=(
+                traffic_policy.config.max_physical_requests
+                or _DEFAULT_STRUCTURED_HTTP_REQUEST_CEILING
+            ),
+            workspace_dir=workspace.root,
+            state=state,
+            proof_recognition_enabled=(settings.proof_recognition_enabled and flag_objective),
+            authentication=settings.authentication,
+            traffic_policy=traffic_policy,
+            low_noise=settings.traffic_policy_mode == "low-noise",
+            resume_expected=resumed_state,
+        )
+        persisted_http_surface = {
+            key: state.surface[key]
+            for key in (
+                "evidence_lead_lock",
+                "evidence_lead_replay_generation",
+                "http_session_dirty",
+                "http_state_epoch",
+            )
+            if key in state.surface
+        }
+        route = _select_model_route(settings)
+        client = settings.model_client or ChatClient(route)
+        knowledge_pack_metadata = _knowledge_pack_metadata_payload(settings)
+        knowledge_pack_sha256 = (
+            str(knowledge_pack_metadata["sha256"])
+            if knowledge_pack_metadata is not None
+            else None
+        )
+
+        started_payload: dict[str, object] = {
+            "target_url": target_url,
+            "model": route.model,
+            "provider": route.provider,
+            "agent_mode": settings.agent_mode,
+            "reference_architecture": "planner-executor with working memory",
+            "knowledge_pack": knowledge_pack_metadata,
+            "flag_objective": flag_objective,
+            "stop_after_first_finding": stop_after_first_finding,
+            "traffic_policy": traffic_policy.config.to_json(),
+            "traffic_policy_snapshot": traffic_policy.snapshot().to_json(),
+            "structured_http_replay": True,
+        }
+        session_mode = _authentication_session_mode(settings.authentication)
+        if session_mode:
+            started_payload["session_mode"] = session_mode
+        if recovery is not None:
+            started_payload["recovery_profile"] = settings.recovery_profile
+            started_payload["global_model_request_budget"] = (
+                recovery.scheduler.config.max_model_requests
+            )
+        _record(
+            audit,
+            brief.engagement_id,
+            actor="agent",
+            action="agent_started",
+            payload=started_payload,
+        )
+        workspace_started_payload: dict[str, object] = {
+            "target_url": target_url,
+            "provider": route.provider,
+            "model": route.model,
+            "agent_mode": settings.agent_mode,
+            "max_turns": settings.max_turns,
+            "tool_runtime": settings.tool_runtime_mode,
+            "autonomous_route": settings.autonomous_route,
+            "flag_objective": flag_objective,
+            "stop_after_first_finding": stop_after_first_finding,
+        }
+        if session_mode:
+            workspace_started_payload["session_mode"] = session_mode
+        if recovery is not None:
+            workspace_started_payload["recovery_profile"] = settings.recovery_profile
+        workspace.record_event(kind="agent_started", payload=workspace_started_payload)
+        traffic_started_payload = {
+            "state_path": str(traffic_policy.state_path),
+            "config": traffic_policy.config.to_json(),
+            "snapshot": traffic_policy.snapshot().to_json(),
+        }
+        _record(
+            audit,
+            brief.engagement_id,
+            actor="agent",
+            action="traffic_policy_started",
+            payload=traffic_started_payload,
+        )
+        workspace.record_event(kind="traffic_policy_started", payload=traffic_started_payload)
+        if knowledge_pack_metadata:
+            workspace.record_event(kind="knowledge_pack_loaded", payload=knowledge_pack_metadata)
+
         safe_context = _safe_runtime_context(brief.context or {}, brief_path=brief_path)
         description = str(safe_context.get("description") or "")
         _write_runtime_context(
@@ -504,6 +552,7 @@ def run_ai_web_agent(
             authentication=settings.authentication,
             traffic_policy=traffic_policy,
         )
+        state.surface.update(persisted_http_surface)
         # Recon replaces the discovered-surface mapping. Reapply policy and mission
         # metadata afterward so both fresh runs and resumes retain their controls.
         state.surface["scope_in_scope"] = list(brief.scope.in_scope)
@@ -718,7 +767,17 @@ def run_ai_web_agent(
                 max_turns=max(settings.max_turns, 1),
                 allow_premature_final=allow_premature_final,
             )
-            if recovery is not None and recovery.scheduler.role is not RecoveryRole.CORE:
+            if unresolved_lead(state) is not None:
+                # Exact replay and auth-recovery obligations remain executor-owned;
+                # a delegated recovery branch must not replace either one.
+                action = _model_action_from_parsed(
+                    proposed_action,
+                    state=state,
+                    turn=turn,
+                    max_turns=max(settings.max_turns, 1),
+                    allow_premature_final=allow_premature_final,
+                )
+            elif recovery is not None and recovery.scheduler.role is not RecoveryRole.CORE:
                 action = select_recovery_branch_action(
                     proposed_action,
                     role=recovery.scheduler.role,
@@ -746,6 +805,10 @@ def run_ai_web_agent(
                     action = resolved_action
                     shadow_action = resolved_action
                     shadow_reason = resolution_reason
+            action, lead_selection_reason = _enforce_evidence_lead_action(state, action)
+            if lead_selection_reason is not None:
+                shadow_action = action
+                shadow_reason = lead_selection_reason
             selection_payload = selection_trace_payload(
                 turn=turn,
                 action_id=action_id,
@@ -753,7 +816,7 @@ def run_ai_web_agent(
                 selected_action=action,
                 shadow_action=shadow_action,
                 shadow_reason=shadow_reason,
-                repeat_context=_repeat_context(state),
+                repeat_context=_repeat_context(state, action=action),
             )
             selection_payload = _authenticated_artifact_mapping(
                 settings.authentication,
@@ -767,7 +830,10 @@ def run_ai_web_agent(
                 action="harness_selection",
                 payload=selection_payload,
             )
-            repeat_count = state.ledger.remember(action, context=_repeat_context(state))
+            repeat_count = state.ledger.remember(
+                action,
+                context=_repeat_context(state, action=action),
+            )
             selected_action_payload = _authenticated_artifact_mapping(
                 settings.authentication,
                 {
@@ -823,6 +889,7 @@ def run_ai_web_agent(
                     action_id=action_id,
                     authentication=settings.authentication,
                     traffic_policy=traffic_policy,
+                    http_executor=http_session,
                 )
             else:
                 outcome = execute_action(
@@ -840,12 +907,24 @@ def run_ai_web_agent(
                     action_id=action_id,
                     authentication=settings.authentication,
                     traffic_policy=traffic_policy,
+                    http_executor=http_session,
                 )
             if settings.authentication is not None and not outcome.session_mode:
                 outcome = replace(outcome, session_mode=session_mode)
             outcome = _continue_after_proof_outcome(state, outcome)
             outcome = _stop_after_finding_outcome(state, outcome)
             outcome_json = outcome.to_json()
+            # Also evaluate auth-paused routes: an exact replay carrying a newly
+            # established bearer/header session can resume the obligation.
+            lead_outcome = outcome_json
+            if outcome.evidence_observation:
+                # Executor evidence is used only for in-memory attempt
+                # accounting. It is intentionally excluded from action memory.
+                lead_outcome = {
+                    **outcome_json,
+                    "_evidence_observation": outcome.evidence_observation,
+                }
+            record_aligned_outcome(state, action, lead_outcome)
             _update_state_from_action(state, action=action, outcome=outcome_json)
             post_action_state_trace = state_trace_snapshot(state)
             attempt_record = attempt_record_payload(
@@ -854,7 +933,7 @@ def run_ai_web_agent(
                 proposed_action=proposed_action,
                 selected_action=action,
                 selection_reason=str(selection_payload.get("selection_reason") or ""),
-                repeat_context=_repeat_context(state),
+                repeat_context=_repeat_context(state, action=action),
                 pre_state=pre_state_trace,
                 post_state=post_action_state_trace,
                 outcome=outcome_json,
@@ -973,120 +1052,223 @@ def run_ai_web_agent(
         raise
     finally:
         cleanup_error: BaseException | None = None
+        http_terminal: dict[str, object] | None = None
         try:
-            runtime.close()
+            if runtime is not None:
+                runtime.close()
         except BaseException as exc:  # noqa: BLE001 - cleanup must be reported.
-            cleanup_error = exc
-        finish_status = "completed"
-        if isinstance(run_error, KeyboardInterrupt):
-            finish_status = "cancelled"
-            termination_reason = "keyboard_interrupt"
-        elif run_error is not None:
-            finish_status = "failed"
-            termination_reason = "error"
-        elif termination_reason is None:
-            termination_reason = (
-                "max_turns_reached" if state.turn >= max(settings.max_turns, 1) else "agent_final"
+            cleanup_error = _merge_finalization_error(
+                run_error=run_error,
+                cleanup_error=cleanup_error,
+                error=exc,
+                stage="tool runtime cleanup",
             )
-        expected_proof_count = _state_expected_proof_count(state)
-        captured_proof_count = _captured_proof_count(state)
-        required_proof_count_unmet = (
-            expected_proof_count is not None
-            and captured_proof_count < expected_proof_count
-        )
-        completion_requirements_met = (
-            not flag_objective
-            or _proof_objective_completion_met(state, settings=settings)
-        )
-        if required_proof_count_unmet and termination_reason in {
-            "agent_final",
-            "objective_met",
-        }:
-            termination_reason = "required_proof_count_unmet"
-        if termination_reason in {
-            "max_turns_reached",
-            "cost_budget_exhausted",
-            "required_proof_count_unmet",
-        } or (run_error is None and not completion_requirements_met):
-            finish_status = "incomplete"
-        finished_payload: dict[str, object] = {
-            "status": finish_status,
-            "termination_reason": termination_reason,
-            "flags": state.flags,
-            "flag_record_path": str(workspace.events_path),
-            "finding_count": audit.count_findings(
-                status="confirmed",
-                engagement_id=brief.engagement_id,
-            ),
-            "finding_record_path": str(workspace.events_path),
-            "audit_path": str(settings.db_path or workspace.root / "audit.db"),
-            "flag_objective": flag_objective,
-            "expected_proof_count": expected_proof_count,
-            "captured_proof_count": captured_proof_count,
-            "required_proof_count_unmet": required_proof_count_unmet,
-            "completion_requirements_met": completion_requirements_met,
-            "turns": state.turn,
-            "phase": state.phase,
-            "cost_usd": round(spent_cost_usd, 6),
-            "cost_accounting_complete": cost_accounting_complete,
-            "traffic_policy": traffic_policy.config.to_json(),
-            "traffic_policy_snapshot": traffic_policy.snapshot().to_json(),
-        }
-        if settings.report_path is not None or settings.report_agent:
-            finished_payload["report_path"] = str(
-                settings.report_path or workspace.root.parent / "report.md"
+        try:
+            if http_session is not None:
+                terminal = http_session.finalize()
+                if terminal is not None:
+                    http_terminal = terminal.to_json()
+        except BaseException as exc:  # noqa: BLE001 - cleanup must be reported.
+            cleanup_error = _merge_finalization_error(
+                run_error=run_error,
+                cleanup_error=cleanup_error,
+                error=exc,
+                stage="structured HTTP cleanup",
             )
-        if run_error is not None:
-            finished_payload["error_type"] = type(run_error).__name__
-        if recovery is not None:
-            finished_payload.update(
-                {
-                    "recovery_profile": settings.recovery_profile,
-                    "recovery_status": recovery.scheduler.status.value,
-                    "global_model_requests": recovery.scheduler.total_model_requests,
-                    "interrupted_model_requests": recovery.interrupted_model_requests,
-                }
-            )
-        _record(
-            audit,
-            brief.engagement_id,
-            actor="agent",
-            action="agent_finished",
-            payload=finished_payload,
-        )
-        workspace.record_event(kind="agent_finished", payload=finished_payload)
-        traffic_finished_payload = {
-            "state_path": str(traffic_policy.state_path),
-            "config": traffic_policy.config.to_json(),
-            "snapshot": traffic_policy.snapshot().to_json(),
-        }
-        _record(
-            audit,
-            brief.engagement_id,
-            actor="agent",
-            action="traffic_policy_finished",
-            payload=traffic_finished_payload,
-        )
-        workspace.record_event(kind="traffic_policy_finished", payload=traffic_finished_payload)
-        if run_error is None and cleanup_error is None:
-            _handle_memory_after_run(
+        try:
+            termination_reason = _record_agent_finish(
+                run_error=run_error,
+                cleanup_error=cleanup_error,
+                termination_reason=termination_reason,
+                state=state,
                 settings=settings,
+                flag_objective=flag_objective,
+                spent_cost_usd=spent_cost_usd,
+                cost_accounting_complete=cost_accounting_complete,
+                audit=audit,
+                engagement_id=brief.engagement_id,
+                workspace=workspace,
+                traffic_policy=traffic_policy,
+                http_terminal=http_terminal,
+                recovery=recovery,
                 route=route,
                 client=client,
-                audit_db_path=settings.db_path or workspace.root / "audit.db",
             )
-        audit.close()
-        _write_report_if_requested(
-            brief_path=brief_path,
-            target_url=target_url,
-            settings=settings,
-            workspace=workspace,
-            state=state,
-            error=run_error or cleanup_error,
-            termination_reason=termination_reason,
-        )
+        except BaseException as exc:  # noqa: BLE001 - preserve the primary failure.
+            cleanup_error = _merge_finalization_error(
+                run_error=run_error,
+                cleanup_error=cleanup_error,
+                error=exc,
+                stage="finish telemetry",
+            )
+        try:
+            audit.close()
+        except BaseException as exc:  # noqa: BLE001 - preserve the primary failure.
+            cleanup_error = _merge_finalization_error(
+                run_error=run_error,
+                cleanup_error=cleanup_error,
+                error=exc,
+                stage="audit store cleanup",
+            )
+        try:
+            _write_report_if_requested(
+                brief_path=brief_path,
+                target_url=target_url,
+                settings=settings,
+                workspace=workspace,
+                state=state,
+                error=run_error or cleanup_error,
+                termination_reason=termination_reason,
+            )
+        except BaseException as exc:  # noqa: BLE001 - preserve the primary failure.
+            cleanup_error = _merge_finalization_error(
+                run_error=run_error,
+                cleanup_error=cleanup_error,
+                error=exc,
+                stage="report cleanup",
+            )
         if cleanup_error is not None and run_error is None:
             raise cleanup_error
+
+
+def _merge_finalization_error(
+    *,
+    run_error: BaseException | None,
+    cleanup_error: BaseException | None,
+    error: BaseException,
+    stage: str,
+) -> BaseException | None:
+    """Keep the first failure while retaining secret-free cleanup context."""
+    primary = run_error if run_error is not None else cleanup_error
+    if primary is None:
+        return error
+    primary.add_note(f"{stage} also failed: {type(error).__name__}")
+    return cleanup_error
+
+
+def _record_agent_finish(  # noqa: PLR0913
+    *,
+    run_error: BaseException | None,
+    cleanup_error: BaseException | None,
+    termination_reason: str | None,
+    state: AgentState,
+    settings: AIWebAgentSettings,
+    flag_objective: bool,
+    spent_cost_usd: float,
+    cost_accounting_complete: bool,
+    audit: AuditStore,
+    engagement_id: UUID,
+    workspace: AgentWorkspace,
+    traffic_policy: TrafficPolicyController,
+    http_terminal: dict[str, object] | None,
+    recovery: RecoveryCampaign | None,
+    route: ResolvedModelRoute | None,
+    client: Any | None,
+) -> str | None:
+    """Emit terminal telemetry before independently owned resources are closed."""
+    finish_status = "completed"
+    if isinstance(run_error, KeyboardInterrupt):
+        finish_status = "cancelled"
+        termination_reason = "keyboard_interrupt"
+    elif run_error is not None:
+        finish_status = "failed"
+        termination_reason = "error"
+    elif termination_reason is None:
+        termination_reason = (
+            "max_turns_reached" if state.turn >= max(settings.max_turns, 1) else "agent_final"
+        )
+    expected_proof_count = _state_expected_proof_count(state)
+    captured_proof_count = _captured_proof_count(state)
+    required_proof_count_unmet = (
+        expected_proof_count is not None and captured_proof_count < expected_proof_count
+    )
+    completion_requirements_met = not flag_objective or _proof_objective_completion_met(
+        state,
+        settings=settings,
+    )
+    if required_proof_count_unmet and termination_reason in {
+        "agent_final",
+        "objective_met",
+    }:
+        termination_reason = "required_proof_count_unmet"
+    if termination_reason in {
+        "max_turns_reached",
+        "cost_budget_exhausted",
+        "required_proof_count_unmet",
+    } or (run_error is None and not completion_requirements_met):
+        finish_status = "incomplete"
+    finished_payload: dict[str, object] = {
+        "status": finish_status,
+        "termination_reason": termination_reason,
+        "flags": state.flags,
+        "flag_record_path": str(workspace.events_path),
+        "finding_count": audit.count_findings(
+            status="confirmed",
+            engagement_id=engagement_id,
+        ),
+        "finding_record_path": str(workspace.events_path),
+        "audit_path": str(settings.db_path or workspace.root / "audit.db"),
+        "flag_objective": flag_objective,
+        "expected_proof_count": expected_proof_count,
+        "captured_proof_count": captured_proof_count,
+        "required_proof_count_unmet": required_proof_count_unmet,
+        "completion_requirements_met": completion_requirements_met,
+        "turns": state.turn,
+        "phase": state.phase,
+        "cost_usd": round(spent_cost_usd, 6),
+        "cost_accounting_complete": cost_accounting_complete,
+        "traffic_policy": traffic_policy.config.to_json(),
+        "traffic_policy_snapshot": traffic_policy.snapshot().to_json(),
+    }
+    if http_terminal is not None:
+        finished_payload["structured_http"] = http_terminal
+        workspace.record_event(kind="structured_http_finished", payload=http_terminal)
+    if settings.report_path is not None or settings.report_agent:
+        finished_payload["report_path"] = str(
+            settings.report_path or workspace.root.parent / "report.md"
+        )
+    if run_error is not None:
+        finished_payload["error_type"] = type(run_error).__name__
+    if recovery is not None:
+        finished_payload.update(
+            {
+                "recovery_profile": settings.recovery_profile,
+                "recovery_status": recovery.scheduler.status.value,
+                "global_model_requests": recovery.scheduler.total_model_requests,
+                "interrupted_model_requests": recovery.interrupted_model_requests,
+            }
+        )
+    _record(
+        audit,
+        engagement_id,
+        actor="agent",
+        action="agent_finished",
+        payload=finished_payload,
+    )
+    workspace.record_event(kind="agent_finished", payload=finished_payload)
+    traffic_finished_payload = {
+        "state_path": str(traffic_policy.state_path),
+        "config": traffic_policy.config.to_json(),
+        "snapshot": traffic_policy.snapshot().to_json(),
+    }
+    _record(
+        audit,
+        engagement_id,
+        actor="agent",
+        action="traffic_policy_finished",
+        payload=traffic_finished_payload,
+    )
+    workspace.record_event(kind="traffic_policy_finished", payload=traffic_finished_payload)
+    if run_error is None and cleanup_error is None:
+        if route is None or client is None:
+            raise RuntimeError("completed agent run is missing its model route")
+        _handle_memory_after_run(
+            settings=settings,
+            route=route,
+            client=client,
+            audit_db_path=settings.db_path or workspace.root / "audit.db",
+        )
+    return termination_reason
 
 
 def _model_action(
@@ -1108,6 +1290,13 @@ def _model_action_from_parsed(
     max_turns: int,
     allow_premature_final: bool = False,
 ) -> dict[str, object]:
+    lead_action, lead_reason = _enforce_evidence_lead_action(state, action)
+    if lead_reason is not None:
+        return lead_action
+    if unresolved_lead(state) is not None:
+        # An aligned exact replay or an auth-establishing HTTP action outranks
+        # generic primitive and description-based harness rewrites this turn.
+        return lead_action
     if allow_premature_final and action.get("action") == "final":
         return dict(action)
     if not allow_premature_final and _final_is_premature(
@@ -1139,6 +1328,16 @@ def _shadow_harness_action(
     max_turns: int,
     allow_premature_final: bool = False,
 ) -> tuple[dict[str, object] | None, str]:
+    lead_action, lead_reason = _enforce_evidence_lead_action(state, proposed_action)
+    if lead_reason is not None:
+        return lead_action, lead_reason
+    if unresolved_lead(state) is not None:
+        reason = (
+            "evidence_lead_session_recovery"
+            if awaiting_session_lead(state) is not None
+            else "evidence_lead_aligned"
+        )
+        return None, reason
     if not allow_premature_final and _final_is_premature(
         action=proposed_action, state=state, turn=turn, max_turns=max_turns
     ):
@@ -1158,7 +1357,49 @@ def _shadow_harness_action(
     return None, "no_shadow_route"
 
 
-_REPEAT_GUARDED_ACTIONS = frozenset({"run_command", "run_python", "run_probe", "validate_poc"})
+def _enforce_evidence_lead_action(
+    state: AgentState,
+    action: Mapping[str, object],
+) -> tuple[dict[str, object], str | None]:
+    lead = pending_lead(state)
+    selected = dict(action)
+    if lead is not None:
+        if action_matches_lead(
+            selected,
+            lead,
+            primary_origin=state.surface_graph.target_origin,
+        ):
+            return selected, None
+        return (
+            {
+                "action": "invalid",
+                "error": evidence_lead_directive(state),
+                "raw": f"blocked action kind: {selected.get('action')}",
+            },
+            "evidence_lead_lock",
+        )
+    if awaiting_session_lead(state) is None:
+        return selected, None
+    if _is_evidence_session_recovery_action(selected):
+        return selected, None
+    return (
+        {
+            "action": "invalid",
+            "error": evidence_lead_directive(state),
+            "raw": f"blocked action kind: {selected.get('action')}",
+        },
+        "evidence_lead_session_recovery",
+    )
+
+
+def _is_evidence_session_recovery_action(action: Mapping[str, object]) -> bool:
+    """Allow only the persistent HTTP lane or trusted proof closure while paused."""
+    return str(action.get("action") or "") in {"http_request", "capture_flag"}
+
+
+_REPEAT_GUARDED_ACTIONS = frozenset(
+    {"http_request", "run_command", "run_python", "run_probe", "validate_poc"}
+)
 _ACTIVE_TASK_STATUSES = frozenset({"pending", "in_progress"})
 
 
@@ -1322,7 +1563,7 @@ def _would_hit_repeat_guard(state: AgentState, action: Mapping[str, object]) -> 
     if str(action.get("action") or "") not in _REPEAT_GUARDED_ACTIONS:
         return False
     return (
-        state.ledger.count(action, context=_repeat_context(state))
+        state.ledger.count(action, context=_repeat_context(state, action=action))
         >= MAX_IDENTICAL_ACTION_EXECUTIONS
     )
 
@@ -1373,6 +1614,8 @@ def _assessment_ready_for_terminal(
     if not state.tasks or _has_open_assessment_tasks(state):
         return False
     if pending_closure_obligation(state) is not None:
+        return False
+    if unresolved_lead(state) is not None:
         return False
     if _has_executable_live_primitive_route(state, settings=settings):
         return False
@@ -1481,7 +1724,7 @@ def _forced_primitive_probe_action(
         "fallback": "If the locked specialist exhausts this primitive twice, move to the next confirmed primitive or distinct evidence.",
         "memory_updates": [f"forced locked primitive probe: {primitive_name} -> {rule.probe}"],
     }
-    if state.ledger.count(action, context=_repeat_context(state)) >= 2:
+    if state.ledger.count(action, context=_repeat_context(state, action=action)) >= 2:
         return None
     return action
 
@@ -1911,7 +2154,7 @@ def _forced_evidence_probe_action(
             ),
             "memory_updates": [f"forced evidence route: {route.name} -> {route.probe}"],
         }
-        if state.ledger.count(action, context=_repeat_context(state)) >= 2:
+        if state.ledger.count(action, context=_repeat_context(state, action=action)) >= 2:
             continue
         return action
     return None
@@ -1968,7 +2211,7 @@ def _forced_multi_finding_url_fetch_action(
             "preserved structured URL-fetch form requires SSRF closure after an earlier proof"
         ],
     }
-    if state.ledger.count(action, context=_repeat_context(state)) >= 2:
+    if state.ledger.count(action, context=_repeat_context(state, action=action)) >= 2:
         return None
     return action
 
@@ -2297,7 +2540,7 @@ def _forced_cookie_identity_idor_action(
         "fallback": "If idor_boundary exhausts twice, resume model-driven exploration with a different primitive.",
         "memory_updates": ["forced cookie identity IDOR loop -> idor_boundary"],
     }
-    if state.ledger.count(action, context=_repeat_context(state)) >= 2:
+    if state.ledger.count(action, context=_repeat_context(state, action=action)) >= 2:
         return None
     return action
 
@@ -2337,7 +2580,7 @@ def _forced_authenticated_object_idor_action(
         "fallback": "If idor_boundary exhausts twice, resume model-driven exploration with a different primitive.",
         "memory_updates": ["forced authenticated object-route IDOR loop -> idor_boundary"],
     }
-    if state.ledger.count(action, context=_repeat_context(state)) >= 2:
+    if state.ledger.count(action, context=_repeat_context(state, action=action)) >= 2:
         return None
     return action
 
@@ -2475,6 +2718,7 @@ def _final_is_premature(
         return (
             _has_open_assessment_tasks(state)
             or pending_closure_obligation(state) is not None
+            or unresolved_lead(state) is not None
             or _has_executable_live_primitive_route(state, settings=settings)
         )
     return not _proof_objective_completion_met(state, settings=settings)
@@ -2489,6 +2733,7 @@ def _proof_objective_completion_met(
         _proof_count_requirement_unmet(state)
         or _captured_proof_count(state) == 0
         or pending_closure_obligation(state) is not None
+        or unresolved_lead(state) is not None
     ):
         return False
     if not _continue_after_proof_enabled(state):
@@ -2814,6 +3059,7 @@ def _execute_recovery_action(  # noqa: PLR0913 - mirrors the executor boundary.
     action_id: str,
     authentication: ManagedAttackAuthentication | None,
     traffic_policy: TrafficPolicyController,
+    http_executor: StatefulHttpActionSession,
 ) -> tuple[ActionResult, bool]:
     specialist = recovery.scheduler.role is not RecoveryRole.CORE
     if specialist and action.get("action") == "final":
@@ -2838,7 +3084,27 @@ def _execute_recovery_action(  # noqa: PLR0913 - mirrors the executor boundary.
         )
 
     route_fingerprint = semantic_action_fingerprint(action)
-    if not recovery.scheduler.route_is_available(route_fingerprint):
+    lead = pending_lead(state)
+    lead_owned_route = (
+        lead is not None
+        and action_matches_lead(
+            action,
+            lead,
+            primary_origin=state.surface_graph.target_origin,
+        )
+    ) or (
+        awaiting_session_lead(state) is not None
+        and _is_evidence_session_recovery_action(action)
+    )
+    # An exact evidence replay has its own executor-owned lifecycle: two
+    # completed no-progress attempts, with authentication pauses excluded.
+    # Auth recovery is likewise bounded by the repeat/global budgets. The
+    # generic recovery throttle may already have counted the pre-auth 401/403,
+    # so letting it block here can strand the lead before a usable session or
+    # after only one real replay.
+    if not lead_owned_route and not recovery.scheduler.route_is_available(
+        route_fingerprint
+    ):
         payload = {
             "turn": state.turn,
             "branch_id": recovery.scheduler.active_branch_id,
@@ -2883,6 +3149,7 @@ def _execute_recovery_action(  # noqa: PLR0913 - mirrors the executor boundary.
             action_id=action_id,
             authentication=authentication,
             traffic_policy=traffic_policy,
+            http_executor=http_executor,
         ),
         False,
     )
@@ -3001,6 +3268,8 @@ def _seed_recon(
     authentication: ManagedAttackAuthentication | None = None,
     traffic_policy: TrafficPolicyController | None = None,
 ) -> None:
+    if not state.surface_graph.target_origin:
+        state.surface_graph = SurfaceGraphState.for_target(target_url)
     try:
         recon = run_recon(
             target_url,
@@ -3039,8 +3308,6 @@ def _seed_recon(
         description=safe_description,
         recon_payload=recon_payload,
     )
-    if not state.surface_graph.target_origin:
-        state.surface_graph = SurfaceGraphState.for_target(target_url)
     ingest_recon_surface(
         state.surface_graph,
         recon_payload,
@@ -3161,6 +3428,8 @@ def _authenticated_model_action(
         action,
         protected_keys={
             (): _AUTHENTICATED_ACTION_PROTOCOL_KEYS,
+            ("form",): _AUTHENTICATED_HTTP_PARAMETER_KEYS,
+            ("json",): _AUTHENTICATED_HTTP_PARAMETER_KEYS,
             ("finding",): _AUTHENTICATED_FINDING_KEYS,
             ("steps", "*"): _AUTHENTICATED_HTTP_STEP_KEYS,
             ("steps", "*", "form"): _AUTHENTICATED_HTTP_PARAMETER_KEYS,
@@ -3177,7 +3446,9 @@ def _authenticated_model_action(
                 "medium",
             ),
             ("finding", "vuln_class"): _AUTHENTICATED_FINDING_CLASSES,
+            ("method",): _AUTHENTICATED_HTTP_METHODS,
             ("probe",): probe_names,
+            ("vuln_class",): _AUTHENTICATED_FINDING_CLASSES,
             ("steps", "*", "evidence_role"): ("control", "exploit"),
             ("steps", "*", "method"): _AUTHENTICATED_HTTP_METHODS,
         },
@@ -3440,19 +3711,21 @@ def _build_messages(
             "no flag is required and do not spend turns searching for one"
         )
     if low_noise:
-        execution_loop = "run one useful native metered HTTP probe or PoC replay"
+        execution_loop = "run one useful structured HTTP request, native probe, or PoC replay"
         execution_boundary = (
             "The whole-run low-noise policy permits native metered HTTP lanes only; "
             "opaque command, Python, browser-process, and external-process actions are unavailable."
         )
     elif settings.authentication is None:
-        execution_loop = "run one useful command or Python script"
+        execution_loop = "replay one observed HTTP request or run one useful command or script"
         execution_boundary = "Use the available tools directly."
     else:
-        execution_loop = "run one useful managed HTTP probe or managed PoC replay"
+        execution_loop = (
+            "run one useful structured HTTP request, managed HTTP probe or managed PoC replay"
+        )
         execution_boundary = (
-            "Use only the managed probe and PoC request lanes; raw shell and Python "
-            "execution cannot receive authenticated credentials."
+            "Use only managed structured HTTP, probe, and PoC request lanes; raw shell "
+            "and Python execution cannot receive authenticated credentials."
         )
     system = (
         "You are Ravage, an autonomous web exploitation agent running only against "
@@ -3462,6 +3735,12 @@ def _build_messages(
         f"{completion_goal}. Do not call canned drivers, route by tags, "
         f"or assume the answer key. {execution_boundary}"
     )
+    plan_directives = planner_directives(state)
+    unresolved_evidence_lead = unresolved_lead(state)
+    session_paused_evidence_lead = awaiting_session_lead(state)
+    lead_instruction = evidence_lead_directive(state)
+    if lead_instruction:
+        plan_directives.insert(0, lead_instruction)
     user: dict[str, object] = {
         "target_url": target_url,
         "scope": {
@@ -3483,9 +3762,25 @@ def _build_messages(
         "confirmed_primitives": dict(state.primitives),
         "locked_primitive": locked_primitive(state),
         "active_strategy_cards": strategies,
-        "planner_directives": planner_directives(state),
+        "planner_directives": plan_directives,
         "memory_hints": _memory_hints_for_prompt(settings, route=route),
         "action_schema": {
+            "http_request": {
+                "action": "http_request",
+                "task_id": "one active_tasks id",
+                "vuln_class": "canonical family when continuing an evidence lead",
+                "method": "GET, HEAD, OPTIONS, POST, PUT, or PATCH",
+                "url": "exact same-origin URL or path observed on the target",
+                "headers": {"content-type": "optional explicit content type"},
+                "form": {"observed_field": "one control or test value"},
+                "timeout_seconds": 10,
+                "strategy": "evidence-derived vulnerability family or workflow",
+                "notes": "what exact observed request this replays or mutates",
+                "expected_signal": "the response change that would advance or reject the lead",
+                "fallback": "one material mutation on this same request template",
+                "hypotheses": ["candidate inferred from target evidence"],
+                "memory_updates": ["short facts learned or hypotheses"],
+            },
             "run_probe": {
                 "action": "run_probe",
                 "task_id": "one active_tasks id",
@@ -3584,10 +3879,30 @@ def _build_messages(
             "Use active strategy cards as checklists, not as answer keys.",
             "Choose exactly one active task and include its task_id in every non-final action.",
             "Do not repeat an action from repetition_ledger unless you change a material variable.",
+            "Treat surface_graph operations and discovered forms as canonical request templates. Preserve their exact method, route, body location, field names, and active session.",
+            "When a real form or API request exists, use http_request to mutate that observed template before inventing query parameters, alternate methods, or guessed endpoints.",
+            (
+                "When evidence_lead_lock.status is awaiting_session, use http_request in "
+                "the persistent lane to establish authentication; do not switch to an "
+                "unrelated probe or finish. The exact request-shape lock resumes after "
+                "session state changes."
+                if session_paused_evidence_lead is not None
+                else "When evidence_lead_lock is present, do not change vulnerability "
+                "family, method, endpoint, encoding, or exact request fields. Continue it "
+                "with http_request or validate_poc; run_probe metadata cannot enforce an "
+                "exact physical replay. Include vuln_class on http_request."
+            )
+            + (
+                " capture_flag remains allowed when exact target proof is visible."
+                if flag_objective
+                else ""
+            ),
+            "Anonymous http_request actions share one persistent cookie session for this run. Establish workflows such as login with it, then keep using it for the authenticated follow-up surface; configured managed identities are attached by their trusted session owner.",
+            "For http_request request bodies, emit exactly one of form, json, or body. The schema example uses form; replace it with json or body when the observed request requires that encoding.",
             "If recommended_specialists is non-empty, pick the highest-scored specialist with run_probe before writing an equivalent run_command/run_python loop.",
             "If locked_primitive is set, you have already confirmed an exploitable primitive: run its locked run_probe specialist (top of recommended_specialists) and drive it to validated target evidence. Do not run recon/surface probes or switch to an unrelated vulnerability class until that primitive is exploited or genuinely exhausted.",
             "After a specialist returns same_as_before, either change a material endpoint/parameter/payload family or move to the next specialist; do not reimplement the same probe by hand.",
-            "Use run_command or run_python only for custom follow-up, exploitation logic, or payload adaptation not covered by an available probe.",
+            "Use http_request for custom HTTP follow-up and payload adaptation. Use run_command or run_python only for non-HTTP tooling not covered by an available probe.",
             "Do not spend more than two consecutive run_command/run_python turns while a matching run_probe specialist remains untried.",
             "Use validate_poc after a promising signal to replay the shortest stable HTTP evidence.",
             (
@@ -3626,6 +3941,8 @@ def _build_messages(
             "Inspect full response bodies, headers, cookies, redirects, forms, links, and errors.",
         ],
     }
+    if unresolved_evidence_lead is not None:
+        user["evidence_lead_lock"] = unresolved_evidence_lead.to_json()
     if traffic_budget is not None:
         user["traffic_budget"] = dict(traffic_budget)
     action_schema = user["action_schema"]
@@ -3658,8 +3975,8 @@ def _build_messages(
                 item for item in tool_guidance if not _authenticated_external_guidance(str(item))
             ]
             tool_guidance.append(
-                "Whole-run low-noise mode permits run_probe and validate_poc only through "
-                "native metered HTTP transports; do not propose opaque process or browser lanes."
+                "Whole-run low-noise mode permits http_request, run_probe, and validate_poc "
+                "through native metered HTTP transports; do not propose opaque process or browser lanes."
             )
     if settings.allow_remote_target and not is_local_url(target_url):
         tool_guidance = user["tool_guidance"]
@@ -3860,7 +4177,7 @@ def _focus_authenticated_prompt(  # noqa: C901, PLR0912 - prompt policy is expli
 
     schema_actions = list(action_schema) if isinstance(action_schema, dict) else []
     managed_http_actions = [
-        name for name in ("run_probe", "validate_poc") if name in schema_actions
+        name for name in ("http_request", "run_probe", "validate_poc") if name in schema_actions
     ]
     user["managed_http_identity"] = {
         "mode": _authentication_session_mode(authentication),
@@ -3894,13 +4211,14 @@ def _focus_authenticated_methodology(methodology: dict[str, object]) -> None:
     methodology["loop"] = [
         "Observe: gather one new fact from target responses or prior output.",
         "Orient: connect that fact to an active task and hypothesis.",
-        "Act: run one eligible managed in-process probe or structured validate_poc replay.",
+        "Act: replay one exact observed request, run one eligible managed probe, or validate a PoC.",
         (
             "Review: record whether the result was new surface, a candidate signal, "
             "blocked, or confirmed evidence."
         ),
     ]
     methodology["tool_use"] = [
+        "Use http_request to preserve an observed method, route, fields, and managed identity.",
         "Use run_probe for scoped authenticated discovery and specialist workflows.",
         "Use validate_poc for short same-origin HTTP control/exploit comparisons.",
         "Let the managed executor own cookies, authentication headers, refresh, pacing, and scope.",
@@ -4358,7 +4676,11 @@ def _float_value(value: object, *, default: float) -> float:
         return default
 
 
-def _repeat_context(state: AgentState) -> str:
+def _repeat_context(
+    state: AgentState,
+    *,
+    action: Mapping[str, object] | None = None,
+) -> str:
     """
     Material replay-context signature for repeat-action de-duplication.
 
@@ -4372,7 +4694,23 @@ def _repeat_context(state: AgentState) -> str:
             if str(value).strip()
         }
     )
-    return "host:" + ",".join(hosts) if hosts else ""
+    parts = ["host:" + ",".join(hosts)] if hosts else []
+    kind = str(action.get("action") or "") if action is not None else ""
+    session_sensitive = action is None or kind in {"http_request", "validate_poc"}
+    if session_sensitive:
+        target_origin = str(state.surface_graph.target_origin or "").strip()
+        if target_origin:
+            parts.append(f"origin:{target_origin}")
+        lead = pending_lead(state)
+        if lead is not None:
+            parts.append(lead.fingerprint)
+            replay_generation = lead_replay_generation(state)
+            if replay_generation:
+                parts.append(f"lead-replay:{replay_generation}")
+        http_state_epoch = state.surface.get("http_state_epoch")
+        if isinstance(http_state_epoch, int) and not isinstance(http_state_epoch, bool):
+            parts.append(f"http-state:{max(0, http_state_epoch)}")
+    return "|".join(parts)
 
 
 def _update_state_from_action(
@@ -4395,6 +4733,14 @@ def _update_state_from_action(
         "repeat_count": outcome.get("repeat_count"),
         "outcome": outcome.get("outcome"),
     }
+    if action.get("action") == "http_request":
+        record["request_shape"] = _http_request_memory(action)
+    elif action.get("action") == "validate_poc":
+        steps = action.get("steps")
+        if isinstance(steps, list):
+            record["request_shapes"] = [
+                _http_request_memory(step) for step in steps[:12] if isinstance(step, Mapping)
+            ]
     state.actions.append(record)
     update_mission_from_action(state, action=dict(action), outcome=dict(outcome))
     for item in _string_list(action.get("memory_updates")):
@@ -4404,8 +4750,12 @@ def _update_state_from_action(
     observation = str(outcome.get("observation") or "")
     if observation and not state.last_observation:
         state.last_observation = observation_digest(observation)
-    for item in observation_facts(observation):
-        append_unique(state.facts, item, limit=80)
+    if action.get("action") != "http_request":
+        # The structured HTTP executor has already mined response-only
+        # discovery. This visible envelope also contains the model-authored
+        # request, which must never promote a target-evidence primitive.
+        for item in observation_facts(observation):
+            append_unique(state.facts, item, limit=80)
     if action.get("action") == "invalid":
         append_unique(state.facts, "previous model response violated action schema", limit=80)
     promote_primitives(state)
@@ -4416,6 +4766,67 @@ def _update_state_from_action(
     elif state.primitives or state.turn >= 3:
         state.phase = "exploit"
     state.summary = summarize_state(state)
+
+
+def _http_request_memory(action: Mapping[str, object]) -> dict[str, object]:
+    """Keep a replayable request shape without retaining caller-authored values."""
+    raw_url = str(action.get("url") or action.get("path") or "")
+    encoding, field_names = _http_request_body_memory(action)
+    headers = action.get("headers")
+    header_names = (
+        sorted(
+            {
+                str(name).strip().casefold()
+                for name in headers
+                if str(name).strip() and "\n" not in str(name) and "\r" not in str(name)
+            }
+        )[:32]
+        if isinstance(headers, Mapping)
+        else []
+    )
+    return {
+        "method": str(action.get("method") or "GET").strip().upper(),
+        "url_shape": semantic_url_shape(raw_url),
+        "body_encoding": encoding,
+        "field_names": list(safe_field_names(field_names)),
+        "header_names": header_names,
+        "values_retained": False,
+    }
+
+
+def _http_request_body_memory(
+    action: Mapping[str, object],
+) -> tuple[str, tuple[object, ...]]:
+    form = action.get("form")
+    if isinstance(form, Mapping):
+        return "form", tuple(form)
+    json_body = action.get("json")
+    if json_body is not None:
+        return "json", tuple(json_body) if isinstance(json_body, Mapping) else ()
+    raw_body = action.get("body")
+    if raw_body is None:
+        return "none", ()
+    content_type = _http_request_content_type(action.get("headers"))
+    if content_type == "application/x-www-form-urlencoded":
+        return "form", tuple(
+            name for name, _value in parse_qsl(str(raw_body), keep_blank_values=True)
+        )
+    if content_type == "application/json" or content_type.endswith("+json"):
+        try:
+            decoded = json.loads(str(raw_body))
+        except (TypeError, json.JSONDecodeError):
+            decoded = None
+        return "json", tuple(decoded) if isinstance(decoded, Mapping) else ()
+    return "raw", ()
+
+
+def _http_request_content_type(value: object) -> str:
+    if not isinstance(value, Mapping):
+        return ""
+    for name, header_value in value.items():
+        if str(name).strip().casefold() == "content-type":
+            return str(header_value).split(";", 1)[0].strip().casefold()
+    return ""
 
 
 def _write_runtime_context(

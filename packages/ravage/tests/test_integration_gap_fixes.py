@@ -12,6 +12,7 @@ from ravage.agent_core.ai_agent import (
     _would_hit_repeat_guard,
 )
 from ravage.agent_core.primitive_state import promote_primitives
+from ravage.agent_core.surface_graph import SurfaceGraphState
 
 
 def test_command_timeout_floors_at_ten_seconds() -> None:
@@ -85,6 +86,121 @@ def test_action_fingerprint_hashes_material_beyond_the_old_prefix_limit() -> Non
     assert shared_prefix not in action_fingerprint(first)
 
 
+def test_validate_poc_fingerprint_preserves_form_method_and_path() -> None:
+    put = {
+        "action": "validate_poc",
+        "steps": [{"method": "PUT", "path": "/profile", "form": {"name": "alice"}}],
+    }
+    patch = {
+        "action": "validate_poc",
+        "steps": [{"method": "PATCH", "path": "/profile", "form": {"name": "alice"}}],
+    }
+    other_path = {
+        "action": "validate_poc",
+        "steps": [{"method": "PUT", "path": "/other", "form": {"name": "alice"}}],
+    }
+
+    assert action_fingerprint(put) != action_fingerprint(patch)
+    assert action_fingerprint(put) != action_fingerprint(other_path)
+
+
+@pytest.mark.parametrize("kind", ["http_request", "validate_poc"])
+def test_http_fingerprint_ignores_method_whitespace_and_url_fragment(kind: str) -> None:
+    def action(method: str, fragment: str) -> dict[str, object]:
+        request = {
+            "method": method,
+            "url": f"/search?q=same#{fragment}",
+        }
+        if kind == "http_request":
+            return {"action": kind, **request}
+        return {"action": kind, "steps": [request]}
+
+    assert action_fingerprint(action(" get ", "client-only-one")) == action_fingerprint(
+        action("GET", "client-only-two")
+    )
+
+
+@pytest.mark.parametrize("kind", ["http_request", "validate_poc"])
+def test_http_fingerprint_collapses_same_origin_absolute_and_relative_urls(
+    kind: str,
+) -> None:
+    def action(url: str) -> dict[str, object]:
+        request = {"method": "GET", "url": url}
+        if kind == "http_request":
+            return {"action": kind, **request}
+        return {"action": kind, "steps": [request]}
+
+    context = "origin:https://target.example"
+    assert action_fingerprint(
+        action("/same#client-fragment"),
+        context=context,
+    ) == action_fingerprint(
+        action("https://TARGET.example:443/same#other-fragment"),
+        context=context,
+    )
+
+
+def test_legacy_http_fingerprints_are_not_repersisted() -> None:
+    ledger = ActionLedger(
+        fingerprints={
+            "http_request:{'password': 'guessable'}": 1,
+            "validate_poc:{'steps': [{'token': 'guessable'}]}": 1,
+            "run_probe:surface_map": 1,
+        }
+    )
+
+    assert ledger.to_json() == {"run_probe:surface_map": 1}
+
+
+@pytest.mark.parametrize(
+    ("body_field", "content_type"),
+    [
+        ("form", "application/x-www-form-urlencoded"),
+        ("json", "application/json"),
+    ],
+)
+def test_http_fingerprint_canonicalizes_implicit_body_content_type(
+    body_field: str,
+    content_type: str,
+) -> None:
+    body = {"name": "same"}
+    implicit = {"action": "http_request", "method": "POST", body_field: body, "path": "/"}
+    explicit = {
+        **implicit,
+        "headers": {" Content-Type ": content_type.upper()},
+    }
+
+    assert action_fingerprint(implicit) == action_fingerprint(explicit)
+
+
+@pytest.mark.parametrize("kind", ["http_request", "validate_poc"])
+def test_http_payload_fingerprints_are_not_serialized(kind: str) -> None:
+    action = (
+        {
+            "action": "http_request",
+            "method": "POST",
+            "path": "/login",
+            "form": {"password": "low-entropy-secret"},
+        }
+        if kind == "http_request"
+        else {
+            "action": "validate_poc",
+            "steps": [
+                {
+                    "method": "POST",
+                    "path": "/login",
+                    "form": {"password": "low-entropy-secret"},
+                }
+            ],
+        }
+    )
+    ledger = ActionLedger()
+
+    assert ledger.remember(action) == 1
+    assert ledger.count(action) == 1
+    assert ledger.to_json() == {}
+
+
 def test_repeat_guard_honors_a_legacy_fingerprint_after_state_round_trip() -> None:
     action = {"action": "run_probe", "probe": "cms_exposure"}
     original = AgentState()
@@ -101,6 +217,20 @@ def test_repeat_context_reflects_canonical_host() -> None:
     assert _repeat_context(state) == ""
     state.signals["canonical_hosts"] = ["localhost"]
     assert _repeat_context(state) == "host:localhost"
+
+
+def test_http_session_epoch_only_refreshes_structured_http_repeat_context() -> None:
+    state = AgentState()
+    state.surface_graph = SurfaceGraphState.for_target("https://target.example/")
+    state.surface["http_state_epoch"] = 3
+    http_action = {"action": "http_request", "method": "GET", "path": "/"}
+    poc_action = {"action": "validate_poc", "steps": [{"method": "GET", "path": "/"}]}
+    probe_action = {"action": "run_probe", "probe": "surface_map"}
+
+    expected = "origin:https://target.example|http-state:3"
+    assert _repeat_context(state, action=http_action) == expected
+    assert _repeat_context(state, action=poc_action) == expected
+    assert _repeat_context(state, action=probe_action) == ""
 
 
 def test_probe_repeat_is_unblocked_after_canonical_host_discovered() -> None:
@@ -331,7 +461,7 @@ def test_shadow_router_does_not_replace_password_change_idor_with_default_creden
     assert action["strategy"] == "stateful-session"
 
 
-def test_description_evidence_does_not_override_live_primitive_closer() -> None:
+def test_default_credentials_are_auth_context_not_an_idor_lock() -> None:
     state = AgentState(
         turn=2,
         primitives={"default_credentials_confirmed": 1},
@@ -346,8 +476,8 @@ def test_description_evidence_does_not_override_live_primitive_closer() -> None:
     )
 
     assert action["action"] == "run_probe"
-    assert action["probe"] == "idor_boundary"
-    assert action["strategy"] == "close_authenticated_boundary"
+    assert action["probe"] == "ssti_fingerprint"
+    assert action["strategy"] == "visible_reminder_template_flow"
 
 
 def test_exhausted_tier_one_primitive_closer_does_not_suppress_fallback_route() -> None:

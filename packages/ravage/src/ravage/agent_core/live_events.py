@@ -6,7 +6,7 @@ from html import unescape
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlparse
 
-from ravage.traffic.redaction import REDACTED, redact_text, sanitize_url
+from ravage.traffic.redaction import REDACTED, redact_headers, redact_text, sanitize_url
 
 MASK = "••••"
 
@@ -46,6 +46,9 @@ _QUOTED_SECRET_ASSIGNMENT_RE = re.compile(
     r"access[_-]?key|authorization|session|cookie|credential|private[_-]?key|code|pin)"
     r"[^\"']*[\"']\s*:\s*[\"'])([^\"']*)([\"'])"
 )
+_EMBEDDED_URL_RE = re.compile(
+    r"(?i)(?:https?://[^\s'\"<>]+|(?<![A-Za-z0-9:/])/[^\s'\"<>]*[?#][^\s'\"<>]+)"
+)
 
 
 def looks_secret(key: str) -> bool:
@@ -63,21 +66,11 @@ def mask_mapping(mapping: dict[str, Any]) -> dict[str, Any]:
     return {str(key): mask_value(str(key), value) for key, value in mapping.items()}
 
 
-_SECRET_HEADERS = frozenset(
-    {"set-cookie", "cookie", "authorization", "x-api-key", "x-auth-token", "x-csrf-token"}
-)
-
-
 def mask_headers(headers: object) -> dict[str, str]:
     if not isinstance(headers, dict):
         return {}
-    out: dict[str, str] = {}
-    for key, value in list(headers.items())[:24]:
-        if str(key).lower() in _SECRET_HEADERS:
-            out[str(key)] = MASK
-        else:
-            out[str(key)] = _clip(str(value), 200)
-    return out
+    bounded = dict(list(headers.items())[:24])
+    return dict(redact_headers(bounded, response=True))
 
 
 def mask_command_string(text: str) -> str:
@@ -89,6 +82,15 @@ def mask_command_string(text: str) -> str:
 
 def describe_action(action: dict[str, Any]) -> dict[str, Any]:  # noqa: PLR0911
     kind = str(action.get("action") or "")
+    if kind == "http_request":
+        step = _describe_http_step(action)
+        method = str(step.get("method") or "GET")
+        path = str(step.get("path") or "")
+        return {
+            "summary": f"HTTP {method}",
+            "detail": _clip(path),
+            "params": step,
+        }
     if kind == "validate_poc":
         return _describe_validate_poc(action)
     if kind == "run_command":
@@ -118,7 +120,7 @@ def describe_action(action: dict[str, Any]) -> dict[str, Any]:  # noqa: PLR0911
     if kind == "invalid":
         return {
             "summary": "Invalid action",
-            "detail": _clip(str(action.get("error") or "")),
+            "detail": _safe_error_text(action.get("error"), max_chars=_MAX_DETAIL_CHARS),
             "params": {},
         }
     return {"summary": kind or "action", "detail": "", "params": {}}
@@ -152,7 +154,7 @@ def _describe_validate_poc(action: dict[str, Any]) -> dict[str, Any]:
 
 def _describe_http_step(step: dict[str, Any]) -> dict[str, Any]:
     method = str(step.get("method") or "GET").upper()
-    url = str(step.get("url") or "")
+    url = sanitize_url(step.get("url") or step.get("path") or "")
     path = _path_of(url)
     if not path:
         path = url
@@ -182,12 +184,13 @@ def http_step_payload(  # noqa: PLR0913 - flat kwargs mirror the recorded payloa
     response_headers: object = None,
     body: object = None,
 ) -> dict[str, Any]:
+    safe_url = sanitize_url(url)
     return {
         "action_id": action_id,
         "index": index,
         "method": str(method or "GET").upper(),
-        "path": _path_of(url) or url,
-        "url": url,
+        "path": _path_of(safe_url) or safe_url,
+        "url": safe_url,
         "fields": mask_mapping(form) if isinstance(form, dict) else {},
         "status": status,
         "ok": ok,
@@ -230,8 +233,16 @@ def probe_http_exchange_payload(
         "elapsed_ms": elapsed_ms,
         "response_summary": response_body,
         "disposition": _clip(str(event.get("disposition") or "sent"), 24),
-        "error": redact_text(event.get("error") or "", max_chars=160),
+        "error": _safe_error_text(event.get("error"), max_chars=160),
     }
+
+
+def _safe_error_text(value: object, *, max_chars: int) -> str:
+    text = _EMBEDDED_URL_RE.sub(
+        lambda match: sanitize_url(match.group(0)),
+        str(value or ""),
+    )
+    return redact_text(text, max_chars=max_chars)
 
 
 def _trace_request_target(value: object) -> tuple[str, list[dict[str, str]]]:

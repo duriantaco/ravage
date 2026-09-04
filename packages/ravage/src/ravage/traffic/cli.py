@@ -10,6 +10,7 @@ import re
 import shlex
 import sys
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -20,8 +21,10 @@ from ravage.web_core.scope_policy import is_local_url
 
 from .manifest import (
     TrafficRunError,
+    TrafficRunManifest,
     read_traffic_manifest,
     resolve_workspace,
+    resolve_workspaces,
 )
 from .provenance import load_traffic_provenance
 from .redaction import redact_text, sanitize_url
@@ -39,8 +42,19 @@ _SLOT_RE = re.compile(
 _MAX_DISPLAY_URL_CHARS = 100
 
 if TYPE_CHECKING:
-    from .contracts import CapturedHttpExchange
-    from .provenance import AgentHttpEvidenceLink
+    from .contracts import CapturedHttpExchange, ReplayReceipt
+    from .provenance import AgentHttpEvidenceLink, TrafficProvenanceIndex
+
+
+@dataclass(frozen=True, slots=True)
+class _TrafficLane:
+    name: str
+    workspace: Path
+    manifest: TrafficRunManifest
+    store: TrafficStore
+    exchanges: tuple[CapturedHttpExchange, ...]
+    replays: tuple[ReplayReceipt, ...]
+    provenance: TrafficProvenanceIndex
 
 
 def handle_traffic_command(args: Sequence[str]) -> None:
@@ -241,79 +255,95 @@ def _capture(parsed: argparse.Namespace) -> None:  # noqa: C901
 
 
 def _list(parsed: argparse.Namespace) -> None:
-    workspace, store = _open_store(parsed.run_dir)
-    manifest = read_traffic_manifest(workspace)
-    all_exchanges = store.exchanges()
-    provenance = load_traffic_provenance(
-        workspace,
-        exchanges=all_exchanges,
-        target_identity=manifest.target_identity,
-    )
-    links_by_id = {link.request_id: link for link in provenance.links}
-    exchanges = [
-        exchange
-        for exchange in all_exchanges
-        if parsed.all or exchange.request_resource_type not in _ASSET_RESOURCE_TYPES
-    ]
-    payload = {
+    lanes = _open_lanes(parsed.run_dir)
+    qualified = len(lanes) > 1
+    visible: list[tuple[_TrafficLane, CapturedHttpExchange, AgentHttpEvidenceLink]] = []
+    hidden_assets = 0
+    for lane in lanes:
+        links_by_id = {link.request_id: link for link in lane.provenance.links}
+        for exchange in lane.exchanges:
+            if not parsed.all and exchange.request_resource_type in _ASSET_RESOURCE_TYPES:
+                hidden_assets += 1
+                continue
+            visible.append((lane, exchange, links_by_id[exchange.exchange_id]))
+    payload: dict[str, object] = {
         "run_dir": str(parsed.run_dir),
-        "workspace_dir": str(workspace),
+        "workspace_dir": str(lanes[0].workspace),
         "requests": [
             _exchange_summary(
                 exchange,
-                agent_evidence=links_by_id[exchange.exchange_id].summary_json(),
+                request_id=_qualified_id(lane.name, exchange.exchange_id)
+                if qualified
+                else exchange.exchange_id,
+                lane=lane.name if qualified else "",
+                agent_evidence=evidence_link.summary_json(),
             )
-            for exchange in exchanges
+            for lane, exchange, evidence_link in visible
         ],
-        "contracts": len(store.contracts()),
-        "hidden_assets": len(all_exchanges) - len(exchanges),
+        "contracts": sum(len(lane.store.contracts()) for lane in lanes),
+        "hidden_assets": hidden_assets,
     }
+    if qualified:
+        payload["workspaces"] = [
+            {"lane": lane.name, "workspace_dir": str(lane.workspace)} for lane in lanes
+        ]
     if parsed.json:
         _line(json.dumps(payload, indent=2, sort_keys=True))
         return
-    _line(banner("TRAFFIC HISTORY", f"{len(exchanges)} requests"))
-    if not exchanges:
+    _line(banner("TRAFFIC HISTORY", f"{len(visible)} requests"))
+    if not visible:
         _line(f"{badge('empty', 'muted')} no application requests were captured")
-    for exchange in exchanges:
+    for lane, exchange, evidence_link in visible:
         status = exchange.response_status if exchange.response_status is not None else "—"
         sent = "" if exchange.request_sent else " blocked"
+        request_id = (
+            _qualified_id(lane.name, exchange.exchange_id) if qualified else exchange.exchange_id
+        )
+        request_id_width = 27 if qualified else 9
         _line(
-            f"{exchange.exchange_id:<9} {exchange.request_method:<7} {status!s:<7} "
+            f"{request_id:<{request_id_width}} {exchange.request_method:<7} {status!s:<7} "
             f"{_display_url(exchange.request_url)}{sent}"
-            f"{_evidence_list_suffix(links_by_id[exchange.exchange_id])}"
+            f"{_evidence_list_suffix(evidence_link)}"
         )
     if payload["hidden_assets"]:
         _line(
             f"{badge('filtered', 'muted')} {payload['hidden_assets']} static assets hidden; "
             "add --all"
         )
-    if exchanges:
-        _line(
-            f"{badge('next', 'info')} ravage traffic show {parsed.run_dir} "
-            f"{exchanges[0].exchange_id}"
+    if visible:
+        lane, exchange, _evidence_link = visible[0]
+        request_id = (
+            _qualified_id(lane.name, exchange.exchange_id) if qualified else exchange.exchange_id
         )
+        _line(f"{badge('next', 'info')} ravage traffic show {parsed.run_dir} {request_id}")
 
 
 def _show(parsed: argparse.Namespace) -> None:
-    workspace, store = _open_store(parsed.run_dir)
-    manifest = read_traffic_manifest(workspace)
-    exchange = _require_exchange(store, parsed.request_id)
-    provenance = load_traffic_provenance(
-        workspace,
-        exchanges=store.exchanges(),
-        target_identity=manifest.target_identity,
+    lanes = _open_lanes(parsed.run_dir)
+    lane, exchange = _select_exchange(lanes, parsed.request_id)
+    qualified = len(lanes) > 1
+    request_id = (
+        _qualified_id(lane.name, exchange.exchange_id) if qualified else exchange.exchange_id
     )
-    evidence_link = provenance.for_exchange_id(exchange.exchange_id)
-    contract = store.contract(exchange.semantic_fingerprint)
-    payload = {
+    evidence_link = lane.provenance.for_exchange_id(exchange.exchange_id)
+    contract = lane.store.contract(exchange.semantic_fingerprint)
+    payload: dict[str, object] = {
         "exchange": exchange.to_json(),
         "contract": contract.to_json() if contract is not None else None,
         "agent_evidence": evidence_link.to_json(),
     }
+    if qualified:
+        payload.update(
+            {
+                "lane": lane.name,
+                "qualified_id": request_id,
+                "workspace_dir": str(lane.workspace),
+            }
+        )
     if parsed.json:
         _line(json.dumps(payload, indent=2, sort_keys=True))
         return
-    _line(banner("REQUEST CONTRACT", exchange.exchange_id))
+    _line(banner("REQUEST CONTRACT", request_id))
     _line(f"method     {exchange.request_method}")
     _line(f"url        {exchange.request_url}")
     _line(f"source     {exchange.source} · {exchange.request_resource_type or 'http'}")
@@ -331,18 +361,26 @@ def _show(parsed: argparse.Namespace) -> None:
     _line(f"observed   {observations} time{'s' if observations != 1 else ''}")
     _show_evidence_link(evidence_link)
     _line(f"{badge('next', 'info')} fill the values below, then run:")
-    for line in _replay_command_skeleton(parsed.run_dir, exchange, manifest.origin):
+    for line in _replay_command_skeleton(
+        parsed.run_dir,
+        exchange,
+        lane.manifest.origin,
+        request_id=request_id,
+    ):
         _line(f"  {line}")
 
 
 def _replay(parsed: argparse.Namespace) -> None:
-    workspace, store = _open_store(parsed.run_dir, writable=True)
-    manifest = read_traffic_manifest(workspace)
-    exchange = _require_exchange(store, parsed.request_id)
+    lanes = _open_lanes(parsed.run_dir, writable=True)
+    lane, exchange = _select_exchange(lanes, parsed.request_id)
+    qualified = len(lanes) > 1
+    request_id = (
+        _qualified_id(lane.name, exchange.exchange_id) if qualified else exchange.exchange_id
+    )
     bindings = _bindings(parsed.values, parsed.env_values)
     result = replay_exchange(
-        store=store,
-        manifest=manifest,
+        store=lane.store,
+        manifest=lane.manifest,
         exchange=exchange,
         allow_remote_target=parsed.authorized_remote_target,
         allow_state_change=parsed.allow_state_change,
@@ -351,6 +389,16 @@ def _replay(parsed: argparse.Namespace) -> None:
     )
     receipt = result.receipt
     payload = receipt.to_json()
+    replay_id = _qualified_id(lane.name, receipt.replay_id) if qualified else receipt.replay_id
+    if qualified:
+        payload.update(
+            {
+                "lane": lane.name,
+                "qualified_id": replay_id,
+                "source_request_ref": request_id,
+                "workspace_dir": str(lane.workspace),
+            }
+        )
     if parsed.json:
         _line(json.dumps(payload, indent=2, sort_keys=True))
         if not result.sent:
@@ -358,37 +406,49 @@ def _replay(parsed: argparse.Namespace) -> None:
         if receipt.response_status is None:
             raise SystemExit(1)
     elif result.sent and receipt.response_status is not None:
-        _line(banner("REQUEST REPLAY", receipt.replay_id))
+        _line(banner("REQUEST REPLAY", replay_id))
         _line(
             f"{badge('sent', 'ok')} {receipt.request_method} "
             f"{receipt.response_status if receipt.response_status is not None else 'no response'} "
             f"{_display_url(receipt.request_url)}"
         )
         _line(
-            f"{badge('next', 'info')} ravage traffic diff {parsed.run_dir} "
-            f"{exchange.exchange_id} {receipt.replay_id}"
+            f"{badge('next', 'info')} ravage traffic diff {parsed.run_dir} {request_id} {replay_id}"
         )
     elif not result.sent:
         _line(f"{badge('blocked', 'warn')} {result.error}")
-        _line(f"{badge('receipt', 'info')} {receipt.replay_id} · no request sent")
+        _line(f"{badge('receipt', 'info')} {replay_id} · no request sent")
         raise SystemExit(2)
     else:
-        _line(banner("REQUEST REPLAY", receipt.replay_id))
+        _line(banner("REQUEST REPLAY", replay_id))
         _line(
             f"{badge('attempted', 'warn')} {receipt.request_method} · no response · "
             f"{_display_url(receipt.request_url)}"
         )
         _line(f"{badge('error', 'warn')} {receipt.response_error or 'transport failed'}")
-        _line(f"{badge('receipt', 'info')} {receipt.replay_id} · request attempted")
+        _line(f"{badge('receipt', 'info')} {replay_id} · request attempted")
         raise SystemExit(1)
 
 
 def _diff(parsed: argparse.Namespace) -> None:
-    _workspace, store = _open_store(parsed.run_dir)
+    lanes = _open_lanes(parsed.run_dir)
+    left_lane, left_id = _select_record(lanes, parsed.left_id)
+    right_lane, right_id = _select_record(lanes, parsed.right_id)
+    if left_lane.workspace != right_lane.workspace:
+        raise ValueError("traffic diff requires both records to be in the same lane/store")
     try:
-        payload = diff_records(store, parsed.left_id, parsed.right_id)
+        payload = diff_records(left_lane.store, left_id, right_id)
     except KeyError as exc:
         raise KeyError(f"unknown traffic record ID: {exc.args[0]}") from None
+    if len(lanes) > 1:
+        payload.update(
+            {
+                "lane": left_lane.name,
+                "left_ref": _qualified_id(left_lane.name, left_id),
+                "right_ref": _qualified_id(right_lane.name, right_id),
+                "workspace_dir": str(left_lane.workspace),
+            }
+        )
     if parsed.json:
         _line(json.dumps(payload, indent=2, sort_keys=True))
         return
@@ -404,22 +464,166 @@ def _diff(parsed: argparse.Namespace) -> None:
             _line(f"{name:<22} {change.get('left')} → {change.get('right')}{suffix}")
 
 
+def _open_lanes(run_dir: Path, *, writable: bool = False) -> tuple[_TrafficLane, ...]:
+    supplied = Path(run_dir)
+    try:
+        os.lstat(supplied / "traffic")
+    except FileNotFoundError:
+        workspaces = resolve_workspaces(supplied)
+    except OSError as exc:
+        raise TrafficRunError("could not inspect explicit traffic workspace") from exc
+    else:
+        # Preserve exact selection when the operator names a workspace. Run
+        # roots have no direct traffic directory and intentionally aggregate.
+        workspaces = (resolve_workspace(supplied),)
+    if not workspaces:
+        raise TrafficRunError(f"no traffic history found in run directory {run_dir}")
+    lanes: list[_TrafficLane] = []
+    for workspace in workspaces:
+        manifest = read_traffic_manifest(workspace)
+        store = TrafficStore.open(workspace, writable=writable)
+        exchanges = store.exchanges()
+        replays = store.replay_receipts()
+        if any(
+            exchange.capture_session_id != manifest.capture_session_id
+            for exchange in exchanges
+        ) or any(
+            receipt.capture_session_id != manifest.capture_session_id for receipt in replays
+        ):
+            raise TrafficStoreError("traffic store contains records from another capture session")
+        provenance = load_traffic_provenance(
+            workspace,
+            exchanges=exchanges,
+            target_identity=manifest.target_identity,
+        )
+        lanes.append(
+            _TrafficLane(
+                name=_lane_name(workspace),
+                workspace=workspace,
+                manifest=manifest,
+                store=store,
+                exchanges=exchanges,
+                replays=replays,
+                provenance=provenance,
+            )
+        )
+    if lanes:
+        expected_boundary = _lane_manifest_boundary(lanes[0].manifest)
+        if any(
+            _lane_manifest_boundary(lane.manifest) != expected_boundary
+            for lane in lanes[1:]
+        ):
+            raise TrafficRunError("traffic histories disagree on target or scope")
+    return tuple(lanes)
+
+
 def _open_store(run_dir: Path, *, writable: bool = False) -> tuple[Path, TrafficStore]:
+    """Open one explicit traffic store for compatibility with internal callers."""
     workspace = resolve_workspace(run_dir)
     manifest = read_traffic_manifest(workspace)
     store = TrafficStore.open(workspace, writable=writable)
+    exchanges = store.exchanges()
+    replays = store.replay_receipts()
     if any(
-        exchange.capture_session_id != manifest.capture_session_id for exchange in store.exchanges()
+        exchange.capture_session_id != manifest.capture_session_id for exchange in exchanges
+    ) or any(
+        receipt.capture_session_id != manifest.capture_session_id for receipt in replays
     ):
         raise TrafficStoreError("traffic store contains records from another capture session")
+    load_traffic_provenance(
+        workspace,
+        exchanges=exchanges,
+        target_identity=manifest.target_identity,
+    )
     return workspace, store
 
 
-def _require_exchange(store: TrafficStore, request_id: str) -> CapturedHttpExchange:
-    exchange = store.exchange(request_id)
-    if exchange is None:
-        raise KeyError(f"unknown request ID: {request_id}")
-    return exchange
+def _select_exchange(
+    lanes: Sequence[_TrafficLane],
+    request_ref: str,
+) -> tuple[_TrafficLane, CapturedHttpExchange]:
+    selected_lane, request_id = _parse_qualified_ref(lanes, request_ref)
+    candidates = (
+        (lane, exchange)
+        for lane in lanes
+        if selected_lane is None or lane.name == selected_lane
+        if (
+            exchange := next(
+                (item for item in lane.exchanges if item.exchange_id == request_id),
+                None,
+            )
+        )
+        is not None
+    )
+    matches = tuple(candidates)
+    if not matches:
+        raise KeyError(f"unknown request ID: {request_ref}")
+    if len(matches) > 1:
+        choices = ", ".join(_qualified_id(lane.name, request_id) for lane, _ in matches)
+        raise TrafficRunError(f"request ID {request_id} is ambiguous; use one of: {choices}")
+    return matches[0]
+
+
+def _select_record(
+    lanes: Sequence[_TrafficLane],
+    record_ref: str,
+) -> tuple[_TrafficLane, str]:
+    selected_lane, record_id = _parse_qualified_ref(lanes, record_ref)
+    matches = tuple(
+        lane
+        for lane in lanes
+        if selected_lane is None or lane.name == selected_lane
+        if _lane_has_record(lane, record_id)
+    )
+    if not matches:
+        raise KeyError(f"unknown traffic record ID: {record_ref}")
+    if len(matches) > 1:
+        choices = ", ".join(_qualified_id(lane.name, record_id) for lane in matches)
+        raise TrafficRunError(f"traffic record ID {record_id} is ambiguous; use one of: {choices}")
+    return matches[0], record_id
+
+
+def _parse_qualified_ref(
+    lanes: Sequence[_TrafficLane],
+    record_ref: str,
+) -> tuple[str | None, str]:
+    lane_name, separator, record_id = record_ref.partition(":")
+    if not separator:
+        return None, record_ref
+    known = {lane.name for lane in lanes}
+    if lane_name not in known:
+        raise ValueError(f"unknown traffic lane: {lane_name}")
+    if not record_id:
+        raise ValueError("qualified traffic ID is missing its record ID")
+    return lane_name, record_id
+
+
+def _lane_has_record(lane: _TrafficLane, record_id: str) -> bool:
+    if record_id.startswith("rq_"):
+        return any(exchange.exchange_id == record_id for exchange in lane.exchanges)
+    if record_id.startswith("rp_"):
+        return any(receipt.replay_id == record_id for receipt in lane.replays)
+    return False
+
+
+def _lane_name(workspace: Path) -> str:
+    if workspace.name == "agent-graph" and workspace.parent.name == "autonomous-route":
+        return "autonomous_graph"
+    return "base"
+
+
+def _lane_manifest_boundary(manifest: TrafficRunManifest) -> tuple[object, ...]:
+    return (
+        manifest.target_url,
+        manifest.target_identity,
+        manifest.origin,
+        manifest.in_scope,
+        manifest.out_of_scope,
+    )
+
+
+def _qualified_id(lane: str, record_id: str) -> str:
+    return f"{lane}:{record_id}"
 
 
 def _bindings(values: Sequence[str], env_values: Sequence[str]) -> dict[str, str]:
@@ -453,10 +657,12 @@ def _assignment(value: str, *, label: str) -> tuple[str, str]:
 def _exchange_summary(
     exchange: CapturedHttpExchange,
     *,
+    request_id: str,
+    lane: str,
     agent_evidence: Mapping[str, object],
 ) -> dict[str, object]:
-    return {
-        "id": exchange.exchange_id,
+    payload: dict[str, object] = {
+        "id": request_id,
         "method": exchange.request_method,
         "url": exchange.request_url,
         "resource_type": exchange.request_resource_type,
@@ -467,6 +673,9 @@ def _exchange_summary(
         "unresolved_slots": list(exchange.unresolved_slots),
         "agent_evidence": dict(agent_evidence),
     }
+    if lane:
+        payload["lane"] = lane
+    return payload
 
 
 def _evidence_list_suffix(link: AgentHttpEvidenceLink) -> str:
@@ -505,6 +714,8 @@ def _replay_command_skeleton(
     run_dir: Path,
     exchange: CapturedHttpExchange,
     origin: str,
+    *,
+    request_id: str | None = None,
 ) -> tuple[str, ...]:
     if exchange.replayability == "not_replayable":
         return ("This blocked request is not replayable.",)
@@ -526,7 +737,7 @@ def _replay_command_skeleton(
         "traffic",
         "replay",
         str(run_dir),
-        exchange.exchange_id,
+        request_id or exchange.exchange_id,
         *bindings,
     ]
     if not is_local_url(origin):

@@ -8,6 +8,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
 import socket
 import ssl
 import stat
@@ -21,7 +22,7 @@ from http.client import HTTPConnection, HTTPMessage, HTTPResponse, HTTPSConnecti
 from http.cookiejar import CookieJar
 from typing import IO, TYPE_CHECKING, Protocol, cast
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import unquote_plus, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import (
     HTTPCookieProcessor,
     HTTPHandler,
@@ -48,6 +49,8 @@ from ravage.traffic.policy import (
     TrafficPolicyController,
     TrafficPolicyError,
 )
+from ravage.traffic.redaction import redact_text as redact_traffic_text
+from ravage.traffic.redaction import sanitize_url
 from ravage.web_core.proof_recognizer import recognize_proofs
 from ravage.web_core.scope_policy import (
     assert_authorized_target,
@@ -98,8 +101,10 @@ _MAX_HTTP_STATE_BYTES = 262_144
 _HTTP_STATE_READ_CHUNK_BYTES = 65_536
 _PRIVATE_FILE_MODE = 0o600
 _MAX_NETWORK_PORT = 65_535
+_MAX_PROOF_CANONICALIZATION_PASSES = 16
 _IPV6_VERSION = 6
 _MANAGED_AUTH_HEADERS = frozenset({"authorization", "cookie"})
+_REQUEST_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 
 
 class ScopedHttpError(ValueError):
@@ -198,25 +203,57 @@ class ManagedGraphAuthentication(Protocol):
 class ManagedAuthenticationScopedHttpTransport:
     """Adapt managed ``ProbeSession`` requests to the graph HTTP transport."""
 
-    def __init__(self, authentication: ManagedGraphAuthentication) -> None:
+    def __init__(
+        self,
+        authentication: ManagedGraphAuthentication,
+        *,
+        persistent_session: bool = False,
+    ) -> None:
         identity = str(getattr(authentication, "identity", "")).strip()
         if not identity:
             raise ScopedHttpError("managed graph authentication identity is required")
         self.authentication = authentication
+        self.persistent_session = persistent_session
         self._session: ProbeSession | None = None
+        self._action_active = False
+
+    @property
+    def cookies(self) -> object | None:
+        session = self._session
+        return getattr(session, "cookies", None) if session is not None else None
 
     def begin_action(self, *, timeout_seconds: float) -> None:
         """Lease one disposable identity lane for a complete redirect chain."""
-        if self._session is not None:
+        if self._action_active:
             raise ScopedHttpError("managed authentication action session is already active")
-        try:
-            self._session = self.authentication.session_for_model_action(
-                timeout_seconds=max(int(timeout_seconds), 1)
-            )
-        except Exception:  # noqa: BLE001 - owner failures are never artifact-safe.
-            raise ScopedHttpError("managed authentication action session failed") from None
+        if self._session is None:
+            try:
+                self._session = self.authentication.session_for_model_action(
+                    timeout_seconds=max(int(timeout_seconds), 1)
+                )
+            except Exception:  # noqa: BLE001 - owner failures are never artifact-safe.
+                raise ScopedHttpError("managed authentication action session failed") from None
+        self._action_active = True
 
     def end_action(self) -> None:
+        if not self._action_active:
+            return
+        self._action_active = False
+        if self.persistent_session:
+            return
+        session = self._session
+        self._session = None
+        if session is None:
+            return
+        try:
+            self.authentication.retire_probe_session(session)
+        except Exception:  # noqa: BLE001 - cleanup details can contain auth material.
+            raise ScopedHttpError("managed authentication action cleanup failed") from None
+
+    def close(self) -> None:
+        """Retire a retained managed session exactly once at lane shutdown."""
+        if self._action_active:
+            raise ScopedHttpError("managed authentication action session is still active")
         session = self._session
         self._session = None
         if session is None:
@@ -659,7 +696,7 @@ class ScopedGraphHttpExecutor:
     request, including each redirect hop, is validated and independently counted.
     """
 
-    def __init__(
+    def __init__(  # noqa: C901 - validates all executor ownership boundaries.
         self,
         *,
         target_url: str,
@@ -677,6 +714,8 @@ class ScopedGraphHttpExecutor:
         minimum_request_count: int = 0,
         authentication: ManagedGraphAuthentication | None = None,
         traffic_policy: TrafficPolicyController | None = None,
+        cache_anonymous_gets: bool = True,
+        persistent_managed_session: bool = False,
     ) -> None:
         assert_authorized_target(
             target_url,
@@ -721,6 +760,7 @@ class ScopedGraphHttpExecutor:
         ):
             raise ScopedHttpError("traffic policy belongs to a different target origin")
         self.authentication = authentication
+        self.cache_anonymous_gets = cache_anonymous_gets
         policy_config = getattr(bound_traffic_policy, "config", None)
         self._require_public_addresses = bool(
             getattr(policy_config, "require_public_addresses", False)
@@ -734,7 +774,10 @@ class ScopedGraphHttpExecutor:
             else ""
         )
         self.transport = (
-            ManagedAuthenticationScopedHttpTransport(authentication)
+            ManagedAuthenticationScopedHttpTransport(
+                authentication,
+                persistent_session=persistent_managed_session,
+            )
             if authentication is not None
             else transport or UrllibScopedHttpTransport(self._validated_transport_pins)
         )
@@ -743,7 +786,7 @@ class ScopedGraphHttpExecutor:
         self.traffic_observer = traffic_observer
         self._require_existing_state = require_existing_state
         self._minimum_request_count = minimum_request_count
-        request_count, pins = self._load_state()
+        request_count, pins, session_dirty = self._load_state()
         if request_count < minimum_request_count:
             raise ScopedHttpError(
                 "remote HTTP state request count is behind captured traffic history"
@@ -757,6 +800,7 @@ class ScopedGraphHttpExecutor:
                 "remote HTTP state request count does not match captured traffic history"
             )
         self._pins = pins
+        self._session_dirty = session_dirty
         self._pin_lock = threading.Lock()
         self._execution_lock = threading.Lock()
         self._gate = _RequestGate(
@@ -767,15 +811,44 @@ class ScopedGraphHttpExecutor:
             on_acquire=self._persist_state,
         )
         self._managed_request_acquisitions: list[tuple[int, float]] = []
-        if authentication is not None:
-            authentication.configure_request_gate(
-                cast(Callable[[str, str], None], self._account_managed_request)
-            )
         self._persist_state(request_count)
 
     @property
     def request_count(self) -> int:
         return self._gate.request_count
+
+    @property
+    def session_dirty(self) -> bool:
+        """Whether an anonymous cookie jar changed since its last clean start."""
+        return self._session_dirty
+
+    def mark_session_dirty(self) -> None:
+        if self._session_dirty:
+            return
+        self._session_dirty = True
+        self._persist_state(self.request_count)
+
+    def clear_session_dirty(self) -> None:
+        if not self._session_dirty:
+            return
+        self._session_dirty = False
+        self._persist_state(self.request_count)
+
+    def close(self) -> None:
+        transport = self.transport
+        if isinstance(transport, ManagedAuthenticationScopedHttpTransport):
+            try:
+                transport.close()
+            except BaseException as exc:
+                if self.authentication is not None:
+                    _cleanup_preserving(
+                        exc,
+                        lambda: self.authentication.configure_request_gate(None),
+                        message="managed authentication gate cleanup also failed",
+                    )
+                raise
+            if self.authentication is not None:
+                self.authentication.configure_request_gate(None)
 
     def __call__(
         self,
@@ -798,6 +871,7 @@ class ScopedGraphHttpExecutor:
         arguments: dict[str, object],
         action_id: str,
     ) -> ActionExecution:
+        authored_proofs = _request_authored_proofs(arguments)
         method, url, headers, body, timeout = _request_from_arguments(
             arguments,
             target_url=self.target_url,
@@ -820,7 +894,19 @@ class ScopedGraphHttpExecutor:
             if not isinstance(self.transport, ManagedAuthenticationScopedHttpTransport):
                 raise ScopedHttpError("managed authentication transport binding is invalid")
             managed_transport = self.transport
-            managed_transport.begin_action(timeout_seconds=timeout)
+            self.authentication.configure_request_gate(
+                cast("Callable[[str, str], None]", self._account_managed_request)
+            )
+            try:
+                managed_transport.begin_action(timeout_seconds=timeout)
+            except BaseException as exc:
+                _cleanup_preserving(
+                    exc,
+                    lambda: self.authentication.configure_request_gate(None),
+                    message="managed authentication gate cleanup also failed",
+                )
+                raise
+        action_error: BaseException | None = None
         try:
             for redirect_index in range(self.profile.max_redirects + 1):
                 if redirect_index > 0:
@@ -828,14 +914,51 @@ class ScopedGraphHttpExecutor:
                     self._verify_dns_pin(url)
                 attempt_index = 0
                 while True:
-                    dispatch = self._dispatch_request(
-                        method=method,
-                        url=url,
-                        headers=headers,
-                        body=body,
-                        timeout=timeout,
-                        attempt_index=attempt_index,
-                    )
+                    request_count_before = self.request_count
+                    try:
+                        dispatch = self._dispatch_request(
+                            method=method,
+                            url=url,
+                            headers=headers,
+                            body=body,
+                            timeout=timeout,
+                            attempt_index=attempt_index,
+                        )
+                    except BaseException as exc:
+                        # The gate commits at the physical dispatch boundary. If
+                        # transport control flow is then interrupted, close the
+                        # matching traffic half before preserving the interrupt.
+                        if (
+                            self.authentication is None
+                            and self.request_count > request_count_before
+                        ):
+                            interrupted = ScopedHttpTransportResponse(
+                                status=None,
+                                url=self._safe_url(url),
+                                headers={},
+                                body=b"",
+                                elapsed_ms=0,
+                                error=(
+                                    f"{type(exc).__name__}:"
+                                    "transport dispatch interrupted"
+                                ),
+                            )
+                            try:
+                                self._record_traffic(
+                                    observation_id=observation_id,
+                                    method=method,
+                                    url=self._safe_url(url),
+                                    headers=headers,
+                                    body=body,
+                                    response=interrupted,
+                                    response_body=b"",
+                                )
+                            except BaseException as capture_error:
+                                exc.add_note(
+                                    "interrupted HTTP traffic capture also failed: "
+                                    f"{type(capture_error).__name__}"
+                                )
+                        raise
                     raw_response = dispatch.response
                     raw_location = _header(raw_response.headers, "location")
                     response, decoded_body = self._redacted_response(raw_response)
@@ -843,7 +966,7 @@ class ScopedGraphHttpExecutor:
                         traffic_exchange_id = self._record_traffic(
                             observation_id=observation_id,
                             method=method,
-                            url=self._redact_text(url),
+                            url=self._safe_url(url),
                             headers=headers,
                             body=body,
                             response=response,
@@ -857,7 +980,7 @@ class ScopedGraphHttpExecutor:
                             redirect_index=redirect_index,
                             attempt_index=attempt_index,
                             method=method,
-                            url=self._redact_text(url),
+                            url=self._safe_url(url),
                             headers=headers,
                             body=body,
                             delay_seconds=dispatch.delay_seconds,
@@ -904,9 +1027,37 @@ class ScopedGraphHttpExecutor:
                     }
                 headers = next_headers
                 url = next_url
+        except BaseException as exc:
+            action_error = exc
+            raise
         finally:
+            cleanup_error = action_error
             if managed_transport is not None:
-                managed_transport.end_action()
+                if cleanup_error is None:
+                    try:
+                        managed_transport.end_action()
+                    except BaseException as exc:
+                        cleanup_error = exc
+                else:
+                    _cleanup_preserving(
+                        cleanup_error,
+                        managed_transport.end_action,
+                        message="managed authentication action cleanup also failed",
+                    )
+            if self.authentication is not None:
+                if cleanup_error is None:
+                    try:
+                        self.authentication.configure_request_gate(None)
+                    except BaseException as exc:
+                        cleanup_error = exc
+                else:
+                    _cleanup_preserving(
+                        cleanup_error,
+                        lambda: self.authentication.configure_request_gate(None),
+                        message="managed authentication gate cleanup also failed",
+                    )
+            if action_error is None and cleanup_error is not None:
+                raise cleanup_error
         if response is None:
             raise RuntimeError("remote HTTP executor produced no response")
 
@@ -946,11 +1097,15 @@ class ScopedGraphHttpExecutor:
             sort_keys=True,
         )
         proofs = []
-        if self.proof_recognition_enabled and response.status is not None:
+        if (
+            self.proof_recognition_enabled
+            and response.status is not None
+            and authored_proofs is not None
+        ):
             proofs = [
                 proof
                 for proof in recognize_proofs(decoded_body)
-                if not self._contains_secret(proof)
+                if proof not in authored_proofs and not self._contains_secret(proof)
             ]
         return ActionExecution(
             result=ActionResult(
@@ -1023,7 +1178,7 @@ class ScopedGraphHttpExecutor:
             lane="agent_http",
             identity_alias="anonymous",
             identity_generation=0,
-            cacheable=method in {"GET", "HEAD"},
+            cacheable=self.cache_anonymous_gets and method in {"GET", "HEAD"},
             retryable=method in {"GET", "HEAD"},
         )
         try:
@@ -1141,17 +1296,22 @@ class ScopedGraphHttpExecutor:
         response: ScopedHttpTransportResponse,
     ) -> tuple[ScopedHttpTransportResponse, str]:
         decoded_body = _decode_body(response.body, response.headers)
-        if self.authentication is None:
-            return response, decoded_body
-        safe_body = self._redact_text(decoded_body)
-        safe_error = self._redact_text(response.error)
-        safe_headers = {
-            str(name): self._redact_text(str(value)) for name, value in response.headers.items()
-        }
+        safe_body = (
+            decoded_body if self.authentication is None else self._redact_text(decoded_body)
+        )
+        safe_error = redact_traffic_text(self._redact_text(response.error), max_chars=2_048)
+        safe_headers = (
+            dict(response.headers)
+            if self.authentication is None
+            else {
+                str(name): self._redact_text(str(value))
+                for name, value in response.headers.items()
+            }
+        )
         return (
             ScopedHttpTransportResponse(
                 status=response.status,
-                url=self._redact_text(response.url),
+                url=self._safe_url(response.url),
                 headers=safe_headers,
                 body=safe_body.encode("utf-8"),
                 elapsed_ms=response.elapsed_ms,
@@ -1160,6 +1320,9 @@ class ScopedGraphHttpExecutor:
             ),
             safe_body,
         )
+
+    def _safe_url(self, value: str) -> str:
+        return sanitize_url(self._redact_text(value))
 
     def _redact_text(self, value: str) -> str:
         authentication = self.authentication
@@ -1265,11 +1428,11 @@ class ScopedGraphHttpExecutor:
 
     def _load_state(  # noqa: C901, PLR0912, PLR0915 - one fail-closed state boundary.
         self,
-    ) -> tuple[int, dict[tuple[str, int], tuple[str, ...]]]:
+    ) -> tuple[int, dict[tuple[str, int], tuple[str, ...]], bool]:
         if self.state_path is None:
             if self._require_existing_state or self._minimum_request_count:
                 raise ScopedHttpError("remote HTTP resume state path is required")
-            return 0, {}
+            return 0, {}, False
         try:
             descriptor = os.open(
                 self.state_path,
@@ -1280,7 +1443,7 @@ class ScopedGraphHttpExecutor:
                 raise ScopedHttpError(
                     "remote HTTP resume state is missing; refusing to reset request limits"
                 ) from None
-            return 0, {}
+            return 0, {}, False
         except OSError as exc:
             raise ScopedHttpError(f"cannot read remote HTTP state: {exc}") from exc
         try:
@@ -1338,7 +1501,10 @@ class ScopedGraphHttpExecutor:
             if key in pins:
                 raise ScopedHttpError("remote HTTP state DNS pin is duplicated")
             pins[key] = tuple(sorted(set(addresses)))
-        return raw_count, pins
+        raw_session_dirty = payload.get("session_dirty", False)
+        if not isinstance(raw_session_dirty, bool):
+            raise ScopedHttpError("remote HTTP state session marker is invalid")
+        return raw_count, pins, raw_session_dirty
 
     def _persist_state(self, request_count: int) -> None:
         if self.state_path is None:
@@ -1358,6 +1524,7 @@ class ScopedGraphHttpExecutor:
             "profile": self.profile.to_json(),
             "request_count": request_count,
             "dns_pins": pins,
+            "session_dirty": self._session_dirty,
         }
         encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
         if len(encoded) > _MAX_HTTP_STATE_BYTES:
@@ -1421,6 +1588,40 @@ def _target_identity(target_url: str) -> str:
     return f"target:{digest}"
 
 
+def _request_authored_proofs(
+    arguments: Mapping[str, object],
+) -> frozenset[str] | None:
+    """Return proof-shaped tokens supplied by the caller, including URL encoding."""
+    texts: list[str] = []
+    for key in ("url", "path", "body"):
+        value = arguments.get(key)
+        if value is not None:
+            texts.append(str(value))
+    for key in ("form", "json"):
+        value = arguments.get(key)
+        if value is not None:
+            texts.append(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str))
+    headers = arguments.get("headers")
+    if isinstance(headers, Mapping):
+        for name, value in headers.items():
+            texts.extend((str(name), str(value)))
+
+    proofs: set[str] = set()
+    for text in texts:
+        decoded = text
+        for _index in range(_MAX_PROOF_CANONICALIZATION_PASSES):
+            proofs.update(recognize_proofs(decoded))
+            unquoted = unquote_plus(decoded)
+            if unquoted == decoded:
+                break
+            decoded = unquoted
+        else:
+            # If canonicalization cannot reach a stable form within the work
+            # bound, fail closed by disabling automatic proof capture.
+            return None
+    return frozenset(proofs)
+
+
 def _request_from_arguments(
     arguments: Mapping[str, object],
     *,
@@ -1452,7 +1653,7 @@ def _request_from_arguments(
     return method, url, headers, body, timeout
 
 
-def _request_headers(
+def _request_headers(  # noqa: C901 - validates each header trust boundary.
     value: object,
     *,
     stable_user_agent: str,
@@ -1469,11 +1670,15 @@ def _request_headers(
         "Accept-Encoding": "identity",
         "User-Agent": stable_user_agent,
     }
+    seen_names: set[str] = set()
     for raw_name, raw_value in raw_headers.items():
-        name = str(raw_name).strip()
-        if not name or "\n" in name or "\r" in name:
+        name = str(raw_name)
+        if _REQUEST_HEADER_NAME_RE.fullmatch(name) is None:
             raise ScopedHttpError("http_request header name is invalid")
         lowered = name.lower()
+        if lowered in seen_names:
+            raise ScopedHttpError(f"http_request header is duplicated: {name}")
+        seen_names.add(lowered)
         if lowered in _BLOCKED_REQUEST_HEADERS:
             raise ScopedHttpError(f"http_request header is blocked: {name}")
         if managed_authentication and lowered in _MANAGED_AUTH_HEADERS:
@@ -1485,6 +1690,9 @@ def _request_headers(
         rendered = str(raw_value)
         if "\n" in rendered or "\r" in rendered:
             raise ScopedHttpError(f"http_request header value is invalid: {name}")
+        for existing_name in tuple(headers):
+            if existing_name.casefold() == lowered:
+                headers.pop(existing_name)
         headers[name] = rendered
     return headers
 
@@ -1513,7 +1721,7 @@ def _request_body(
         if not isinstance(value, (Mapping, list)):
             raise ScopedHttpError("http_request json must be an object or list")
         encoded = json.dumps(value, ensure_ascii=False, sort_keys=True).encode()
-        headers.setdefault("Content-Type", "application/json")
+        _set_default_header(headers, "Content-Type", "application/json")
     else:
         if not isinstance(value, Mapping):
             raise ScopedHttpError("http_request form must be an object")
@@ -1525,13 +1733,20 @@ def _request_body(
         if len(fields) != len(value):
             raise ScopedHttpError("http_request form values must be scalar")
         encoded = urlencode(fields).encode()
-        headers.setdefault(
+        _set_default_header(
+            headers,
             "Content-Type",
             "application/x-www-form-urlencoded",
         )
     if len(encoded) > _MAX_REQUEST_BODY_BYTES:
         raise ScopedHttpError("http_request body exceeds the byte limit")
     return encoded
+
+
+def _set_default_header(headers: dict[str, str], name: str, value: str) -> None:
+    if any(existing.casefold() == name.casefold() for existing in headers):
+        return
+    headers[name] = value
 
 
 def _request_receipt(
@@ -1559,7 +1774,9 @@ def _request_receipt(
         "url": url,
         "request_header_names": sorted(headers),
         "request_body_bytes": len(body or b""),
-        "request_body_sha256": hashlib.sha256(body or b"").hexdigest(),
+        # A digest of a password, token, or short form value is an offline
+        # verifier. Preserve size/shape only, matching the traffic contract.
+        "request_body_sha256": "unavailable",
         "scheduled_delay_seconds": round(delay_seconds, 6),
         "status": response.status,
         "response_url": response.url,
@@ -1683,7 +1900,11 @@ def _header(headers: Mapping[str, str], name: str) -> str:
 def _observation_response_headers(headers: Mapping[str, str]) -> dict[str, str]:
     return {
         str(name): (
-            "[REDACTED]" if str(name).lower() in _SENSITIVE_RESPONSE_HEADERS else str(value)
+            "[REDACTED]"
+            if str(name).lower() in _SENSITIVE_RESPONSE_HEADERS
+            else sanitize_url(value)
+            if str(name).lower() == "location"
+            else redact_traffic_text(value, max_chars=1_024)
         )
         for name, value in headers.items()
     }

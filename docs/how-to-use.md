@@ -31,6 +31,11 @@ The no-model `surface_map` scan is the recommended first check. An included
 lab, observer, agent graph, full probe set, and benchmarks remain
 [optional](#optional-workflows).
 
+Ravage's structured HTTP follow-up is request-aware gray-box testing, not
+white-box testing. It replays and mutates request templates observed from the
+running application and typed Ravage evidence. It does not assume source-code,
+server, database, or deployment access.
+
 ## Install Once
 
 Ravage currently runs from a source checkout. Install Python 3.12, then run:
@@ -289,10 +294,10 @@ Ravage loads `.env.ravage` directly; do not shell-source it.
 
 Authorized remote attacks default to the whole-run low-noise policy. It shares
 one durable physical-request ledger across authentication, recon, probes, PoC
-replay, and structured graph HTTP; defaults to 300 physical requests and 0.5
-requests per second; and disables opaque command, Python, browser-process, and
-external-process actions. Override the conservative limits when the written ROE
-requires less traffic:
+replay, and structured base and graph HTTP; defaults to 300 physical requests
+and 0.5 requests per second; and disables opaque command, Python,
+browser-process, and external-process actions. Override the conservative limits
+when the written ROE requires less traffic:
 
 ```bash
 ravage attack ravage-brief.yaml \
@@ -330,9 +335,10 @@ snapshot is not silently rewritten. Native recon and JavaScript discovery feed
 the base graph. OpenAPI, GraphQL, built-in probes, and strict value-free external
 observation batches contribute when those typed results pass through an
 executor-owned native probe. The graph route also imports its own typed captured
-HTTP exchanges. Standalone `ravage traffic capture` history is not automatically
-merged into either attack snapshot. Query/body/header values and response bodies
-are omitted from the graph.
+HTTP exchanges, while base `http_request` exchanges update the base snapshot.
+Standalone `ravage traffic capture` history is not automatically merged into
+either attack snapshot. Query/body/header values and response bodies are omitted
+from the graph.
 
 For a remote target, `--authorized-remote-target` is mandatory. HTTP requests,
 redirects, and routed HTTP(S) browser subresources are checked at URL scope.
@@ -399,12 +405,16 @@ Every attack writes these main outputs:
 - `RUN_DIR/workspace/transcript.jsonl`: model and tool transcript;
 - `RUN_DIR/workspace/traffic-policy.json`: durable physical-request ledger;
 - `RUN_DIR/workspace/working_state.json`: base state and surface-graph snapshot;
+- `RUN_DIR/workspace/agent-http-state.json`, `traffic/`, and
+  `evidence-blackboard.json`: private base structured-HTTP artifacts, when used;
 - `RUN_DIR/workspace/artifacts/`: larger captured artifacts.
 
 If the bounded agent graph starts, its current state and events live below
 `RUN_DIR/workspace/autonomous-route/agent-graph/`. The base and graph state files
 use the same surface-graph schema, but the nested graph snapshot can advance
-beyond the retained base snapshot.
+beyond the retained base snapshot. The graph's HTTP state, traffic store, and
+evidence blackboard also live below that nested directory; Ravage keeps the two
+lane stores separate on disk.
 
 Verify the audit chain:
 
@@ -427,23 +437,43 @@ ravage report RUN_DIR --brief ravage-brief.yaml
 
 ### Inspect automatic agent HTTP evidence
 
-If the attack enters the bounded `agent-graph` route, its structured HTTP
-requests are captured automatically; do not start a separate browser capture.
-The history includes every followed redirect as its own request and records
-transport-failure metadata when no HTTP status is available. The normal traffic
-commands discover the nested graph workspace from the printed attack run:
+Base `http_request` actions and bounded `agent-graph` structured HTTP actions
+are captured automatically; do not start a separate browser capture for them.
+Each lane has its own private traffic and evidence store. The histories include
+every followed redirect as its own request and record transport-failure metadata
+when no HTTP status is available. The normal traffic commands discover both
+lanes from the printed attack run:
 
 ```bash
 ravage traffic list RUN_DIR
-ravage traffic show RUN_DIR REQUEST_ID
+ravage traffic show RUN_DIR base:rq_0001
+ravage traffic replay RUN_DIR autonomous_graph:rq_0001
+ravage traffic diff RUN_DIR \
+  autonomous_graph:rq_0001 autonomous_graph:rp_0001
 ```
+
+If only one lane exists, short IDs such as `rq_0001` keep working. When both
+lanes exist, `list` emits `base:` and `autonomous_graph:` qualified IDs because
+both stores can contain the same local ID. An unqualified ID is accepted only
+when it is unique across the run. Replay stays in the selected lane, and `diff`
+requires both records to come from that same lane/store. Pass the exact
+manifested workspace path when you deliberately want to inspect only one lane
+with its short local IDs.
 
 Human output shows link status and counts. Add `--json` for stable fields such
 as `observation_id`, `evidence_refs`, and `material_evidence_refs`. These are
 identifier-only joins to the validated evidence blackboard: evidence payloads,
 request values, and response bodies are not copied into CLI output. The
 Markdown report has an **Agent HTTP Evidence** section, and `report.json` has
-the corresponding `agent_http_evidence` object.
+the corresponding `agent_http_evidence` object. Report links are also
+lane-qualified so local request-ID collisions are unambiguous.
+
+Report finalization binds every traffic lane and traffic-policy ledger to the
+report target and the brief's exact scope, so a history copied from another
+engagement is rejected. For an older run whose saved target contains redacted
+query values or normalized path placeholders, omit `--target-url` and let
+`ravage report` use that run's persisted-safe target; the original raw target
+identity cannot be reconstructed from a legacy artifact.
 
 Agent capture is part of the evidence boundary. If Ravage cannot durably save a
 structured agent request, that action fails before its observation can be
@@ -628,7 +658,7 @@ Use `ravage traffic` when you want a short, operator-driven request history
 without starting an attack or spending model credits. For a local application:
 
 This manual Playwright workflow is separate from the automatic structured-HTTP
-history produced by an `agent-graph` attack.
+history produced by base and `agent-graph` attack actions.
 
 This workflow currently requires macOS, Linux, or WSL because its private
 artifact permissions and cross-process locks rely on POSIX filesystem
@@ -830,9 +860,13 @@ lane uses `--tool-runtime docker`. An authenticated remote resume keeps the
 same `--identity` and does not need Docker. Do not reuse an old
 run directory for a fresh attack; leave `--run-dir` unset and let Ravage create
 a timestamped one. Deterministic scans do not use this attack-resume flow.
-For an `agent-graph` resume, Ravage reopens the same traffic session and reloads
-the structured HTTP request count and DNS pins, so interruption cannot reset the
-request ceiling or silently resolve a different destination.
+For base and `agent-graph` structured HTTP, Ravage reopens each durable traffic
+lane and reloads its request count and DNS pins, so interruption cannot reset
+the request ceiling or silently resolve a different destination. Anonymous
+cookie values are deliberately never written to disk: a resumed process starts
+a new in-memory cookie jar and releases work tied to the old session so the
+agent must authenticate again. Partial or inconsistent HTTP-state, traffic, and
+evidence artifacts fail closed.
 The base agent reopens the same `workspace/traffic-policy.json` ledger as well,
 so authentication, recon, native probes, PoC replay, and graph HTTP retain one
 physical-request total across the resume. An eligible opaque process action in

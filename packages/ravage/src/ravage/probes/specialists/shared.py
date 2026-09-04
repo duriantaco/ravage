@@ -23,6 +23,14 @@ def _generic_input_targets(state: AgentState, *, limit: int) -> list[dict[str, o
     targets: list[dict[str, object]] = []
     reflected = _reflected_input_names(state)
     for target in _parameter_targets(state, limit=limit):
+        if any(
+            source.casefold().startswith("surface_graph:")
+            for source in _string_items(target.get("sources"))
+        ):
+            # Canonical graph parameters must retain their physical location;
+            # the aggregate legacy projection cannot safely associate one URL
+            # with one of several body/query provenance labels.
+            continue
         input_name = str(target.get("name") or "")
         priority = _int_value(target.get("priority"))
         priority += _input_name_priority(input_name)
@@ -35,8 +43,10 @@ def _generic_input_targets(state: AgentState, *, limit: int) -> list[dict[str, o
                 "input": input_name,
                 "hints": _string_items(target.get("hints")),
                 "priority": priority,
+                "authority": _parameter_target_authority(target),
             }
         )
+    targets.extend(_surface_graph_query_targets(state, reflected=reflected))
     for form in _form_targets(state, limit=limit):
         action = str(form.get("action") or state.surface.get("target_url") or "")
         if not action:
@@ -55,6 +65,7 @@ def _generic_input_targets(state: AgentState, *, limit: int) -> list[dict[str, o
                     "form": form,
                     "hints": _string_items(form.get("categories")),
                     "priority": priority,
+                    "authority": "target_observed",
                 }
             )
     for target in _signal_parameter_targets(state, reflected=reflected, limit=limit):
@@ -62,6 +73,7 @@ def _generic_input_targets(state: AgentState, *, limit: int) -> list[dict[str, o
     for endpoint in _signal_endpoints(state):
         endpoint_query_names = _query_param_names_from_url(endpoint)
         names = endpoint_query_names or _common_param_names(endpoint)
+        authority = "observed_input" if endpoint_query_names else "inferred"
         endpoint_priority = _endpoint_input_priority(endpoint)
         endpoint_priority += _endpoint_query_bonus(endpoint_query_names)
         for name in names:
@@ -72,11 +84,16 @@ def _generic_input_targets(state: AgentState, *, limit: int) -> list[dict[str, o
                     "kind": _endpoint_target_kind(endpoint),
                     "url": endpoint,
                     "input": name,
-                    "hints": ["observed_input_name"],
+                    "hints": [
+                        "observed_input_name"
+                        if endpoint_query_names
+                        else "inferred_input_name"
+                    ],
                     "priority": 24
                     + endpoint_priority
                     + _input_name_priority(name)
                     + _rendered_text_input_bonus(name),
+                    "authority": authority,
                 }
             )
     deduped: dict[tuple[str, str, str], dict[str, object]] = {}
@@ -134,6 +151,7 @@ def _rendered_text_input_bonus(name: str) -> int:
             "bio",
             "text",
             "author",
+            "sentence",
         ),
     ):
         return 16
@@ -153,14 +171,72 @@ def _target_should_replace_previous(
 ) -> bool:
     if previous is None:
         return True
+    authority = _target_authority_rank(target)
+    previous_authority = _target_authority_rank(previous)
+    if authority != previous_authority:
+        return authority < previous_authority
     return _int_value(target.get("priority")) > _int_value(previous.get("priority"))
 
 
-def _target_sort_key(item: dict[str, object]) -> tuple[int, str, str]:
+def _target_sort_key(item: dict[str, object]) -> tuple[int, int, str, str]:
+    authority = _target_authority_rank(item)
     priority = -_int_value(item.get("priority"))
     url = str(item.get("url"))
     input_name = str(item.get("input"))
-    return priority, url, input_name
+    return authority, priority, url, input_name
+
+
+def _target_authority_rank(target: dict[str, object]) -> int:
+    authority = str(target.get("authority") or "")
+    if authority == "target_observed":
+        return 0
+    if authority == "observed_input":
+        return 1
+    return 2
+
+
+def _parameter_target_authority(target: dict[str, object]) -> str:
+    sources = {item.casefold() for item in _string_items(target.get("sources"))}
+    if any(
+        source in {
+            "surface_graph:body",
+            "surface_graph:form",
+            "surface_graph:graphql",
+            "surface_graph:query",
+        }
+        for source in sources
+    ):
+        return "target_observed"
+    return "observed_input"
+
+
+def _surface_graph_query_targets(
+    state: AgentState,
+    *,
+    reflected: set[str],
+) -> list[dict[str, object]]:
+    targets: list[dict[str, object]] = []
+    for operation in (state.surface_graph.operations or {}).values():
+        if not operation.actionable or operation.method.upper() not in {"GET", "HEAD"}:
+            continue
+        for parameter in operation.parameters:
+            if parameter.location != "query":
+                continue
+            input_name = parameter.name
+            priority = _input_name_priority(input_name)
+            priority += _rendered_text_input_bonus(input_name)
+            priority += _reflected_priority_bonus(input_name, reflected)
+            targets.append(
+                {
+                    "kind": "query_param",
+                    "url": operation.structural_url,
+                    "input": input_name,
+                    "hints": list(operation.hints),
+                    "priority": priority,
+                    "authority": "target_observed",
+                }
+            )
+    return targets[:128]
 
 
 def _send_target(session: ProbeSession, target: dict[str, object], value: str) -> ProbeResponse:
@@ -521,9 +597,9 @@ def _cookie_signal_values(state: AgentState) -> list[str]:
 
 
 def _name_looks_expression_context(name: str, url: str) -> bool:
-    text = f"{name} {url}".lower()
-    return _contains_marker(
-        text,
+    lowered_name = name.lower()
+    if _contains_marker(
+        lowered_name,
         (
             "term",
             "amount",
@@ -534,6 +610,25 @@ def _name_looks_expression_context(name: str, url: str) -> bool:
             "years",
             "value",
             "expression",
+            "calc",
+            "amort",
+            "total",
+            "date",
+            "time",
+            "remind",
+            "reminder",
+            "notify",
+            "schedule",
+        ),
+    ):
+        return True
+    lowered_url = url.lower()
+    return _contains_marker(
+        lowered_url,
+        (
+            "amount",
+            "principal",
+            "payment",
             "calc",
             "amort",
             "total",
@@ -646,6 +741,7 @@ def _parameter_target_sort_key(item: dict[str, object]) -> tuple[int, str]:
 
 def _form_targets(state: AgentState, *, limit: int) -> list[dict[str, object]]:
     forms = _list_of_dicts(state.surface.get("forms"))
+    forms.extend(_surface_graph_form_targets(state))
     forms.extend(_signal_form_targets(state))
     deduped: dict[tuple[str, str, str], dict[str, object]] = {}
     for form in forms:
@@ -659,6 +755,39 @@ def _form_targets(state: AgentState, *, limit: int) -> list[dict[str, object]]:
     ordered = list(deduped.values())
     ordered.sort(key=_form_target_sort_key)
     return ordered[:limit]
+
+
+def _surface_graph_form_targets(state: AgentState) -> list[dict[str, object]]:
+    """Rebuild value-free specialist forms from trusted canonical declarations."""
+    forms: list[dict[str, object]] = []
+    for operation in (state.surface_graph.operations or {}).values():
+        if not operation.actionable or "form" not in operation.hints:
+            continue
+        method = operation.method.upper()
+        if method not in {"GET", "POST"}:
+            continue
+        inputs = [
+            {
+                "name": parameter.name,
+                "type": "text",
+                "value": "",
+                "required": parameter.required,
+            }
+            for parameter in operation.parameters
+            if parameter.location in {"form", "query"}
+        ]
+        if not inputs:
+            continue
+        forms.append(
+            {
+                "action": operation.structural_url,
+                "method": method,
+                "inputs": inputs,
+                "categories": list(operation.hints),
+                "source": "surface_graph",
+            }
+        )
+    return forms[:64]
 
 
 def _form_target_sort_key(item: dict[str, object]) -> tuple[int, str]:
@@ -752,6 +881,7 @@ def _signal_parameter_targets(
                     "input": name,
                     "hints": ["observed_parameter_name"],
                     "priority": priority,
+                    "authority": "observed_input",
                 }
             )
     targets.sort(key=_target_sort_key)

@@ -1,17 +1,27 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
+from ravage.traffic.redaction import redact_headers, redact_text, sanitize_url
 from ravage.web_core.http_probe import ProbeResponse, ProbeSession
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from ravage.traffic.policy import TrafficPolicyController
+
+
+_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"})
+_BODYLESS_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_MAX_STEPS = 12
+_MAX_ARTIFACT_ERROR_CHARS = 2_048
+_EMBEDDED_URL_RE = re.compile(
+    r"(?i)(?:https?://[^\s'\"<>]+|(?<![A-Za-z0-9:/])/[^\s'\"<>]*[?#][^\s'\"<>]+)"
+)
 
 
 @dataclass(frozen=True)
@@ -70,6 +80,13 @@ def validate_http_poc(
         target_url
     ):
         raise ValueError("validate_http_poc session belongs to a different target")
+    step_errors = _step_validation_errors(steps)
+    if step_errors:
+        return ValidationResult(
+            ok=False,
+            summary="validate_poc contains invalid steps",
+            errors=[_artifact_text(error) for error in step_errors],
+        )
     if session is None and request is None:
         session = ProbeSession(
             target_url,
@@ -86,10 +103,7 @@ def validate_http_poc(
     errors: list[str] = []
     required_checks = 0
     passed_checks = 0
-    for index, raw_step in enumerate(steps[:12], start=1):
-        if not isinstance(raw_step, dict):
-            errors.append(f"step {index} is not an object")
-            continue
+    for index, raw_step in enumerate(steps, start=1):
         response = _execute_step(
             session,
             raw_step,
@@ -98,7 +112,10 @@ def validate_http_poc(
             timeout_seconds=timeout_seconds,
         )
         step_result = _evaluate_step(index=index, step=raw_step, response=response)
-        safe_step_result = _redacted_mapping(step_result, redact=redact)
+        safe_step_result = _redacted_mapping(
+            _sanitize_step_result(step_result),
+            redact=redact,
+        )
         _notify_step(
             on_step,
             index=index,
@@ -159,13 +176,14 @@ def _notify_step(
         _redacted_mapping(
             {
                 "index": index,
-                "method": str(step.get("method") or "GET"),
-                "url": str(step.get("url") or ""),
+                "method": str(step.get("method") or "GET").upper(),
+                "url": _artifact_url(_step_location(step)),
                 "form": form if isinstance(form, dict) else None,
                 "status": response.status,
                 "ok": ok if isinstance(ok, bool) else None,
-                "headers": dict(response.headers) if isinstance(response.headers, dict) else {},
+                "headers": _artifact_response_headers(response.headers),
                 "body": response.body,
+                "error": _artifact_text(response.error),
             },
             redact=redact,
         )
@@ -181,13 +199,13 @@ def _execute_step(
     timeout_seconds: int,
 ) -> ProbeResponse:
     method = str(step.get("method") or "GET").upper()
-    url = str(step.get("url") or target_url)
+    url = _step_location(step, fallback=target_url)
     headers = _string_dict(step.get("headers"))
-    form = _string_dict(step.get("form"))
-    if form:
+    data: bytes | None
+    if step.get("form") is not None:
+        form = _string_dict(step.get("form"))
         data = urlencode(form).encode("utf-8")
         headers = {"Content-Type": "application/x-www-form-urlencoded", **headers}
-        method = "POST"
     else:
         body = step.get("body")
         data = _request_body_bytes(body)
@@ -222,9 +240,10 @@ def _redacted_text(
     *,
     redact: Callable[[object], object] | None,
 ) -> str:
+    artifact_safe = _artifact_text(value)
     if redact is None:
-        return value
-    safe = redact(value)
+        return artifact_safe
+    safe = redact(artifact_safe)
     if not isinstance(safe, str):
         raise TypeError("validate_http_poc redactor must preserve text values")
     return safe
@@ -297,8 +316,8 @@ def _evaluate_step(
         "index": index,
         "request": {
             "method": str(step.get("method") or "GET").upper(),
-            "url": str(step.get("url") or ""),
-            "has_body": step.get("body") is not None or bool(step.get("form")),
+            "url": _step_location(step),
+            "has_body": step.get("body") is not None or step.get("form") is not None,
         },
         "response": response.summary(body_chars=300),
         "checks": checks,
@@ -306,6 +325,59 @@ def _evaluate_step(
         "passed_checks": _passed_check_count(checks),
         "errors": errors,
     }
+
+
+def _sanitize_step_result(result: dict[str, object]) -> dict[str, object]:
+    sanitized = dict(result)
+    request = result.get("request")
+    if isinstance(request, dict):
+        safe_request = dict(request)
+        safe_request["url"] = _artifact_url(request.get("url"))
+        sanitized["request"] = safe_request
+    response = result.get("response")
+    if isinstance(response, dict):
+        safe_response = dict(response)
+        safe_response["url"] = _artifact_url(response.get("url"))
+        safe_response["final_url"] = _artifact_url(response.get("final_url"))
+        safe_response["headers"] = _artifact_response_headers(response.get("headers"))
+        safe_response["error"] = _artifact_text(response.get("error"))
+        sanitized["response"] = safe_response
+    checks = result.get("checks")
+    if isinstance(checks, list):
+        safe_checks: list[object] = []
+        for check in checks:
+            if not isinstance(check, dict):
+                safe_checks.append(check)
+                continue
+            safe_check = dict(check)
+            expected = check.get("expected")
+            if isinstance(expected, str):
+                safe_check["expected"] = _artifact_text(expected)
+            safe_checks.append(safe_check)
+        sanitized["checks"] = safe_checks
+    raw_errors = result.get("errors")
+    if isinstance(raw_errors, list):
+        sanitized["errors"] = [_artifact_text(error) for error in raw_errors]
+    return sanitized
+
+
+def _artifact_url(value: object) -> str:
+    text = str(value or "").strip()
+    return sanitize_url(text) if text else ""
+
+
+def _artifact_response_headers(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return dict(redact_headers(value, response=True))
+
+
+def _artifact_text(value: object) -> str:
+    text = _EMBEDDED_URL_RE.sub(
+        lambda match: sanitize_url(match.group(0)),
+        str(value or ""),
+    )
+    return redact_text(text, max_chars=_MAX_ARTIFACT_ERROR_CHARS)
 
 
 def _passed_check_count(checks: list[dict[str, object]]) -> int:
@@ -323,6 +395,55 @@ def _string_dict(value: object) -> dict[str, str]:
     for key, item in value.items():
         result[str(key)] = str(item)
     return result
+
+
+def _step_validation_errors(steps: list[object]) -> list[str]:
+    if len(steps) > _MAX_STEPS:
+        return [f"validate_poc accepts at most {_MAX_STEPS} steps"]
+    errors: list[str] = []
+    for index, step in enumerate(steps, start=1):
+        error = _step_validation_error(step)
+        if error:
+            errors.append(f"step {index} {error}")
+    return errors
+
+
+def _step_validation_error(value: object) -> str:  # noqa: C901, PLR0911
+    if not isinstance(value, dict):
+        return "must be an object"
+    for location_field in ("url", "path"):
+        location = value.get(location_field)
+        if location is not None and not isinstance(location, str):
+            return f"{location_field} must be a string"
+    if not _step_location(value):
+        return "requires url or path"
+
+    method = str(value.get("method") or "GET").strip().upper()
+    if method not in _HTTP_METHODS:
+        return f"method is not allowed: {method}"
+    if value.get("headers") is not None and not isinstance(value.get("headers"), dict):
+        return "headers must be an object"
+    if value.get("json") is not None:
+        return "does not support json; encode JSON in body and set Content-Type"
+
+    body_fields = [name for name in ("body", "form") if value.get(name) is not None]
+    if len(body_fields) > 1:
+        return "accepts only one of body or form"
+    if method in _BODYLESS_HTTP_METHODS and body_fields:
+        return f"{method} request cannot include a body"
+    if value.get("form") is not None and not isinstance(value.get("form"), dict):
+        return "form must be an object"
+    if value.get("body") is not None and not isinstance(value.get("body"), str):
+        return "body must be a string"
+    return ""
+
+
+def _step_location(step: dict[str, Any], *, fallback: str = "") -> str:
+    for field_name in ("url", "path"):
+        value = step.get(field_name)
+        if isinstance(value, str) and value.strip():
+            return value
+    return fallback
 
 
 def _int_or_none(value: object) -> int | None:

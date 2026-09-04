@@ -1557,7 +1557,7 @@ def test_attack_result_distinguishes_confirmed_findings_from_candidate_signals(
     workspace.mkdir()
     traffic_policy = TrafficPolicyController.open(
         workspace / "traffic-policy.json",
-        target_url="http://127.0.0.1:8765",
+        target_url="https://example.test",
         config=TrafficPolicyConfig(),
     )
     traffic_policy.record_unmetered_action()

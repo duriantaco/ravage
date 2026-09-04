@@ -25,6 +25,12 @@ PACKAGES = (
         ROOT / "packages/ravage/src/ravage/_version.py",
     ),
 )
+ROOT_PYPROJECT = ROOT / "pyproject.toml"
+CITATION_FILE = ROOT / "CITATION.cff"
+RELEASE_MANIFEST = ROOT / "tools/release/.release-please-manifest.json"
+LOCK_FILE = ROOT / "uv.lock"
+CHANGELOG_FILE = ROOT / "CHANGELOG.md"
+WORKSPACE_PROJECTS = ("pentest-agent", "ravage", "ravage-schemas")
 
 
 def main() -> int:
@@ -62,7 +68,9 @@ def main() -> int:
         )
 
     expected = next(iter(versions.values()))
+    errors.extend(_workspace_version_errors(expected))
     errors.extend(_release_ref_errors(expected, os.environ))
+    errors.extend(_release_changelog_errors(expected, os.environ))
 
     if errors:
         for error in errors:
@@ -71,6 +79,39 @@ def main() -> int:
 
     sys.stdout.write(f"release check passed: {next(iter(versions.values()))}\n")
     return 0
+
+
+def _workspace_version_errors(expected: str) -> list[str]:
+    declared: dict[str, str] = {}
+    root_project = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))["project"]
+    declared[str(root_project["name"])] = str(root_project["version"])
+
+    manifest = json.loads(RELEASE_MANIFEST.read_text(encoding="utf-8"))
+    manifest_version = manifest.get(".") if isinstance(manifest, dict) else None
+    declared["release-please manifest"] = str(manifest_version)
+
+    citation_match = re.search(
+        r"^version:\s*['\"]?([^\s'\"]+)",
+        CITATION_FILE.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    declared["CITATION.cff"] = citation_match.group(1) if citation_match else "<missing>"
+
+    lock = tomllib.loads(LOCK_FILE.read_text(encoding="utf-8"))
+    locked_packages = lock.get("package", [])
+    for project_name in WORKSPACE_PROJECTS:
+        matches = [
+            str(item.get("version"))
+            for item in locked_packages
+            if isinstance(item, dict) and item.get("name") == project_name
+        ]
+        declared[f"uv.lock:{project_name}"] = matches[0] if len(matches) == 1 else "<missing>"
+
+    return [
+        f"{source} version {version!r} does not match package version {expected!r}"
+        for source, version in declared.items()
+        if version != expected
+    ]
 
 
 def _release_ref_errors(expected_version: str, environ: Mapping[str, str]) -> list[str]:
@@ -84,6 +125,28 @@ def _release_ref_errors(expected_version: str, environ: Mapping[str, str]) -> li
     if tag != expected_tag:
         return [f"release tag {tag!r} does not match package version {expected_tag}"]
     return []
+
+
+def _release_changelog_errors(
+    expected_version: str,
+    environ: Mapping[str, str],
+) -> list[str]:
+    is_tag_context, _ = _github_tag_context(environ)
+    if not is_tag_context:
+        return []
+    escaped = re.escape(expected_version)
+    plain_heading = re.compile(rf"^## {escaped} - \d{{4}}-\d{{2}}-\d{{2}}$", re.MULTILINE)
+    linked_heading = re.compile(
+        rf"^## \[{escaped}\]\([^\n)]+\) \(\d{{4}}-\d{{2}}-\d{{2}}\)$",
+        re.MULTILINE,
+    )
+    changelog = CHANGELOG_FILE.read_text(encoding="utf-8")
+    if plain_heading.search(changelog) or linked_heading.search(changelog):
+        return []
+    return [
+        f"CHANGELOG.md is missing a dated {expected_version} release heading; "
+        "move the release notes out of Unreleased before tagging"
+    ]
 
 
 def _github_tag_context(environ: Mapping[str, str]) -> tuple[bool, str | None]:

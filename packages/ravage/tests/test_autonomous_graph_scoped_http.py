@@ -8,6 +8,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import replace
 from email.message import Message
 from typing import TYPE_CHECKING
+from urllib.parse import quote
 
 import pytest
 from pentest_schemas import Scope
@@ -189,6 +190,7 @@ def _executor(
     require_existing_state: bool = False,
     minimum_request_count: int = 0,
     traffic_policy: TrafficPolicyController | None = None,
+    proof_recognition_enabled: bool = False,
 ) -> ScopedGraphHttpExecutor:
     selected_clock = clock or FakeClock()
     return ScopedGraphHttpExecutor(
@@ -204,6 +206,7 @@ def _executor(
         resolver=resolver or (lambda _host, _port: (TARGET_ADDRESS,)),
         clock=selected_clock,
         sleeper=selected_clock.sleep,
+        proof_recognition_enabled=proof_recognition_enabled,
         state_path=state_path,
         traffic_observer=traffic_observer,
         require_existing_state=require_existing_state,
@@ -367,6 +370,7 @@ def test_remote_http_uses_stable_identity_and_auditable_receipt() -> None:
     assert request.headers["User-Agent"] == "ravage-authorized-assessment/1.0"
     assert payload["profile"]["name"] == "low-noise"
     assert payload["requests"][0]["sequence"] == 1
+    assert payload["requests"][0]["request_body_sha256"] == "unavailable"
     assert payload["response"]["body"] == "remote body"
     assert execution.result.evidence_source_kind == "tool_http_request"
     assert execution.observation_id.startswith("http:")
@@ -418,6 +422,158 @@ def test_managed_authentication_owns_request_and_redacts_all_observations(
     [exchange] = store.exchanges()
     assert exchange.identity_alias == authentication.identity
     assert authentication.secret not in (store.root / "exchanges.jsonl").read_text(encoding="utf-8")
+
+
+def test_persistent_managed_authentication_reuses_and_retires_one_session() -> None:
+    authentication = FakeManagedAuthentication()
+    executor = ScopedGraphHttpExecutor(
+        target_url=TARGET_URL,
+        scope=Scope(in_scope=[TARGET_URL], out_of_scope=[]),
+        allow_remote_target=True,
+        profile=graph_operational_profile(
+            GraphOperationalProfileName.LOW_NOISE,
+            roe_max_rps=5,
+            max_total_requests=4,
+        ),
+        resolver=lambda _host, _port: (TARGET_ADDRESS,),
+        authentication=authentication,
+        persistent_managed_session=True,
+    )
+    assert authentication.request_gate is None
+
+    executor(
+        node_id="node-auth-1",
+        arguments={"method": "GET", "path": "/app/first"},
+        action_id="action-auth-1",
+    )
+    assert authentication.request_gate is None
+    assert executor.request_count == 1
+    authentication.request("GET", TARGET_URL)
+    assert executor.request_count == 1
+    executor(
+        node_id="node-auth-2",
+        arguments={"method": "GET", "path": "/app/second"},
+        action_id="action-auth-2",
+    )
+
+    assert authentication.request_gate is None
+    assert executor.request_count == 2
+    assert len(authentication.calls) == 3
+    assert authentication.retired_sessions == []
+    executor.close()
+    assert len(authentication.retired_sessions) == 1
+    executor.close()
+    assert len(authentication.retired_sessions) == 1
+
+
+def test_response_urls_locations_and_errors_are_secret_safe() -> None:
+    secret = "plain-query-secret"  # noqa: S105 - redaction fixture.
+    response_url = f"{TARGET_URL}?token={secret}#private-fragment"
+    transport = QueuedTransport(
+        [
+            ScopedHttpTransportResponse(
+                status=200,
+                url=response_url,
+                headers={
+                    "Content-Type": "text/plain",
+                    "Location": f"/next?password={secret}#private-fragment",
+                },
+                body=b"ok",
+                elapsed_ms=3,
+                error=f"upstream failed with password={secret}",
+            )
+        ]
+    )
+
+    execution = _executor(transport)(
+        node_id="node-safe-artifact",
+        arguments={"method": "GET", "path": "/app/safe"},
+        action_id="action-safe-artifact",
+    )
+
+    evidence = execution.result.evidence_observation
+    visible = execution.result.observation
+    assert secret not in evidence
+    assert secret not in visible
+    assert "private-fragment" not in evidence
+    payload = json.loads(evidence)
+    assert "token" in payload["response"]["final_url"]
+    assert "password" in payload["response"]["headers"]["Location"]
+
+
+def test_request_rejects_case_insensitive_duplicate_headers_before_dispatch() -> None:
+    transport = QueuedTransport([_response()])
+
+    with pytest.raises(ScopedHttpError, match="duplicated"):
+        _executor(transport)(
+            node_id="node-duplicate-header",
+            arguments={
+                "method": "GET",
+                "path": "/app/safe",
+                "headers": {"X-Trace": "first", "x-trace": "second"},
+            },
+            action_id="action-duplicate-header",
+        )
+
+    assert transport.calls == []
+
+
+def test_request_rejects_non_token_header_name_before_dispatch() -> None:
+    transport = QueuedTransport([_response()])
+
+    with pytest.raises(ScopedHttpError, match="header name is invalid"):
+        _executor(transport)(
+            node_id="node-invalid-header",
+            arguments={
+                "method": "GET",
+                "path": "/app/safe",
+                "headers": {"flag{caller_authored_header_name_7c2e91}": "1"},
+            },
+            action_id="action-invalid-header",
+        )
+
+    assert transport.calls == []
+
+
+def test_executor_filters_proof_authored_in_encoded_header_name() -> None:
+    proof = "flag{caller_authored_header_name_7c2e91}"
+    encoded_header_name = quote(proof, safe="")
+    transport = QueuedTransport([_response(body=proof.encode())])
+
+    execution = _executor(
+        transport,
+        proof_recognition_enabled=True,
+    )(
+        node_id="node-encoded-header-proof",
+        arguments={
+            "method": "GET",
+            "path": "/app/echo-headers",
+            "headers": {encoded_header_name: "1"},
+        },
+        action_id="action-encoded-header-proof",
+    )
+
+    assert encoded_header_name in transport.calls[0].headers
+    assert execution.result.flag == ""
+
+
+def test_executor_filters_triple_percent_encoded_authored_proof() -> None:
+    proof = "flag{caller_authored_triple_encoded_7c2e91}"
+    encoded = proof
+    for _index in range(3):
+        encoded = quote(encoded, safe="")
+    transport = QueuedTransport([_response(body=proof.encode())])
+
+    execution = _executor(
+        transport,
+        proof_recognition_enabled=True,
+    )(
+        node_id="node-triple-encoded-proof",
+        arguments={"method": "GET", "path": f"/app/echo?value={encoded}"},
+        action_id="action-triple-encoded-proof",
+    )
+
+    assert execution.result.flag == ""
 
 
 def test_managed_traffic_uses_exact_wire_bytes_without_persisting_content(tmp_path) -> None:
@@ -678,6 +834,258 @@ def test_managed_auth_lifecycle_requests_share_persisted_target_ceiling(
             arguments={"path": "/app/private"},
             action_id="action-auth-resume",
         )
+
+
+def test_managed_internal_interrupt_does_not_fabricate_outer_route_traffic(
+    tmp_path: Path,
+) -> None:
+    class HealthOnlyInterruptingAuthentication(FakeManagedAuthentication):
+        def request(
+            self,
+            method: str,
+            url: str,
+            *,
+            data: bytes | None = None,
+            headers: dict[str, str] | None = None,
+            timeout_seconds: float | None = None,
+        ) -> ProbeResponse:
+            del method, url, data, headers, timeout_seconds
+            self.account_physical_request("GET", f"{TARGET_URL}/health")
+            raise KeyboardInterrupt
+
+    store = TrafficStore.create(tmp_path / "workspace")
+    recorder = ProbeTrafficRecorder(
+        store,
+        capture_session_id="managed-interrupt-test",
+        source="agent_http",
+        strict=True,
+    )
+    state_path = tmp_path / "managed-http-state.json"
+    authentication = HealthOnlyInterruptingAuthentication()
+    executor = ScopedGraphHttpExecutor(
+        target_url=TARGET_URL,
+        scope=Scope(in_scope=[TARGET_URL], out_of_scope=[]),
+        allow_remote_target=True,
+        profile=graph_operational_profile(
+            GraphOperationalProfileName.LOW_NOISE,
+            roe_max_rps=5,
+            max_total_requests=3,
+        ),
+        resolver=lambda _host, _port: (TARGET_ADDRESS,),
+        state_path=state_path,
+        traffic_observer=recorder,
+        authentication=authentication,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        executor(
+            node_id="node-auth-interrupt",
+            arguments={"path": "/app/never-sent"},
+            action_id="action-auth-interrupt",
+        )
+
+    assert executor.request_count == 1
+    assert json.loads(state_path.read_text(encoding="utf-8"))["request_count"] == 1
+    assert not store.exchanges()
+    assert len(authentication.retired_sessions) == 1
+    assert authentication.request_gate is None
+
+
+def test_managed_begin_failure_is_not_masked_by_gate_cleanup_failure() -> None:
+    class FailingAuthentication(FakeManagedAuthentication):
+        def session_for_model_action(
+            self,
+            *,
+            timeout_seconds: int = 10,
+        ) -> FakeManagedSession:
+            del timeout_seconds
+            raise RuntimeError("session-start-primary")
+
+        def configure_request_gate(
+            self,
+            gate: Callable[[str, str], object] | None,
+        ) -> None:
+            if gate is None:
+                raise OSError("gate-cleanup-secondary")
+            super().configure_request_gate(gate)
+
+    executor = ScopedGraphHttpExecutor(
+        target_url=TARGET_URL,
+        scope=Scope(in_scope=[TARGET_URL], out_of_scope=[]),
+        allow_remote_target=True,
+        profile=graph_operational_profile(
+            GraphOperationalProfileName.LOW_NOISE,
+            roe_max_rps=5,
+            max_total_requests=3,
+        ),
+        resolver=lambda _host, _port: (TARGET_ADDRESS,),
+        authentication=FailingAuthentication(),
+    )
+
+    with pytest.raises(
+        ScopedHttpError,
+        match="managed authentication action session failed",
+    ) as error:
+        executor(
+            node_id="node-auth-begin-failure",
+            arguments={"path": "/app/private"},
+            action_id="action-auth-begin-failure",
+        )
+
+    assert any(
+        "managed authentication gate cleanup also failed: OSError" in note
+        for note in getattr(error.value, "__notes__", ())
+    )
+
+
+def test_managed_action_failure_survives_end_and_gate_cleanup_failures() -> None:
+    class FailingAuthentication(FakeManagedAuthentication):
+        def request(
+            self,
+            method: str,
+            url: str,
+            *,
+            data: bytes | None = None,
+            headers: dict[str, str] | None = None,
+            timeout_seconds: float | None = None,
+        ) -> ProbeResponse:
+            del data, headers, timeout_seconds
+            self.account_physical_request(method, url)
+            raise KeyboardInterrupt
+
+        def retire_probe_session(self, session: FakeManagedSession) -> None:
+            self.retired_sessions.append(session)
+            raise RuntimeError("action-cleanup-secondary")
+
+        def configure_request_gate(
+            self,
+            gate: Callable[[str, str], object] | None,
+        ) -> None:
+            if gate is None:
+                raise OSError("gate-cleanup-tertiary")
+            super().configure_request_gate(gate)
+
+    executor = ScopedGraphHttpExecutor(
+        target_url=TARGET_URL,
+        scope=Scope(in_scope=[TARGET_URL], out_of_scope=[]),
+        allow_remote_target=True,
+        profile=graph_operational_profile(
+            GraphOperationalProfileName.LOW_NOISE,
+            roe_max_rps=5,
+            max_total_requests=3,
+        ),
+        resolver=lambda _host, _port: (TARGET_ADDRESS,),
+        authentication=FailingAuthentication(),
+    )
+
+    with pytest.raises(KeyboardInterrupt) as error:
+        executor(
+            node_id="node-auth-action-failure",
+            arguments={"path": "/app/private"},
+            action_id="action-auth-action-failure",
+        )
+
+    notes = getattr(error.value, "__notes__", ())
+    assert any(
+        "managed authentication action cleanup also failed: ScopedHttpError" in note
+        for note in notes
+    )
+    assert any(
+        "managed authentication gate cleanup also failed: OSError" in note
+        for note in notes
+    )
+
+
+def test_managed_end_action_failure_is_not_masked_by_gate_cleanup_failure() -> None:
+    class FailingAuthentication(FakeManagedAuthentication):
+        def retire_probe_session(self, session: FakeManagedSession) -> None:
+            self.retired_sessions.append(session)
+            raise RuntimeError("action-cleanup-primary")
+
+        def configure_request_gate(
+            self,
+            gate: Callable[[str, str], object] | None,
+        ) -> None:
+            if gate is None:
+                raise OSError("gate-cleanup-secondary")
+            super().configure_request_gate(gate)
+
+    executor = ScopedGraphHttpExecutor(
+        target_url=TARGET_URL,
+        scope=Scope(in_scope=[TARGET_URL], out_of_scope=[]),
+        allow_remote_target=True,
+        profile=graph_operational_profile(
+            GraphOperationalProfileName.LOW_NOISE,
+            roe_max_rps=5,
+            max_total_requests=3,
+        ),
+        resolver=lambda _host, _port: (TARGET_ADDRESS,),
+        authentication=FailingAuthentication(),
+    )
+
+    with pytest.raises(
+        ScopedHttpError,
+        match="managed authentication action cleanup failed",
+    ) as error:
+        executor(
+            node_id="node-auth-end-failure",
+            arguments={"path": "/app/private"},
+            action_id="action-auth-end-failure",
+        )
+
+    assert any(
+        "managed authentication gate cleanup also failed: OSError" in note
+        for note in getattr(error.value, "__notes__", ())
+    )
+
+
+def test_managed_close_failure_is_not_masked_by_gate_cleanup_failure() -> None:
+    class FailingAuthentication(FakeManagedAuthentication):
+        fail_gate_cleanup = False
+
+        def retire_probe_session(self, session: FakeManagedSession) -> None:
+            self.retired_sessions.append(session)
+            raise RuntimeError("close-primary")
+
+        def configure_request_gate(
+            self,
+            gate: Callable[[str, str], object] | None,
+        ) -> None:
+            if gate is None and self.fail_gate_cleanup:
+                raise OSError("gate-cleanup-secondary")
+            super().configure_request_gate(gate)
+
+    authentication = FailingAuthentication()
+    executor = ScopedGraphHttpExecutor(
+        target_url=TARGET_URL,
+        scope=Scope(in_scope=[TARGET_URL], out_of_scope=[]),
+        allow_remote_target=True,
+        profile=graph_operational_profile(
+            GraphOperationalProfileName.LOW_NOISE,
+            roe_max_rps=5,
+            max_total_requests=3,
+        ),
+        resolver=lambda _host, _port: (TARGET_ADDRESS,),
+        authentication=authentication,
+        persistent_managed_session=True,
+    )
+    executor(
+        node_id="node-auth-close",
+        arguments={"path": "/app/private"},
+        action_id="action-auth-close",
+    )
+    authentication.fail_gate_cleanup = True
+
+    with pytest.raises(
+        ScopedHttpError,
+        match="managed authentication action cleanup failed",
+    ) as error:
+        executor.close()
+
+    assert any(
+        "managed authentication gate cleanup also failed: OSError" in note
+        for note in getattr(error.value, "__notes__", ())
+    )
 
 
 def test_managed_begin_dispatch_block_does_not_increment_graph_count(
