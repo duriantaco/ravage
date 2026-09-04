@@ -1351,7 +1351,7 @@ def test_surface_graph_traffic_binding_batches_projection_and_preserves_provenan
     binding.finalize()
     assert len(projections) == 2
     [operation] = (state.surface_graph.operations or {}).values()
-    assert operation.provenance == ("openapi", "probe")
+    assert operation.provenance == ("agent_http_response", "openapi")
 
 
 def test_surface_graph_binding_imports_already_captured_browser_exchange(

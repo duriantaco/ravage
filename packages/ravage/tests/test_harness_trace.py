@@ -40,6 +40,90 @@ def test_harness_trace_redacts_secret_shaped_action_values() -> None:
     assert "flag{REDACTED}" in str(payload)
 
 
+def test_harness_trace_sanitizes_nested_validate_transport_artifacts() -> None:
+    action: dict[str, object] = {
+        "action": "validate_poc",
+        "steps": [
+            {
+                "method": "GET",
+                "url": (
+                    "https://alice:request-password@target.example/callback"
+                    "?view=request-query&token=request-token#request-fragment"
+                ),
+                "headers": {
+                    "Accept": "application/json",
+                    "Authorization": "Bearer request-authorization",
+                    "Referer": "https://source.example/?view=referer-query#referer-fragment",
+                    "X-Debug": "request-header-secret",
+                },
+            }
+        ],
+    }
+    original = json.dumps(action, sort_keys=True)
+
+    payload = sanitize_action(action)
+
+    assert json.dumps(action, sort_keys=True) == original
+    serialized = json.dumps(payload, sort_keys=True)
+    for secret in (
+        "alice",
+        "request-password",
+        "request-query",
+        "request-token",
+        "request-fragment",
+        "request-authorization",
+        "referer-query",
+        "referer-fragment",
+        "request-header-secret",
+    ):
+        assert secret not in serialized
+    steps = payload["steps"]
+    assert isinstance(steps, list)
+    step = steps[0]
+    assert isinstance(step, dict)
+    assert step["url"] == (
+        "https://target.example/callback"
+        "?view=%5BREDACTED%5D&token=%5BREDACTED%5D"
+    )
+    headers = step["headers"]
+    assert isinstance(headers, dict)
+    assert headers == {
+        "accept": "application/json",
+        "authorization": "[REDACTED]",
+        "referer": "[REDACTED]",
+        "x-debug": "[REDACTED]",
+    }
+
+
+def test_harness_exact_fingerprint_cannot_verify_url_or_header_secrets() -> None:
+    def record(secret: str) -> dict[str, object]:
+        action = {
+            "action": "http_request",
+            "method": "GET",
+            "url": f"https://target.example/callback?code={secret}#{secret}",
+            "headers": {"Authorization": f"Bearer {secret}"},
+        }
+        snapshot = state_trace_snapshot(AgentState(turn=1))
+        return attempt_record_payload(
+            turn=1,
+            action_id="action-1",
+            proposed_action=action,
+            selected_action=action,
+            selection_reason="model_proposal",
+            repeat_context="",
+            pre_state=snapshot,
+            post_state=snapshot,
+            outcome={"ok": True, "outcome": "observed", "repeat_count": 1},
+        )
+
+    first = record("first-low-entropy-secret")
+    second = record("second-low-entropy-secret")
+
+    assert first["exact_selected_fingerprint"] == second["exact_selected_fingerprint"]
+    assert "first-low-entropy-secret" not in json.dumps(first, sort_keys=True)
+    assert "second-low-entropy-secret" not in json.dumps(second, sort_keys=True)
+
+
 def test_harness_state_delta_tracks_counts_without_signal_values() -> None:
     state = AgentState(turn=1)
     state.signals["cookies"] = ["session=abc"]

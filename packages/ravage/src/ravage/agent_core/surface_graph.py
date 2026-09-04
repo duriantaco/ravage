@@ -37,6 +37,8 @@ _MAX_METADATA_CHARS = 128
 _MAX_TIMESTAMP_CHARS = 64
 _MIN_HTTP_STATUS = 100
 _MAX_HTTP_STATUS = 599
+_MIN_SUCCESSFUL_HTTP_STATUS = 200
+_FIRST_UNSUCCESSFUL_HTTP_STATUS = 400
 
 _METHOD_RE = re.compile(r"^[A-Z][A-Z0-9_-]{0,31}$")
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.:\[\]-]+")
@@ -116,6 +118,7 @@ _ALLOWED_SOURCE_KINDS = frozenset(
         "graphql",
         "browser",
         "probe",
+        "agent_http_response",
         "external_tool",
         "legacy_import",
     }
@@ -562,19 +565,19 @@ class SurfaceGraphState:
         observed_at: object = "",
     ) -> SurfaceOperation:
         source = _source_kind(source_kind)
-        attack_metadata = source == "probe"
+        route_only_metadata = source in {"probe", "agent_http_response"}
         operation = self.add_operation(
             SurfaceOperation.create(
                 url=url,
                 method=method,
                 selector=selector,
                 # Probe mutations remain access evidence, never discovery
-                # metadata. This also prevents a later trusted observation of
-                # the same method/route from inheriting attacker-made fields.
-                parameters=() if attack_metadata else parameters,
-                content_types=() if attack_metadata else content_types,
-                header_names=() if attack_metadata else header_names,
-                hints=() if attack_metadata else hints,
+                # metadata. A successful agent-authored HTTP request confirms
+                # only the method/route, not its model-authored request fields.
+                parameters=() if route_only_metadata else parameters,
+                content_types=() if route_only_metadata else content_types,
+                header_names=() if route_only_metadata else header_names,
+                hints=() if route_only_metadata else hints,
                 provenance=(source,),
             )
         )
@@ -594,18 +597,34 @@ class SurfaceGraphState:
         return operation
 
     def ingest_exchange(self, exchange: CapturedHttpExchange) -> SurfaceOperation:
-        source = _exchange_source_kind(exchange.source)
-        parameters = _exchange_parameters(exchange)
-        content_types = tuple(
-            value for name, value in exchange.request_headers if name.casefold() == "content-type"
+        successful_agent_http = _successful_agent_http_exchange(exchange)
+        source = (
+            "agent_http_response"
+            if successful_agent_http
+            else _exchange_source_kind(exchange.source)
+        )
+        retain_request_metadata = source not in {"probe", "agent_http_response"}
+        parameters = _exchange_parameters(exchange) if retain_request_metadata else ()
+        content_types = (
+            tuple(
+                value
+                for name, value in exchange.request_headers
+                if name.casefold() == "content-type"
+            )
+            if retain_request_metadata
+            else ()
         )
         return self.add(
             url=exchange.request_url,
             method=exchange.request_method,
             parameters=parameters,
             content_types=content_types,
-            header_names=(name for name, _value in exchange.request_headers),
-            hints=(exchange.request_resource_type,),
+            header_names=(
+                (name for name, _value in exchange.request_headers)
+                if retain_request_metadata
+                else ()
+            ),
+            hints=(exchange.request_resource_type,) if retain_request_metadata else (),
             source_kind=source,
             identity_alias=exchange.identity_alias or "anonymous",
             access_level="response" if exchange.response_status is not None else "request",
@@ -976,6 +995,15 @@ def _exchange_source_kind(source: object) -> str:
     return "probe"
 
 
+def _successful_agent_http_exchange(exchange: CapturedHttpExchange) -> bool:
+    status = exchange.response_status
+    return (
+        exchange.source == "agent_http"
+        and status is not None
+        and _MIN_SUCCESSFUL_HTTP_STATUS <= status < _FIRST_UNSUCCESSFUL_HTTP_STATUS
+    )
+
+
 def _optional_status(value: object) -> int | None:
     if value in (None, ""):
         return None
@@ -1084,7 +1112,7 @@ def _json_mapping_items(
         raise SurfaceGraphError(f"{label} must be an array")
     if any(not isinstance(item, Mapping) for item in value):
         raise SurfaceGraphError(f"{label} must contain only objects")
-    return tuple(value)  # type: ignore[return-value]
+    return tuple(item for item in value if isinstance(item, Mapping))
 
 
 def _json_object_items(value: object, *, label: str) -> tuple[object, ...]:

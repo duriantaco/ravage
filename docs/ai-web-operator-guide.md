@@ -24,6 +24,12 @@ and inside scope.
 Findings are only written after a matching typed probe produces confirmed,
 replayable evidence for the same class, endpoint, and parameter.
 
+The structured HTTP action is request-aware gray-box testing, not white-box
+testing. It follows request templates and typed evidence observed from the
+running application; it does not imply access to source code, server state, or
+internal data. Source-guided workflows apply only when that context is provided
+separately.
+
 HTTP redirects are validated before they are followed. In the optional
 process-capable observe/Docker lane, the runtime records
 `orchestrator/scope_firewall_plan_generated`, applies the container egress
@@ -310,9 +316,25 @@ origin is authorized.
 ## Actions The Model Can Call
 
 The base `ai-web` loop accepts exactly one JSON object per turn. Its public
-action vocabulary is `run_probe`, `run_command`, `run_python`, `validate_poc`,
-`capture_flag`, and `final`. Action-specific fields are top-level; there is no
-generic `args` wrapper:
+action vocabulary is `http_request`, `run_probe`, `run_command`, `run_python`,
+`validate_poc`, `capture_flag`, and `final`. Action-specific fields are
+top-level; there is no generic `args` wrapper. For example, the model can replay
+and mutate an observed form directly:
+
+```json
+{
+  "action": "http_request",
+  "task_id": "<active task id>",
+  "method": "POST",
+  "path": "/search",
+  "headers": {"content-type": "application/x-www-form-urlencoded"},
+  "form": {"q": "bounded test value"},
+  "timeout_seconds": 10,
+  "notes": "preserve the observed search request shape"
+}
+```
+
+A native probe remains a separate action:
 
 ```json
 {
@@ -328,6 +350,11 @@ generic `args` wrapper:
 
 The effective catalog is narrower than the parser vocabulary:
 
+- `http_request` accepts a scoped URL or path and one of `form`, `json`, or
+  textual `body` for methods that allow a body. It preserves one anonymous
+  in-process cookie session, or uses the configured identity's trusted managed
+  owner. Model-authored `Cookie` and `Authorization` overrides remain blocked
+  when a managed identity is active.
 - `run_probe` must select an entry in the current turn's `available_probes`.
 - `validate_poc` replays a short supported control/exploit HTTP sequence. It may
   carry finding metadata, but the executor derives endpoint, proof, and
@@ -340,9 +367,20 @@ The effective catalog is narrower than the parser vocabulary:
 
 A verified `run_probe` result can record a typed finding automatically.
 `report_sqli` and `report_finding` are not public actions; `invalid` is an
-internal parser result, not a model-callable action. Direct `http_*`, `browser_*`,
-scanner-name, and `terminal_*` actions are also not part of the base contract.
-The optional graph uses a separate, profile-dependent tool contract.
+internal parser result, not a model-callable action. Apart from the exact
+`http_request` action, invented `http_*`, `browser_*`, scanner-name, and
+`terminal_*` actions are not part of the base contract. The optional graph uses
+a separate, profile-dependent tool contract.
+
+Observed forms and surface-graph operations are the request templates for
+`http_request`; the agent is instructed to preserve their method, route, body
+location, field names, and active session. When typed evidence creates an
+evidence-lead lock, follow-up dispatches must keep the locked origin, method,
+normalized route, encoding, and affected input locations. Authentication denial
+pauses that exact-route obligation. A real cookie/session change reactivates it,
+while a typed rejection or bounded exhaustion closes it. This reduces guessed
+endpoint and parameter drift; it does not turn a candidate into a finding
+without the normal confirmation gate.
 
 Browser confirmation is reached through an eligible probe such as
 `run_probe dom_execution`, not a direct browser action. In unauthenticated
@@ -567,7 +605,10 @@ Conventional `ravage attack` artifacts under `RUN_DIR`:
   `workspace/transcript.jsonl`;
 - optional process-session records: `workspace/terminal/<session>.jsonl`;
 - larger output artifacts: `workspace/artifacts/`;
-- durable physical-request ledger: `workspace/traffic-policy.json`.
+- durable physical-request ledger: `workspace/traffic-policy.json`;
+- base structured-HTTP state, private traffic, and evidence:
+  `workspace/agent-http-state.json`, `workspace/traffic/`, and
+  `workspace/evidence-blackboard.json`, when the base uses `http_request`.
 
 Canonical JSON finalization is local and does not make model or target requests.
 It atomically replaces an owner-private file. Use `--report` for the additional
@@ -578,8 +619,28 @@ The final `traffic` line and report's `traffic_accounting` object read this
 ledger. `exact` means every target dispatch was metered, `lower bound` means an
 opaque action may have emitted additional traffic, and `unavailable` means the
 ledger is missing or unreadable. If the agent graph starts, its current state
-and events live under `workspace/autonomous-route/agent-graph/`; the root state
-remains the base snapshot.
+and events live under `workspace/autonomous-route/agent-graph/`; its structured
+HTTP state, traffic, and evidence stay in that same nested directory. The root
+state remains the base snapshot, and the two traffic stores are not merged on
+disk.
+
+Inspect either or both automatic HTTP histories from the attack run directory:
+
+```bash
+ravage traffic list RUN_DIR
+ravage traffic show RUN_DIR base:rq_0001
+ravage traffic replay RUN_DIR autonomous_graph:rq_0001
+ravage traffic diff RUN_DIR \
+  autonomous_graph:rq_0001 autonomous_graph:rp_0001
+```
+
+With one traffic lane, the CLI retains short IDs such as `rq_0001`. With both
+base and graph lanes, `list` emits `base:` and `autonomous_graph:` qualified IDs
+because the private stores can reuse their local counters. An unqualified ID is
+accepted only when unique across the run, and `diff` cannot compare records
+from different lane stores. `show` and `diff` are offline; `replay` sends one
+new request under the usual scope and state-change gates. Passing an exact
+manifested workspace path selects only that lane and uses its short local IDs.
 
 Benchmark-run artifacts:
 
@@ -606,6 +667,12 @@ Resume requires the saved traffic-policy ledger and matching configuration. A
 genuinely pre-ledger local/observe workspace with neither a ledger nor its lock
 is migrated once to an observe ledger marked `lower_bound` before target
 traffic; a legacy low-noise workspace without its ledger is rejected.
+
+Structured-HTTP request counts, target bindings, and remote DNS pins survive a
+resume, but anonymous cookie values do not: Ravage never writes the cookie jar
+to disk. A resumed process starts a fresh in-memory session and releases work
+that depended on the old session so the agent must authenticate again. Ravage
+rejects partial or inconsistent HTTP-state, traffic, and evidence artifacts.
 
 Inspect `report.json`, `stdout.log`, `workspace/events.jsonl`, and
 `transcript.jsonl` before resuming so the resumed run has a clear operator

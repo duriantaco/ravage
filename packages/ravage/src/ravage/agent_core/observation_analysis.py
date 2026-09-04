@@ -51,6 +51,22 @@ def extract_probe_signals(text: str) -> dict[str, list[str]]:
     return signals
 
 
+def extract_http_discovery_signals(text: str) -> dict[str, list[str]]:
+    """Extract structural discovery only from an untyped direct HTTP response.
+
+    Direct requests are model-authored mutations. Their responses can reflect
+    those mutations, so raw marker/error/file-content classification must stay
+    with typed probes and validators. HTML and JavaScript request structure is
+    still useful for choosing the next exact replay.
+    """
+    signals: dict[str, list[str]] = {}
+    _collect_form_signals(signals, text)
+    _collect_named_input_signals(signals, text)
+    _collect_attribute_url_signals(signals, text)
+    _collect_javascript_endpoint_signals(signals, text)
+    return signals
+
+
 def observation_facts(text: str) -> list[str]:
     facts: list[str] = []
     lower = text.lower()

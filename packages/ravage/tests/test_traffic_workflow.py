@@ -4,11 +4,13 @@ import json
 import multiprocessing
 import os
 import threading
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
 import ravage.__main__ as cli
+import ravage.traffic.cli as traffic_cli_module
 import ravage.traffic.store as traffic_store_module
 from ravage.__main__ import main
 from ravage.probe_suite_parts.result import ProbeRunResult
@@ -23,6 +25,7 @@ from ravage.traffic.manifest import (
     TrafficRunManifest,
     read_traffic_manifest,
     resolve_workspace,
+    resolve_workspaces,
     write_traffic_manifest,
 )
 from ravage.traffic.recorders import BrowserExchangeRecorder, ProbeTrafficRecorder
@@ -36,6 +39,7 @@ if TYPE_CHECKING:
 _OK_STATUS = 200
 _PRIVATE_FILE_MODE = 0o600
 _CAPTURED_REQUESTS = 2
+_ARGPARSE_ERROR = 2
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -124,12 +128,13 @@ def _exchange(
     method: str = "GET",
     body: bytes | None = None,
     unresolved_slots: tuple[str, ...] = (),
+    capture_session_id: str = "browser-test",
 ) -> CapturedHttpExchange:
     headers = {"Accept": "application/json"}
     if body is not None:
         headers["Content-Type"] = "application/json"
     return build_captured_http_exchange(
-        capture_session_id="browser-test",
+        capture_session_id=capture_session_id,
         source="browser",
         method=method,
         url=url,
@@ -208,7 +213,158 @@ def test_workspace_resolution_finds_nested_agent_graph_and_refuses_ambiguity(
 
     with pytest.raises(TrafficRunError, match="multiple traffic histories"):
         resolve_workspace(run_dir)
+    assert resolve_workspaces(run_dir) == (
+        base_workspace.resolve(),
+        graph_workspace.resolve(),
+    )
+    assert resolve_workspace(base_workspace) == base_workspace.resolve()
     assert resolve_workspace(graph_workspace) == graph_workspace.resolve()
+
+
+def test_workspace_resolution_preserves_a_contained_relative_manifest_workspace(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "legacy-run"
+    workspace = run_dir / "custom-workspace"
+    store = TrafficStore.create(workspace)
+    write_traffic_manifest(
+        workspace,
+        TrafficRunManifest.create(
+            target_url="http://127.0.0.1:4321/",
+            capture_session_id="legacy-layout",
+        ).complete(),
+    )
+    run_dir.joinpath("run.json").write_text(
+        json.dumps({"workspace_dir": "custom-workspace"}),
+        encoding="utf-8",
+    )
+    store.append_exchange(
+        _exchange(
+            "http://127.0.0.1:4321/custom",
+            capture_session_id="legacy-layout",
+        )
+    )
+
+    assert resolve_workspaces(run_dir) == (workspace.resolve(),)
+    assert resolve_workspace(run_dir) == workspace.resolve()
+
+
+def test_plural_workspace_resolution_returns_empty_without_traffic(tmp_path: Path) -> None:
+    empty_run = tmp_path / "empty-run"
+    empty_run.mkdir()
+
+    assert resolve_workspaces(empty_run) == ()
+
+
+def test_plural_workspace_resolution_fails_closed_for_malformed_or_mismatched_lanes(
+    tmp_path: Path,
+) -> None:
+    run_dir, _base_store = _traffic_run(tmp_path, "http://127.0.0.1:4321")
+    base_workspace = run_dir / "workspace"
+    graph_workspace = base_workspace / "autonomous-route" / "agent-graph"
+    TrafficStore.create(graph_workspace)
+
+    # An explicitly supplied valid workspace remains usable, but a run-root
+    # aggregation cannot silently ignore the asserted malformed graph lane.
+    assert resolve_workspace(base_workspace) == base_workspace.resolve()
+    with pytest.raises(TrafficRunError, match="no traffic history found"):
+        resolve_workspaces(run_dir)
+
+    base_manifest = read_traffic_manifest(base_workspace)
+    forged_graph_manifest = replace(
+        TrafficRunManifest.create(
+            target_url="http://127.0.0.1:4321/different-target",
+            capture_session_id="mismatched-graph",
+        ).complete(),
+        target_identity=base_manifest.target_identity,
+    )
+    write_traffic_manifest(graph_workspace, forged_graph_manifest)
+    with pytest.raises(TrafficRunError, match="disagree on target or scope"):
+        resolve_workspaces(run_dir)
+
+
+def test_run_root_cli_rejects_http_state_whose_traffic_lane_is_missing(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    run_dir, _base_store = _traffic_run(tmp_path, "http://127.0.0.1:4321")
+    graph_workspace = run_dir / "workspace" / "autonomous-route" / "agent-graph"
+    graph_workspace.mkdir(parents=True)
+    state_path = graph_workspace / "graph-http-state.json"
+    state_path.write_text('{"version":2,"target_identity":"target:marker"}\n', encoding="utf-8")
+    state_path.chmod(_PRIVATE_FILE_MODE)
+
+    with pytest.raises(
+        TrafficRunError,
+        match="durable HTTP state exists without its canonical traffic history",
+    ):
+        resolve_workspaces(run_dir)
+    with pytest.raises(SystemExit) as stopped:
+        main(["traffic", "list", str(run_dir), "--json"])
+
+    assert stopped.value.code == _ARGPARSE_ERROR
+    assert "durable HTTP state exists without its canonical traffic history" in (
+        capsys.readouterr().err
+    )
+
+
+def test_run_root_cli_rejects_a_looping_canonical_workspace_symlink(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    run_dir, _base_store = _traffic_run(tmp_path, "http://127.0.0.1:4321")
+    graph_parent = run_dir / "workspace" / "autonomous-route"
+    graph_parent.mkdir(parents=True)
+    (graph_parent / "agent-graph").symlink_to("agent-graph", target_is_directory=True)
+
+    with pytest.raises(
+        TrafficRunError,
+        match="could not resolve canonical traffic workspace",
+    ):
+        resolve_workspaces(run_dir)
+    with pytest.raises(SystemExit) as stopped:
+        main(["traffic", "list", str(run_dir), "--json"])
+
+    assert stopped.value.code == _ARGPARSE_ERROR
+    error = capsys.readouterr().err
+    assert "could not resolve canonical traffic workspace" in error
+    assert "Traceback" not in error
+
+
+def test_run_root_cli_revalidates_lane_boundaries_after_resolution(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_url = "http://127.0.0.1:4321"
+    run_dir, _base_store = _traffic_run(tmp_path, target_url)
+    graph_workspace = run_dir / "workspace" / "autonomous-route" / "agent-graph"
+    TrafficStore.create(graph_workspace)
+    write_traffic_manifest(
+        graph_workspace,
+        TrafficRunManifest.create(
+            target_url=target_url,
+            capture_session_id="agent-graph-test",
+        ).complete(),
+    )
+    original_resolver = traffic_cli_module.resolve_workspaces
+
+    def resolve_then_tamper(supplied: Path) -> tuple[Path, ...]:
+        resolved = original_resolver(supplied)
+        manifest_path = graph_workspace / "traffic" / "run.json"
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload["target_url"] = f"{target_url}/different-target"
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+        manifest_path.chmod(_PRIVATE_FILE_MODE)
+        return resolved
+
+    monkeypatch.setattr(traffic_cli_module, "resolve_workspaces", resolve_then_tamper)
+
+    with pytest.raises(SystemExit) as stopped:
+        main(["traffic", "list", str(run_dir), "--json"])
+
+    assert stopped.value.code == _ARGPARSE_ERROR
+    assert "traffic histories disagree on target or scope" in capsys.readouterr().err
 
 
 def test_manifest_rejects_dynamic_scope_paths_and_refuses_external_pointer(
@@ -1082,6 +1238,127 @@ def test_traffic_cli_lists_shows_and_diffs_without_network(
     assert listing["requests"][0]["id"] == "rq_0001"
     assert shown["exchange"]["exchange_id"] == "rq_0001"
     assert difference["right"]["id"] == "rp_0001"
+
+
+def test_traffic_cli_qualifies_and_routes_duplicate_ids_across_both_lanes(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target_url = "http://127.0.0.1:4321"
+    run_dir, base_store = _traffic_run(tmp_path, target_url)
+    graph_workspace = run_dir / "workspace" / "autonomous-route" / "agent-graph"
+    graph_store = TrafficStore.create(graph_workspace)
+    write_traffic_manifest(
+        graph_workspace,
+        TrafficRunManifest.create(
+            target_url=target_url,
+            capture_session_id="agent-graph-test",
+        ).complete(),
+    )
+    base_store.append_exchange(_exchange(f"{target_url}/base"))
+    base_store.append_exchange(_exchange(f"{target_url}/base-only"))
+    graph_store.append_exchange(
+        _exchange(
+            f"{target_url}/graph?token=%5BREDACTED%5D",
+            unresolved_slots=("query.token",),
+            capture_session_id="agent-graph-test",
+        )
+    )
+
+    main(["traffic", "list", str(run_dir), "--json"])
+    listing = json.loads(capsys.readouterr().out)
+
+    assert [item["id"] for item in listing["requests"]] == [
+        "base:rq_0001",
+        "base:rq_0002",
+        "autonomous_graph:rq_0001",
+    ]
+    assert [item["lane"] for item in listing["requests"]] == [
+        "base",
+        "base",
+        "autonomous_graph",
+    ]
+    assert [item["lane"] for item in listing["workspaces"]] == [
+        "base",
+        "autonomous_graph",
+    ]
+
+    main(["traffic", "list", str(run_dir / "workspace"), "--json"])
+    explicit_base = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in explicit_base["requests"]] == ["rq_0001", "rq_0002"]
+    assert all("lane" not in item for item in explicit_base["requests"])
+    assert "workspaces" not in explicit_base
+
+    with pytest.raises(SystemExit) as ambiguous:
+        main(["traffic", "show", str(run_dir), "rq_0001", "--json"])
+    assert ambiguous.value.code == _ARGPARSE_ERROR
+    ambiguity_error = capsys.readouterr().err
+    assert "request ID rq_0001 is ambiguous" in ambiguity_error
+    assert "base:rq_0001" in ambiguity_error
+    assert "autonomous_graph:rq_0001" in ambiguity_error
+
+    main(["traffic", "show", str(run_dir), "rq_0002", "--json"])
+    unique = json.loads(capsys.readouterr().out)
+    assert unique["lane"] == "base"
+    assert unique["qualified_id"] == "base:rq_0002"
+
+    main(
+        [
+            "traffic",
+            "show",
+            str(run_dir),
+            "autonomous_graph:rq_0001",
+            "--json",
+        ]
+    )
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["lane"] == "autonomous_graph"
+    assert shown["qualified_id"] == "autonomous_graph:rq_0001"
+    assert shown["exchange"]["request"]["url"].startswith(f"{target_url}/graph")
+
+    with pytest.raises(SystemExit) as blocked:
+        main(
+            [
+                "traffic",
+                "replay",
+                str(run_dir),
+                "autonomous_graph:rq_0001",
+                "--json",
+            ]
+        )
+    assert blocked.value.code == _ARGPARSE_ERROR
+    replay = json.loads(capsys.readouterr().out)
+    assert replay["lane"] == "autonomous_graph"
+    assert replay["qualified_id"] == "autonomous_graph:rp_0001"
+    assert replay["source_request_ref"] == "autonomous_graph:rq_0001"
+
+    main(
+        [
+            "traffic",
+            "diff",
+            str(run_dir),
+            "autonomous_graph:rq_0001",
+            "autonomous_graph:rp_0001",
+            "--json",
+        ]
+    )
+    difference = json.loads(capsys.readouterr().out)
+    assert difference["lane"] == "autonomous_graph"
+    assert difference["left_ref"] == "autonomous_graph:rq_0001"
+    assert difference["right_ref"] == "autonomous_graph:rp_0001"
+
+    with pytest.raises(SystemExit) as cross_lane:
+        main(
+            [
+                "traffic",
+                "diff",
+                str(run_dir),
+                "base:rq_0001",
+                "autonomous_graph:rq_0001",
+            ]
+        )
+    assert cross_lane.value.code == _ARGPARSE_ERROR
+    assert "same lane/store" in capsys.readouterr().err
 
 
 def test_show_prints_a_complete_remote_mutation_replay_skeleton(

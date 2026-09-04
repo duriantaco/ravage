@@ -12,6 +12,7 @@ from ravage.agent_core.action_executor import ActionResult, _clip_probe_text, ex
 from ravage.agent_core.action_parser import parse_action
 from ravage.agent_core.agent_state import AgentState
 from ravage.agent_core.agent_strategy import observation_digest
+from ravage.agent_core.evidence_lead_lock import pending_lead
 from ravage.agent_core.surface_graph import SurfaceGraphState
 from ravage.agent_core.surface_graph_ingest import (
     SURFACE_OBSERVATION_BATCH_SCHEMA,
@@ -356,6 +357,7 @@ def test_validate_poc_promotes_executor_owned_non_flag_finding(
     workspace = AgentWorkspace.open(tmp_path / "workspace")
     engagement_id = uuid4()
     state = AgentState()
+    state.surface["flag_objective"] = True
     audit = AuditStore(tmp_path / "audit.db")
     action = {
         "action": "validate_poc",
@@ -438,7 +440,17 @@ def test_validate_poc_promotes_executor_owned_non_flag_finding(
     assert payload["source_observation_id"]
     assert payload["action_id"] == "poc-finding-action"
     assert payload["finding_record_path"] == str(workspace.events_path)
-    assert "%27" in payload["proof"]["http_request_final"]
+    lead = pending_lead(state)
+    assert lead is not None
+    assert lead.family == "sql_injection"
+    assert lead.method == "GET"
+    assert lead.endpoint == "/search"
+    assert lead.inputs == ("q",)
+    assert lead.source_kind == "tool_validate_poc"
+    assert lead.source_observation_id == payload["source_observation_id"]
+    assert '"url": "/search?q=%5BREDACTED%5D"' in payload["proof"][
+        "http_request_final"
+    ]
     assert [step["evidence_role"] for step in payload["exploit_steps"]] == [
         "exploit",
         "control",
@@ -450,6 +462,60 @@ def test_validate_poc_promotes_executor_owned_non_flag_finding(
     assert actions.count("finding_confirmed") == 1
     assert stored_payload["finding_id"] == payload["finding_id"]
     assert stored_payload["vuln_class"] == "sql_injection"
+
+
+def test_validate_poc_unattested_summary_proof_does_not_bypass_lead_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ravage.web_core.poc_validator.ProbeSession",
+        _SqlErrorWithProofProbeSession,
+    )
+    state = AgentState(surface={"flag_objective": True})
+    workspace = AgentWorkspace.open(tmp_path / "workspace")
+    audit = AuditStore(tmp_path / "audit.db")
+    action = {
+        "action": "validate_poc",
+        "steps": [
+            {
+                "method": "GET",
+                "url": "/search?q=%27",
+                "evidence_role": "exploit",
+                "expect_status": 200,
+                "expect_contains": "SQLite syntax error",
+            },
+            {
+                "method": "GET",
+                "url": "/search?q=ravage-control",
+                "evidence_role": "control",
+                "expect_status": 200,
+            },
+        ],
+        "finding": _finding_metadata("sql_injection"),
+    }
+    try:
+        outcome = execute_action(
+            action,
+            target_url="http://127.0.0.1/",
+            runtime=_ProofRuntime(),
+            state=state,
+            workspace=workspace,
+            audit=audit,
+            engagement_id=uuid4(),
+            repeat_count=1,
+            max_observation_chars=2_000,
+            max_transcript_chars=4_000,
+            proof_recognition_enabled=True,
+            action_id="poc-proof-action",
+        )
+    finally:
+        audit.close()
+
+    assert outcome.stop is False
+    assert outcome.flag == ""
+    assert state.flags == []
+    assert pending_lead(state) is not None
 
 
 def test_validate_poc_keeps_distinct_affected_parameters_and_merges_duplicates(
@@ -2384,6 +2450,29 @@ class _SqlErrorProbeSession(_FakeProbeSession):
             elapsed_ms=1,
             headers={"content-type": "text/plain"},
             body=body,
+        )
+
+
+class _SqlErrorWithProofProbeSession(_SqlErrorProbeSession):
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        data: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> ProbeResponse:
+        response = super().request(method, url, data=data, headers=headers)
+        if "%27" not in url:
+            return response
+        return ProbeResponse(
+            method=response.method,
+            url=response.url,
+            status=response.status,
+            final_url=response.final_url,
+            elapsed_ms=response.elapsed_ms,
+            headers=response.headers,
+            body=response.body + " flag{validated_poc_target_proof_7c31}",
         )
 
 

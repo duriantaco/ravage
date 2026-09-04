@@ -145,6 +145,99 @@ def test_exchange_ingestion_keeps_shapes_but_never_values_or_bodies() -> None:
         assert secret not in serialized
 
 
+@pytest.mark.parametrize("response_status", [200, 204, 300, 399])
+def test_successful_agent_http_exchange_promotes_method_and_route(
+    response_status: int,
+) -> None:
+    exchange = build_captured_http_exchange(
+        capture_session_id="agent-http-success",
+        source="agent_http",
+        source_observation_id="agent-http-observation",
+        method="PATCH",
+        url=f"{TARGET}/confirmed-route",
+        request_sent=True,
+        response_status=response_status,
+        response_final_url=f"{TARGET}/confirmed-route",
+        scope_decision="allowed",
+    ).with_store_identity(exchange_id="rq_0001", sequence=1)
+    graph = SurfaceGraphState.for_target(TARGET)
+
+    operation = graph.ingest_exchange(exchange)
+
+    assert operation.method == "PATCH"
+    assert operation.route_shape == "/confirmed-route"
+    assert operation.provenance == ("agent_http_response",)
+    assert operation.actionable is True
+    projected = project_surface_graph(graph)
+    assert {item["url"] for item in projected["endpoints"]} == {
+        f"{TARGET}/confirmed-route"
+    }
+
+
+def test_successful_agent_http_exchange_excludes_model_authored_request_metadata() -> None:
+    exchange = build_captured_http_exchange(
+        capture_session_id="agent-http-fields",
+        source="agent_http",
+        source_observation_id="agent-http-observation",
+        method="POST",
+        url=f"{TARGET}/confirmed-submit?fabricated_query=value",
+        resource_type="fabricated_hint",
+        request_headers={
+            "Content-Type": "application/json",
+            "X-Fabricated-Header": "value",
+        },
+        request_body={"invented_body_field": "value"},
+        request_sent=True,
+        response_status=201,
+        response_final_url=f"{TARGET}/confirmed-submit",
+        scope_decision="allowed",
+    ).with_store_identity(exchange_id="rq_0001", sequence=1)
+    graph = SurfaceGraphState.for_target(TARGET)
+
+    operation = graph.ingest_exchange(exchange)
+
+    assert operation.parameters == ()
+    assert operation.content_types == ()
+    assert operation.header_names == ()
+    assert operation.hints == ()
+    serialized = json.dumps(graph.to_json())
+    for model_authored_value in (
+        "fabricated_query",
+        "invented_body_field",
+        "x-fabricated-header",
+        "application/json",
+        "fabricated_hint",
+    ):
+        assert model_authored_value not in serialized
+
+
+@pytest.mark.parametrize("response_status", [None, 199, 400, 599])
+def test_agent_http_without_successful_response_remains_non_actionable(
+    response_status: int | None,
+) -> None:
+    exchange = build_captured_http_exchange(
+        capture_session_id="agent-http-failure",
+        source="agent_http",
+        source_observation_id="agent-http-observation",
+        method="GET",
+        url=f"{TARGET}/unconfirmed-route?fabricated_query=value",
+        request_headers={"X-Fabricated-Header": "value"},
+        request_sent=True,
+        response_status=response_status,
+        response_final_url=f"{TARGET}/unconfirmed-route" if response_status is not None else "",
+        scope_decision="allowed",
+    ).with_store_identity(exchange_id="rq_0001", sequence=1)
+    graph = SurfaceGraphState.for_target(TARGET)
+
+    operation = graph.ingest_exchange(exchange)
+
+    assert operation.provenance == ("probe",)
+    assert operation.actionable is False
+    assert operation.parameters == ()
+    assert operation.header_names == ()
+    assert project_surface_graph(graph)["endpoints"] == []
+
+
 def test_recon_javascript_openapi_and_graphql_feed_one_graph() -> None:
     graph = SurfaceGraphState.for_target(TARGET)
     ingest_recon_surface(

@@ -13,6 +13,7 @@ from ravage.agent_core.agent_strategy import (
 )
 from ravage.agent_core.recovery_action_contract import RECOVERY_OBJECTIVE_ACTION_STRATEGY
 from ravage.agent_core.semantic_routes import semantic_action_fingerprint, semantic_action_route
+from ravage.traffic.redaction import redact_headers, redact_text, sanitize_url
 
 if TYPE_CHECKING:
     from ravage.agent_core.agent_state import AgentState
@@ -33,6 +34,9 @@ _SENSITIVE_HEADER_RE = re.compile(
 )
 _INLINE_SENSITIVE_HEADER_RE = re.compile(
     r"(?i)((?:authorization|cookie|x-api-key|x-auth-token|x-access-token)\s*:\s*)[^'\"\n]+"
+)
+_EMBEDDED_URL_RE = re.compile(
+    r"(?i)(?:https?://[^\s'\"<>]+|(?<![A-Za-z0-9:/])/[^\s'\"<>]*[?#][^\s'\"<>]+)"
 )
 
 
@@ -120,7 +124,8 @@ def selection_trace_payload(  # noqa: PLR0913 - flat fields define the trace sch
             "would_route": shadow_action is not None,
             "reason": shadow_reason,
             "suggested_action": sanitize_action(shadow_action or {}),
-            "suggestion_matches_selected": bool(shadow_action)
+            "suggestion_matches_selected": shadow_action is not None
+            and bool(shadow_action)
             and _action_signature(shadow_action) == _action_signature(selected_action),
         },
         "repeat_context": _sanitize_string(repeat_context),
@@ -178,7 +183,7 @@ def attempt_record_payload(  # noqa: PLR0913 - mirrors the turn boundary.
         ),
         "exact_selected_fingerprint": _stable_digest(
             action_fingerprint(
-                selected_action,
+                sanitize_action(selected_action),
                 context=repeat_context,
             )
         ),
@@ -239,12 +244,40 @@ def turn_trace_payload(  # noqa: PLR0913 - flat fields define the trace schema.
 
 
 def sanitize_action(action: Mapping[str, object]) -> dict[str, object]:
+    kind = str(action.get("action") or "")
+    if kind == "http_request":
+        return _sanitize_http_step(action)
     sanitized: dict[str, object] = {}
     for key, value in action.items():
         if _SENSITIVE_KEY_RE.search(str(key)):
             sanitized[str(key)] = "[redacted]"
             continue
+        if kind == "validate_poc" and str(key) == "steps" and isinstance(value, list):
+            sanitized[str(key)] = [
+                _sanitize_http_step(item) if isinstance(item, Mapping) else _sanitize_value(item)
+                for item in value[:20]
+            ]
+            continue
+        if kind == "validate_poc" and str(key) in {"url", "path"}:
+            sanitized[str(key)] = sanitize_url(value)
+            continue
         sanitized[str(key)] = _sanitize_value(value)
+    return sanitized
+
+
+def _sanitize_http_step(step: Mapping[str, object]) -> dict[str, object]:
+    sanitized: dict[str, object] = {}
+    for key, value in step.items():
+        text_key = str(key)
+        lowered = text_key.casefold()
+        if _SENSITIVE_KEY_RE.search(text_key):
+            sanitized[text_key] = "[redacted]"
+        elif lowered in {"url", "path"}:
+            sanitized[text_key] = sanitize_url(value)
+        elif lowered == "headers" and isinstance(value, Mapping):
+            sanitized[text_key] = _sanitize_headers(value, response=False)
+        else:
+            sanitized[text_key] = _sanitize_value(value)
     return sanitized
 
 
@@ -264,21 +297,44 @@ def _sanitize_mapping(value: Mapping[str, object] | Mapping[object, object]) -> 
     sanitized: dict[str, object] = {}
     for key, item in value.items():
         text_key = str(key)
+        lowered = text_key.casefold()
         if _SENSITIVE_KEY_RE.search(text_key):
             sanitized[text_key] = "[redacted]"
+            continue
+        if lowered in {"url", "final_url", "location"}:
+            sanitized[text_key] = sanitize_url(item)
+            continue
+        if lowered in {"headers", "response_headers"} and isinstance(item, Mapping):
+            sanitized[text_key] = _sanitize_headers(item, response=True)
+            continue
+        if lowered == "error" and isinstance(item, str):
+            sanitized[text_key] = redact_text(
+                _sanitize_embedded_urls(item),
+                max_chars=_MAX_SANITIZED_CHARS,
+            )
             continue
         sanitized[text_key] = _sanitize_value(item)
     return sanitized
 
 
+def _sanitize_headers(headers: Mapping[object, object], *, response: bool) -> dict[str, str]:
+    normalized = {str(name): value for name, value in headers.items()}
+    return dict(redact_headers(normalized, response=response))
+
+
 def _sanitize_string(value: str) -> str:
-    text = _PROOF_RE.sub(lambda match: _mask_proof(match.group(0)), value)
+    text = _sanitize_embedded_urls(value)
+    text = _PROOF_RE.sub(lambda match: _mask_proof(match.group(0)), text)
     text = _SENSITIVE_HEADER_RE.sub(r"\1[redacted]", text)
     text = _INLINE_SENSITIVE_HEADER_RE.sub(r"\1[redacted]", text)
     text = _SENSITIVE_ASSIGNMENT_RE.sub(r"\1=[redacted]", text)
     if len(text) > _MAX_SANITIZED_CHARS:
         return text[:_MAX_SANITIZED_CHARS] + "... [truncated]"
     return text
+
+
+def _sanitize_embedded_urls(value: str) -> str:
+    return _EMBEDDED_URL_RE.sub(lambda match: sanitize_url(match.group(0)), value)
 
 
 def _mask_proof(value: str) -> str:

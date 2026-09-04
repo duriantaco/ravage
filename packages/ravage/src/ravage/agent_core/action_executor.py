@@ -8,12 +8,13 @@ import threading
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, TextIO, cast
-from urllib.parse import parse_qsl, unquote_plus, urljoin, urlsplit, urlunsplit
+from typing import TYPE_CHECKING, Any, Protocol, TextIO, cast
+from urllib.parse import parse_qsl, unquote, urljoin, urlsplit, urlunsplit
 from uuid import UUID, uuid5
 
 from ravage.agent_core.agent_state import AgentState, append_unique, merge_signals
 from ravage.agent_core.agent_strategy import observation_digest
+from ravage.agent_core.evidence_lead_lock import remember_from_probe_result
 from ravage.agent_core.live_events import (
     PROBE_HTTP_EVENT_PREFIX,
     http_step_payload,
@@ -22,9 +23,11 @@ from ravage.agent_core.live_events import (
 )
 from ravage.agent_core.observation_analysis import (
     classify_action_result,
+    extract_http_discovery_signals,
     extract_probe_signals,
     extract_signals,
 )
+from ravage.agent_core.surface_graph import SurfaceGraphError
 from ravage.agent_core.surface_graph_ingest import ingest_probe_result, project_surface_graph
 from ravage.auth.sessions import AuthenticationError
 from ravage.finding_evidence import confirmed_finding_evidence_failures
@@ -45,8 +48,11 @@ from ravage.run_data.audit import AuditStore
 from ravage.run_data.workspace import AgentWorkspace
 from ravage.runtime import ToolResult, ToolRuntime
 from ravage.traffic.policy import TrafficPolicyBlocked, TrafficPolicyController
+from ravage.traffic.redaction import redact_text as redact_traffic_text
+from ravage.traffic.redaction import sanitize_url
 from ravage.web_core.poc_validator import ValidationResult, validate_http_poc
 from ravage.web_core.proof_recognizer import is_placeholder_proof, recognize_proofs
+from ravage.web_core.recon import parse_passive_recon_document
 from ravage.web_core.scope_policy import same_origin, url_in_scope_entries
 
 if TYPE_CHECKING:
@@ -170,6 +176,26 @@ class ActionResult:
         return payload
 
 
+class HttpActionExecution(Protocol):
+    """Structural result returned by the scoped structured-HTTP executor."""
+
+    @property
+    def result(self) -> ActionResult: ...
+
+    @property
+    def observation_id(self) -> str: ...
+
+
+class HttpActionExecutor(Protocol):
+    def __call__(
+        self,
+        *,
+        node_id: str,
+        arguments: dict[str, object],
+        action_id: str,
+    ) -> HttpActionExecution: ...
+
+
 @dataclass(frozen=True)
 class _ProbeActionResult:
     text: str
@@ -180,7 +206,7 @@ class _ProbeActionResult:
 ProbeProgressSink = Callable[[dict[str, object]], None]
 
 
-def execute_action(  # noqa: PLR0913
+def execute_action(  # noqa: C901, PLR0911, PLR0912, PLR0913, PLR0915
     action: dict[str, object],
     *,
     target_url: str,
@@ -196,6 +222,7 @@ def execute_action(  # noqa: PLR0913
     action_id: str = "",
     authentication: ManagedAttackAuthentication | None = None,
     traffic_policy: TrafficPolicyController | None = None,
+    http_executor: HttpActionExecutor | None = None,
 ) -> ActionResult:
     if authentication is not None:
         authentication.assert_traffic_policy(traffic_policy)
@@ -218,7 +245,7 @@ def execute_action(  # noqa: PLR0913
             action_id=action_id,
         )
     if (
-        kind in {"run_command", "run_python", "run_probe", "validate_poc"}
+        kind in {"http_request", "run_command", "run_python", "run_probe", "validate_poc"}
         and repeat_count > MAX_IDENTICAL_ACTION_EXECUTIONS
     ):
         return _repeated(
@@ -240,6 +267,54 @@ def execute_action(  # noqa: PLR0913
         )
         if blocked is not None:
             return blocked
+    if kind == "http_request":
+        if http_executor is None:
+            return _http_request_unavailable(
+                workspace=workspace,
+                audit=audit,
+                engagement_id=engagement_id,
+                action_id=action_id,
+            )
+        from ravage.agent_core.stateful_http import request_arguments  # noqa: PLC0415
+
+        try:
+            execution = http_executor(
+                node_id="base-agent",
+                arguments=request_arguments(action),
+                action_id=action_id,
+            )
+        except ValueError as exc:
+            safe_error = (
+                authentication.redact_text(str(exc))
+                if authentication is not None
+                else str(exc)
+            )
+            return _http_request_blocked(
+                error=safe_error,
+                workspace=workspace,
+                audit=audit,
+                engagement_id=engagement_id,
+                action_id=action_id,
+                session_mode=(
+                    f"identity:{authentication.identity}" if authentication is not None else ""
+                ),
+            )
+        return _record_http_action_result(
+            execution,
+            action=action,
+            state=state,
+            workspace=workspace,
+            audit=audit,
+            engagement_id=engagement_id,
+            proof_recognition_enabled=proof_recognition_enabled,
+            action_id=action_id,
+            repeat_count=repeat_count,
+            max_observation_chars=max_observation_chars,
+            max_transcript_chars=max_transcript_chars,
+            session_mode=(
+                f"identity:{authentication.identity}" if authentication is not None else ""
+            ),
+        )
     if kind == "run_command":
         tool_result = runtime.run_command(
             command=str(action.get("command") or "").strip(),
@@ -359,7 +434,7 @@ def execute_action(  # noqa: PLR0913
             session_mode=session_mode,
             authentication=authentication,
         )
-        return record_verified_probe_findings(
+        verified_result = record_verified_probe_findings(
             probe=probe,
             probe_text=probe_result.text,
             result=result,
@@ -370,9 +445,26 @@ def execute_action(  # noqa: PLR0913
             engagement_id=engagement_id,
             action_id=action_id,
         )
+        if state.surface.get("flag_objective") is True and not verified_result.stop:
+            remember_from_probe_result(
+                state,
+                probe_result.text,
+                {**action, "target_url": target_url},
+                str(state.last_observation.get("observation_id") or ""),
+            )
+        return verified_result
     if kind == "validate_poc":
         session_mode = f"identity:{authentication.identity}" if authentication is not None else ""
         poc_session: ProbeSession | None = None
+        persistent_request = getattr(http_executor, "request", None)
+        if not callable(persistent_request):
+            persistent_request = None
+        begin_validation = getattr(http_executor, "begin_validation", None)
+        consume_validation_proofs = getattr(
+            http_executor,
+            "consume_validation_proofs",
+            None,
+        )
 
         def _emit_http_step(info: dict[str, object]) -> None:
             index_value = info.get("index")
@@ -422,8 +514,11 @@ def execute_action(  # noqa: PLR0913
             workspace.record_event(kind="http_step", payload=payload)
 
         poc_timeout = _timeout(action.get("timeout_seconds")) or 10
+        if persistent_request is not None and callable(begin_validation):
+            begin_validation()
+        executor_recognized_proofs: Sequence[str] = ()
         try:
-            if authentication is not None:
+            if authentication is not None and persistent_request is None:
                 poc_session = authentication.session_for_model_action(
                     timeout_seconds=poc_timeout
                 )
@@ -437,16 +532,23 @@ def execute_action(  # noqa: PLR0913
                 out_of_scope=_surface_string_list(state, "scope_out_of_scope"),
                 max_rps=_surface_int(state, "scope_max_rps"),
                 session=poc_session,
+                request=persistent_request,
                 redact=(authentication.redact if authentication is not None else None),
                 traffic_policy_reference=(
                     traffic_policy.to_reference()
-                    if traffic_policy is not None and poc_session is None
+                    if traffic_policy is not None
+                    and poc_session is None
+                    and persistent_request is None
                     else None
                 ),
             )
         finally:
-            if authentication is not None and poc_session is not None:
-                authentication.retire_probe_session(poc_session)
+            try:
+                if authentication is not None and poc_session is not None:
+                    authentication.retire_probe_session(poc_session)
+            finally:
+                if persistent_request is not None and callable(consume_validation_proofs):
+                    executor_recognized_proofs = consume_validation_proofs()
         validation_text = validation_result.to_text()
         safe_action: Mapping[str, object] = action
         if authentication is not None:
@@ -472,6 +574,7 @@ def execute_action(  # noqa: PLR0913
             max_transcript_chars=max_transcript_chars,
             session_mode=session_mode,
             authentication=authentication,
+            executor_recognized_proofs=executor_recognized_proofs,
         )
         finding = safe_action.get("finding")
         if finding is None:
@@ -569,6 +672,50 @@ def _invalid(
         observation="Invalid action. Return exactly one JSON object matching the action schema. "
         f"Error: {error}",
         outcome="blocked",
+    )
+
+
+def _http_request_unavailable(
+    *,
+    workspace: AgentWorkspace,
+    audit: AuditStore,
+    engagement_id: UUID,
+    action_id: str,
+) -> ActionResult:
+    return _http_request_blocked(
+        error="structured HTTP executor is unavailable for this agent route",
+        workspace=workspace,
+        audit=audit,
+        engagement_id=engagement_id,
+        action_id=action_id,
+    )
+
+
+def _http_request_blocked(  # noqa: PLR0913
+    *,
+    error: str,
+    workspace: AgentWorkspace,
+    audit: AuditStore,
+    engagement_id: UUID,
+    action_id: str,
+    session_mode: str = "",
+) -> ActionResult:
+    payload: dict[str, object] = {
+        "ok": False,
+        "action_id": action_id,
+        "error": error,
+        "outcome": "blocked",
+    }
+    if session_mode:
+        payload["session_mode"] = session_mode
+    _record(audit, engagement_id, actor="tool", action="tool_http_request", payload=payload)
+    workspace.record_event(kind="tool_http_request", payload=payload)
+    return ActionResult(
+        ok=False,
+        observation=json.dumps(payload, sort_keys=True),
+        outcome="blocked",
+        session_mode=session_mode,
+        evidence_source_kind="tool_http_request_blocked",
     )
 
 
@@ -955,7 +1102,7 @@ def _record_validated_finding(  # noqa: PLR0913
             source_observation_id=source_observation_id,
         )
 
-    return _persist_confirmed_finding(
+    persisted = _persist_confirmed_finding(
         payload,
         result=result,
         state=state,
@@ -963,6 +1110,14 @@ def _record_validated_finding(  # noqa: PLR0913
         audit=audit,
         engagement_id=engagement_id,
     )
+    if state.surface.get("flag_objective") is True and not persisted.stop:
+        remember_from_probe_result(
+            state,
+            json.dumps(payload, sort_keys=True),
+            action,
+            source_observation_id,
+        )
+    return persisted
 
 
 def record_verified_probe_findings(  # noqa: C901, PLR0912, PLR0913
@@ -1570,7 +1725,7 @@ def _paired_replay_evidence(
         failures.append("control and exploit replay inputs are identical")
     control_shape = _replay_input_shape(control_raw, target_url=target_url)
     exploit_shape = _replay_input_shape(exploit_raw, target_url=target_url)
-    if control_shape and exploit_shape and control_shape != exploit_shape:
+    if control_shape != exploit_shape:
         failures.append("control and exploit replays must vary the same input shape")
     if not _security_relevant_response_delta(control, exploit):
         failures.append("control and exploit responses lack a security-relevant differential")
@@ -1714,11 +1869,30 @@ def _path_traversal_replay_failures(
 
 
 def _decoded_replay_request_text(step: Mapping[str, object]) -> str:
-    parts = [str(step.get("url") or ""), str(step.get("body") or "")]
+    parts: list[str] = []
+    location = _replay_step_location(step)
+    try:
+        parsed = urlsplit(location)
+        parts.append(unquote(parsed.path))
+        parts.extend(
+            f"{name}={value}"
+            for name, value in parse_qsl(parsed.query, keep_blank_values=True)
+        )
+    except ValueError:
+        parts.append(location)
     form = step.get("form")
     if isinstance(form, Mapping):
         parts.extend(f"{name}={value}" for name, value in form.items())
-    return unquote_plus("\n".join(parts))
+    body = step.get("body")
+    if body is not None:
+        if _replay_content_type(step) == "application/x-www-form-urlencoded":
+            parts.extend(
+                f"{name}={value}"
+                for name, value in parse_qsl(str(body), keep_blank_values=True)
+            )
+        else:
+            parts.append(str(body))
+    return "\n".join(parts)
 
 
 def _sql_injection_input_markers(value: str) -> frozenset[str]:
@@ -1819,9 +1993,8 @@ def _same_replay_endpoint(
 
 
 def _replay_material(step: Mapping[str, object]) -> str:
-    material = {
-        key: step.get(key) for key in ("method", "url", "form", "body", "headers") if key in step
-    }
+    material = {key: step.get(key) for key in ("method", "form", "body", "headers") if key in step}
+    material["url"] = _replay_step_location(step)
     return json.dumps(material, sort_keys=True, default=str, separators=(",", ":"))
 
 
@@ -1830,18 +2003,16 @@ def _replay_input_shape(
     *,
     target_url: str,
 ) -> tuple[str, ...]:
-    names: set[str] = set()
-    raw_url = urljoin(target_url, str(step.get("url") or ""))
+    names: list[str] = []
+    raw_url = urljoin(target_url, _replay_step_location(step))
     for name, _value in parse_qsl(urlsplit(raw_url).query, keep_blank_values=True):
-        names.add(f"query:{name}")
-    form = step.get("form")
-    if isinstance(form, Mapping):
-        names.update(f"body:{name}" for name in form)
-    if step.get("body") is not None:
-        names.add("body:raw")
+        names.append(f"query:{name}")
+    names.extend(
+        f"body:{name}" for name, _value in _replay_body_parameter_values(step)
+    )
     headers = step.get("headers")
     if isinstance(headers, Mapping):
-        names.update(f"header:{str(name).lower()}" for name in headers)
+        names.extend(f"header:{str(name).lower()}" for name in headers)
     return tuple(sorted(names))
 
 
@@ -1944,24 +2115,64 @@ def _replay_parameter_values(
     target_url: str,
 ) -> dict[tuple[str, str], tuple[str, ...]]:
     values: dict[tuple[str, str], list[str]] = {}
-    raw_url = urljoin(target_url, str(step.get("url") or ""))
+    raw_url = urljoin(target_url, _replay_step_location(step))
     for name, value in parse_qsl(urlsplit(raw_url).query, keep_blank_values=True):
         values.setdefault(("query", name.strip()[:120]), []).append(value)
-    form = step.get("form")
-    if isinstance(form, Mapping):
-        for name, value in form.items():
-            values[("body", str(name).strip()[:120])] = [str(value)]
-    if step.get("body") is not None:
-        values[("body", "raw_body")] = [str(step.get("body"))]
+    for name, value in _replay_body_parameter_values(step):
+        values.setdefault(("body", name.strip()[:120]), []).append(value)
     headers = step.get("headers")
     if isinstance(headers, Mapping):
         for name, value in headers.items():
             values[("header", str(name).strip().lower()[:120])] = [str(value)]
-    return {
-        key: tuple(items)
-        for key, items in values.items()
-        if key[1]
-    }
+    return {key: tuple(items) for key, items in values.items() if key[1]}
+
+
+def _replay_body_parameter_values(step: Mapping[str, object]) -> list[tuple[str, str]]:
+    form = step.get("form")
+    if isinstance(form, Mapping):
+        return [(str(name), str(value)) for name, value in form.items()]
+    body = step.get("body")
+    if body is None:
+        return []
+    content_type = _replay_content_type(step)
+    if content_type == "application/x-www-form-urlencoded":
+        text = str(body)
+        pairs = parse_qsl(text, keep_blank_values=True)
+        if (text and not pairs) or any(not name.strip() for name, _value in pairs):
+            return [("raw_body", text)]
+        return [(name, value) for name, value in pairs]
+    if content_type == "application/json" or content_type.endswith("+json"):
+        pairs = _raw_json_object_pairs(body)
+        if pairs is not None:
+            return [
+                (str(name), json.dumps(value, sort_keys=True, separators=(",", ":")))
+                for name, value in pairs
+            ]
+    return [("raw_body", str(body))]
+
+
+def _raw_json_object_pairs(value: object) -> tuple[tuple[str, object], ...] | None:
+    try:
+        decoded = json.loads(str(value), object_pairs_hook=lambda pairs: tuple(pairs))
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(decoded, tuple):
+        return None
+    return tuple((str(name), item) for name, item in decoded)
+
+
+def _replay_content_type(step: Mapping[str, object]) -> str:
+    headers = step.get("headers")
+    if not isinstance(headers, Mapping):
+        return ""
+    for name, value in headers.items():
+        if str(name).strip().casefold() == "content-type":
+            return str(value).split(";", 1)[0].strip().casefold()
+    return ""
+
+
+def _replay_step_location(step: Mapping[str, object]) -> str:
+    return str(step.get("url") or step.get("path") or "")
 
 
 def _finding_url_in_scope(url: str, *, target_url: str, audit: AuditStore) -> bool:
@@ -1995,28 +2206,22 @@ def _canonical_endpoint_url(url: str) -> str:
 
 def _endpoint_params(url: str, *, raw_step: Mapping[str, object]) -> list[dict[str, str]]:
     params: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
     for name, _value in parse_qsl(urlsplit(url).query, keep_blank_values=True):
-        _append_endpoint_param(params, seen=seen, name=name, location="query")
-    form = raw_step.get("form")
-    if isinstance(form, Mapping):
-        for name in form:
-            _append_endpoint_param(params, seen=seen, name=str(name), location="body")
+        _append_endpoint_param(params, name=name, location="query")
+    for name, _value in _replay_body_parameter_values(raw_step):
+        _append_endpoint_param(params, name=name, location="body")
     return params[:32]
 
 
 def _append_endpoint_param(
     params: list[dict[str, str]],
     *,
-    seen: set[tuple[str, str]],
     name: str,
     location: str,
 ) -> None:
     clean_name = name.strip()[:120]
-    key = (clean_name, location)
-    if not clean_name or key in seen:
+    if not clean_name:
         return
-    seen.add(key)
     params.append({"name": clean_name, "location": location})
 
 
@@ -2288,6 +2493,217 @@ def _record_tool_result(  # noqa: PLR0913
     )
 
 
+def _record_http_action_result(  # noqa: PLR0913
+    execution: HttpActionExecution,
+    *,
+    action: Mapping[str, object],
+    state: AgentState,
+    workspace: AgentWorkspace,
+    audit: AuditStore,
+    engagement_id: UUID,
+    proof_recognition_enabled: bool,
+    action_id: str,
+    repeat_count: int,
+    max_observation_chars: int,
+    max_transcript_chars: int,
+    session_mode: str = "",
+) -> ActionResult:
+    result = execution.result
+    if not isinstance(result, ActionResult):
+        raise TypeError("structured HTTP executor must return ActionResult")
+    observation_id = str(execution.observation_id or uuid.uuid4())
+    evidence_text = result.evidence_observation or result.observation
+    transcript_text = _clip_probe_text(evidence_text, max_chars=max_transcript_chars)
+    response_payload = _http_response_payload(evidence_text)
+    response_text = _http_response_signal_text(response_payload)
+    # The evidence envelope also contains the model-authored request. Trust only
+    # the executor's response-body recognizer so an echoed request value cannot
+    # manufacture a proof candidate.
+    recognized_proofs = [result.flag] if result.flag else []
+    payload: dict[str, object] = {
+        "ok": result.ok,
+        "repeat_count": repeat_count,
+        "result": transcript_text,
+        "action_id": action_id,
+        "observation_id": observation_id,
+        "outcome": result.outcome,
+        "recognized_proofs": recognized_proofs,
+    }
+    if session_mode:
+        payload["session_mode"] = session_mode
+    _record_tool_payload(
+        payload,
+        kind="tool_http_request",
+        workspace=workspace,
+        audit=audit,
+        engagement_id=engagement_id,
+    )
+    # Keep the complete executor envelope in the durable transcript, but derive
+    # working-memory signals only from the target response. The envelope also
+    # contains model-authored request fields and therefore is not evidence that
+    # a route, parameter, marker, or proof was observed from the target.
+    state.last_observation = _observation_digest_with_source(
+        response_text,
+        observation_id=observation_id,
+        source_kind="tool_http_request",
+        recognized_proofs=recognized_proofs,
+    )
+    state.last_observation["http_response"] = _http_response_memory(response_payload)
+    workspace.record_transcript(role="tool", content=transcript_text)
+    if _passive_http_discovery_allowed(action, response_payload):
+        _ingest_passive_http_response(
+            response_payload,
+            state=state,
+            observation_id=observation_id,
+            identity_alias=_probe_identity_alias(session_mode),
+        )
+        merge_signals(state, extract_http_discovery_signals(response_text))
+    known_proof_replayed = _only_known_auto_capture_proofs(
+        evidence_text,
+        enabled=proof_recognition_enabled,
+        state=state,
+        recognized_proofs=recognized_proofs,
+    )
+    found = _capture_recognized_proof(
+        evidence_text,
+        enabled=proof_recognition_enabled,
+        state=state,
+        workspace=workspace,
+        audit=audit,
+        engagement_id=engagement_id,
+        evidence="tool_http_request",
+        action_id=action_id,
+        recognized_proofs=recognized_proofs,
+    )
+    outcome = result.outcome or ("http_response_observed" if result.ok else "blocked")
+    if found:
+        outcome = "flag_candidate"
+    elif known_proof_replayed:
+        outcome = "same_as_before"
+    return _action_result_from_observation(
+        ok=result.ok,
+        repeat_count=repeat_count,
+        text=_clip_probe_text(result.observation, max_chars=max_observation_chars),
+        max_observation_chars=max_observation_chars,
+        outcome=outcome,
+        stop=bool(found),
+        flag=found,
+        timed_out=result.timed_out,
+        evidence_source_kind="tool_http_request",
+        evidence_observation=evidence_text,
+        session_mode=session_mode,
+    )
+
+
+def _http_response_payload(evidence_text: str) -> dict[str, object]:
+    """Return the executor-owned response while excluding the authored request."""
+    try:
+        envelope = json.loads(evidence_text)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(envelope, Mapping):
+        return {}
+    response = envelope.get("response")
+    if not isinstance(response, Mapping):
+        return {}
+    return {str(key): value for key, value in response.items()}
+
+
+def _http_response_signal_text(response: Mapping[str, object]) -> str:
+    """Return only executor-owned target response content for signal extraction."""
+    body = response.get("body")
+    return body if isinstance(body, str) else ""
+
+
+def _http_response_memory(response: Mapping[str, object]) -> dict[str, object]:
+    headers_value = response.get("headers")
+    headers = dict(headers_value) if isinstance(headers_value, Mapping) else {}
+    status = response.get("status")
+    return {
+        "status": (
+            status
+            if isinstance(status, int) and not isinstance(status, bool)
+            else None
+        ),
+        "final_url": sanitize_url(response.get("final_url")),
+        "headers": mask_headers(headers),
+        "header_names": sorted(str(name).casefold() for name in headers)[:32],
+        "set_cookie": any(str(name).casefold() == "set-cookie" for name in headers),
+        "truncated": response.get("truncated") is True,
+        "error": redact_traffic_text(response.get("error"), max_chars=300),
+    }
+
+
+def _passive_http_discovery_allowed(
+    action: Mapping[str, object],
+    response: Mapping[str, object],
+) -> bool:
+    """Admit structure only from a clean navigation response, never a mutation echo."""
+    if str(action.get("method") or "GET").strip().upper() != "GET":
+        return False
+    if any(action.get(name) is not None for name in ("body", "form", "json")):
+        return False
+    authored_headers = action.get("headers")
+    if isinstance(authored_headers, Mapping) and authored_headers:
+        return False
+    requested = str(action.get("url") or action.get("path") or "").strip()
+    final_url = str(response.get("final_url") or "").strip()
+    try:
+        requested_parts = urlsplit(requested)
+        urlsplit(final_url)
+    except ValueError:
+        return False
+    # Query/path payloads are commonly reflected. Restrict passive parsing to a
+    # static navigation shape; the response remains visible but cannot teach
+    # the planner attacker-authored forms or fields.
+    if (
+        requested_parts.query
+        or requested_parts.fragment
+        or not re.fullmatch(r"[A-Za-z0-9._~/-]*", requested_parts.path or "/")
+    ):
+        return False
+    status = response.get("status")
+    return isinstance(status, int) and not isinstance(status, bool) and 200 <= status < 300
+
+
+def _ingest_passive_http_response(
+    response: Mapping[str, object],
+    *,
+    state: AgentState,
+    observation_id: str,
+    identity_alias: str,
+) -> None:
+    final_url = str(response.get("final_url") or "").strip()
+    body = response.get("body")
+    headers_value = response.get("headers")
+    if not final_url or not isinstance(body, str) or not isinstance(headers_value, Mapping):
+        return
+    headers = {str(name): str(value) for name, value in headers_value.items()}
+    document = parse_passive_recon_document(final_url, headers, body)
+    for operation in document.operations:
+        try:
+            state.surface_graph.add(
+                url=operation.url,
+                method=operation.method,
+                parameters=(
+                    {"name": parameter.name, "location": parameter.location}
+                    for parameter in operation.parameters
+                ),
+                header_names=operation.header_names,
+                hints=operation.hints,
+                source_kind=operation.source_kind,
+                identity_alias=identity_alias,
+                access_level="declared",
+                response_status=None,
+                scope_decision="unknown",
+                evidence_refs=(observation_id,),
+            )
+        except SurfaceGraphError:
+            # Cross-origin or malformed declarations are not part of this target.
+            continue
+    state.surface = project_surface_graph(state.surface_graph, state.surface)
+
+
 def _tool_result_payload(
     result: ToolResult,
     *,
@@ -2361,13 +2777,29 @@ def record_probe_result(  # noqa: PLR0913
     max_transcript_chars: int,
     session_mode: str = "",
     authentication: ManagedAttackAuthentication | None = None,
+    executor_recognized_proofs: Sequence[str] = (),
 ) -> ActionResult:
     observation_id = str(uuid.uuid4())
-    recognized_proofs = _probe_recognized_proofs(
-        text,
-        kind=kind,
+    # The PoC validator summary contains model-authored expectations such as
+    # ``expect_contains``. Proofs from that synthesized JSON are not target
+    # evidence; only the HTTP executor may attest proofs observed while replaying
+    # validator steps. Native probe output remains eligible for normal scanning.
+    scanned_proofs = (
+        []
+        if kind == "tool_validate_poc"
+        else _probe_recognized_proofs(
+            text,
+            kind=kind,
+            authentication=authentication,
+            known_proofs=state.flags,
+        )
+    )
+    recognized_proofs = _trusted_executor_proofs(
+        executor_recognized_proofs,
         authentication=authentication,
-        known_proofs=state.flags,
+    )
+    recognized_proofs.extend(
+        proof for proof in scanned_proofs if proof not in recognized_proofs
     )
     if kind == "tool_run_probe":
         _ingest_probe_surface_graph(
@@ -2657,6 +3089,23 @@ def _probe_recognized_proofs(
     # so an earlier known token cannot hide later evidence.
     known = {str(proof) for proof in known_proofs}
     return [next((proof for proof in candidates if proof not in known), candidates[0])]
+
+
+def _trusted_executor_proofs(
+    values: Sequence[str],
+    *,
+    authentication: ManagedAttackAuthentication | None,
+) -> list[str]:
+    proofs: list[str] = []
+    for value in values[:12]:
+        proof = str(value).strip()
+        if not proof or proof not in recognize_proofs(proof):
+            continue
+        if authentication is not None and authentication.contains_secret(proof):
+            continue
+        if proof not in proofs:
+            proofs.append(proof)
+    return proofs
 
 
 def _structured_finding_proofs(text: str) -> list[str]:

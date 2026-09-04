@@ -269,6 +269,71 @@ def test_cli_exposes_only_identifier_provenance_for_valid_blackboards(
     assert _SECRET not in human
 
 
+def test_cli_validates_provenance_independently_for_both_traffic_lanes(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    run_dir, base_workspace, base_store = _run(tmp_path)
+    _base_board, base_refs = _blackboard(
+        base_workspace,
+        observation_id="http:base-observation",
+    )
+    _append_exchange(
+        base_store,
+        observation_id="http:base-observation",
+        path="/base-proof",
+    )
+
+    graph_workspace = base_workspace / "autonomous-route" / "agent-graph"
+    graph_store = TrafficStore.create(graph_workspace)
+    write_traffic_manifest(
+        graph_workspace,
+        TrafficRunManifest.create(
+            target_url=_TARGET_URL,
+            capture_session_id=_CAPTURE_SESSION_ID,
+        ).complete(),
+    )
+    _graph_board, graph_refs = _blackboard(
+        graph_workspace,
+        observation_id="http:graph-observation",
+    )
+    _append_exchange(
+        graph_store,
+        observation_id="http:graph-observation",
+        path="/graph-proof",
+    )
+
+    main(["traffic", "list", str(run_dir), "--json"])
+    output = capsys.readouterr().out
+    requests = json.loads(output)["requests"]
+
+    assert [item["id"] for item in requests] == [
+        "base:rq_0001",
+        "autonomous_graph:rq_0001",
+    ]
+    assert requests[0]["agent_evidence"]["evidence_refs"] == list(base_refs)
+    assert requests[1]["agent_evidence"]["evidence_refs"] == list(graph_refs)
+    assert all(item["agent_evidence"]["status"] == "linked" for item in requests)
+    assert _SECRET not in output
+
+    main(
+        [
+            "traffic",
+            "show",
+            str(run_dir),
+            "autonomous_graph:rq_0001",
+            "--json",
+        ]
+    )
+    shown_text = capsys.readouterr().out
+    shown = json.loads(shown_text)
+    assert shown["lane"] == "autonomous_graph"
+    assert shown["agent_evidence"]["blackboard_path"] == str(
+        graph_workspace / "evidence-blackboard.json"
+    )
+    assert _SECRET not in shown_text
+
+
 def test_query_target_uses_one_way_manifest_identity_for_the_join(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

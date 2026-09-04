@@ -8,7 +8,7 @@ import stat
 from datetime import UTC, datetime
 from importlib import import_module
 from typing import TYPE_CHECKING, Any, Self, cast
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from ravage.finding_evidence import confirmed_finding_evidence_failures
 from ravage.hosting_layer import HOSTING_LAYER_EVENT_KIND, run_configured_hosting_layer_agent
@@ -17,8 +17,9 @@ from ravage.run_data.brief import load_engagement_brief
 from ravage.run_data.run_manifest import read_manifest
 from ravage.traffic.manifest import (
     TrafficRunError,
+    TrafficRunManifest,
     read_traffic_manifest,
-    resolve_workspace,
+    resolve_workspaces,
 )
 from ravage.traffic.policy import TrafficPolicyError, load_traffic_policy_snapshot
 from ravage.traffic.provenance import TrafficProvenanceError, load_traffic_provenance
@@ -31,7 +32,9 @@ if TYPE_CHECKING:
 
     from pentest_schemas import EngagementBrief, Scope
 
-REPORT_SCHEMA_VERSION = "2026-08-25"
+    from ravage.traffic.provenance import AgentHttpEvidenceLink
+
+REPORT_SCHEMA_VERSION = "2026-09-04"
 PRO_REPORT_MODULE = "ravage_pro.report"
 PRO_REPORT_SUFFIXES = frozenset({".pdf", ".docx"})
 CORE_REPORT_SUFFIXES = frozenset({"", ".md", ".json"})
@@ -48,7 +51,13 @@ _SECRET_PATTERNS = (
 
 _MIN_SECRET_REPLACEMENT_GROUPS = 5
 _GRAPH_MARKER_MAX_BYTES = 262_144
-_PRIVATE_HTTP_STATE_VERSION = 2
+type _ExpectedTrafficBoundary = tuple[
+    str,
+    str | None,
+    str,
+    tuple[str, ...],
+    tuple[str, ...],
+]
 
 _SEVERITY_ORDER = {
     "Critical": 4,
@@ -329,8 +338,17 @@ def build_pentest_report(  # noqa: PLR0913
 
     generated_at = datetime.now(UTC).isoformat()
     target = target_url or _target_from_events(events) or (manifest.target_url if manifest else "")
-    agent_http_evidence = _agent_http_evidence_summary(workspace_dir)
-    traffic_accounting = _traffic_accounting_summary(workspace_dir, events=events)
+    agent_http_evidence = _agent_http_evidence_summary(
+        workspace_dir,
+        target_url=target,
+        scope=brief.scope,
+    )
+    traffic_accounting = _traffic_accounting_summary(
+        workspace_dir,
+        events=events,
+        target_url=target,
+        scope=brief.scope,
+    )
     scan_coverage = _scan_coverage_summary(workspace_dir)
     report = {
         "schema_version": REPORT_SCHEMA_VERSION,
@@ -667,12 +685,16 @@ def _traffic_accounting_summary(
     workspace_dir: Path,
     *,
     events: list[dict[str, Any]],
+    target_url: str,
+    scope: Scope,
 ) -> dict[str, object]:
     ledger_path = workspace_dir / "traffic-policy.json"
     if not ledger_path.exists():
         scan_accounting = _scan_traffic_accounting_summary(
             workspace_dir,
             events=events,
+            target_url=target_url,
+            scope=scope,
         )
         if scan_accounting is not None:
             return scan_accounting
@@ -687,6 +709,14 @@ def _traffic_accounting_summary(
             "status": "unavailable",
             "provenance": "traffic_policy_ledger_unreadable",
         }
+    try:
+        expected_origin = _traffic_policy_origin(target_url)
+    except ValueError as exc:
+        message = "report target cannot be matched to traffic accounting"
+        raise TrafficProvenanceError(message) from exc
+    if inspection.target_origin != expected_origin:
+        message = "traffic accounting does not match the report target"
+        raise TrafficProvenanceError(message)
     snapshot = inspection.snapshot
     limit = inspection.config.max_physical_requests
     remaining = (
@@ -719,33 +749,59 @@ def _traffic_accounting_summary(
     }
 
 
-def _scan_traffic_accounting_summary(
+def _scan_traffic_accounting_summary(  # noqa: C901 - each lane fails closed independently.
     workspace_dir: Path,
     *,
     events: list[dict[str, Any]],
+    target_url: str,
+    scope: Scope,
 ) -> dict[str, object] | None:
     if not any(event.get("kind") == "scan_probe" for event in events):
         return None
     try:
-        traffic_workspace = resolve_workspace(workspace_dir)
+        traffic_workspaces = resolve_workspaces(workspace_dir)
     except TrafficRunError as exc:
-        if _canonical_traffic_artifacts_present(workspace_dir):
-            message = "traffic artifacts are present but could not be validated"
-            raise TrafficProvenanceError(message) from exc
-        return None
-    try:
-        traffic_manifest = read_traffic_manifest(traffic_workspace)
-        exchanges = TrafficStore.open(traffic_workspace).exchanges()
-    except (TrafficRunError, TrafficStoreError) as exc:
         message = "traffic artifacts are present but could not be validated"
         raise TrafficProvenanceError(message) from exc
-    if any(
-        exchange.capture_session_id != traffic_manifest.capture_session_id for exchange in exchanges
-    ):
-        message = "traffic capture session does not match its run manifest"
-        raise TrafficProvenanceError(message)
-
-    scan_exchanges = tuple(exchange for exchange in exchanges if exchange.source == "probe_session")
+    if not traffic_workspaces:
+        return None
+    report_boundary = _expected_traffic_manifest_boundary(target_url, scope=scope)
+    scan_exchanges = []
+    scan_manifests = []
+    expected_boundary: tuple[object, ...] | None = None
+    for traffic_workspace in traffic_workspaces:
+        try:
+            traffic_manifest = read_traffic_manifest(traffic_workspace)
+            store = TrafficStore.open(traffic_workspace)
+            exchanges = store.exchanges()
+            replay_receipts = store.replay_receipts()
+        except (TrafficRunError, TrafficStoreError) as exc:
+            message = "traffic artifacts are present but could not be validated"
+            raise TrafficProvenanceError(message) from exc
+        if not _traffic_manifest_matches_expected(traffic_manifest, report_boundary):
+            message = "traffic history does not match the report target or scope"
+            raise TrafficProvenanceError(message)
+        boundary = _traffic_manifest_boundary(traffic_manifest)
+        if expected_boundary is None:
+            expected_boundary = boundary
+        elif boundary != expected_boundary:
+            message = "traffic histories disagree on target or scope"
+            raise TrafficProvenanceError(message)
+        if any(
+            exchange.capture_session_id != traffic_manifest.capture_session_id
+            for exchange in exchanges
+        ) or any(
+            receipt.capture_session_id != traffic_manifest.capture_session_id
+            for receipt in replay_receipts
+        ):
+            message = "traffic capture session does not match its run manifest"
+            raise TrafficProvenanceError(message)
+        lane_scan_exchanges = [
+            exchange for exchange in exchanges if exchange.source == "probe_session"
+        ]
+        if lane_scan_exchanges:
+            scan_exchanges.extend(lane_scan_exchanges)
+            scan_manifests.append(traffic_manifest)
     if not scan_exchanges:
         return None
     physical_requests = sum(exchange.request_sent for exchange in scan_exchanges)
@@ -761,32 +817,88 @@ def _scan_traffic_accounting_summary(
         "remaining_physical_requests": None,
         "recorded_exchange_count": len(scan_exchanges),
         "blocked_count": sum(not exchange.request_sent for exchange in scan_exchanges),
-        "capture_completed": bool(traffic_manifest.completed_at),
+        "capture_completed": all(manifest.completed_at for manifest in scan_manifests),
     }
 
 
 def _agent_http_evidence_summary(
     workspace_dir: Path,
+    *,
+    target_url: str,
+    scope: Scope,
 ) -> dict[str, object]:
     try:
-        traffic_workspace = resolve_workspace(workspace_dir)
+        traffic_workspaces = resolve_workspaces(workspace_dir)
     except TrafficRunError as exc:
-        if _canonical_traffic_artifacts_present(workspace_dir) or _graph_traffic_expected(
-            workspace_dir
-        ):
-            message = "traffic artifacts are present but could not be validated"
-            raise TrafficProvenanceError(message) from exc
+        message = "traffic artifacts are present but could not be validated"
+        raise TrafficProvenanceError(message) from exc
+    if not traffic_workspaces:
         return _empty_agent_http_evidence_summary()
 
+    report_boundary = _expected_traffic_manifest_boundary(target_url, scope=scope)
+    links: list[dict[str, object]] = []
+    evidence_refs: set[tuple[str, str]] = set()
+    material_evidence_refs: set[tuple[str, str]] = set()
+    expected_boundary: tuple[object, ...] | None = None
+    for traffic_workspace in traffic_workspaces:
+        lane, boundary, agent_links = _validated_agent_http_lane(traffic_workspace)
+        if not _traffic_boundary_matches_expected(boundary, report_boundary):
+            message = "traffic history does not match the report target or scope"
+            raise TrafficProvenanceError(message)
+        if expected_boundary is None:
+            expected_boundary = boundary
+        elif boundary != expected_boundary:
+            message = "traffic histories disagree on target or scope"
+            raise TrafficProvenanceError(message)
+        for link in agent_links:
+            evidence_refs.update((lane, evidence_id) for evidence_id in link.evidence_refs)
+            material_evidence_refs.update(
+                (lane, evidence_id) for evidence_id in link.material_evidence_refs
+            )
+            links.append(
+                {
+                    "lane": lane,
+                    "request_id": f"{lane}:{link.request_id}",
+                    "local_request_id": link.request_id,
+                    "status": link.status,
+                    "observation_id": link.observation_id,
+                    "evidence_ids": list(link.evidence_refs),
+                    "material_evidence_ids": list(link.material_evidence_refs),
+                }
+            )
+
+    if not links:
+        return _empty_agent_http_evidence_summary()
+    return {
+        "status": "available",
+        "request_count": len(links),
+        "linked_request_count": sum(link["status"] == "linked" for link in links),
+        "observation_only_request_count": sum(
+            link["status"] == "observation_only" for link in links
+        ),
+        "evidence_count": len(evidence_refs),
+        "material_evidence_count": len(material_evidence_refs),
+        "links": links,
+    }
+
+
+def _validated_agent_http_lane(
+    traffic_workspace: Path,
+) -> tuple[str, tuple[object, ...], tuple[AgentHttpEvidenceLink, ...]]:
     try:
         traffic_manifest = read_traffic_manifest(traffic_workspace)
         store = TrafficStore.open(traffic_workspace)
         exchanges = store.exchanges()
+        replay_receipts = store.replay_receipts()
     except (TrafficRunError, TrafficStoreError) as exc:
         message = "traffic artifacts are present but could not be validated"
         raise TrafficProvenanceError(message) from exc
     if any(
-        exchange.capture_session_id != traffic_manifest.capture_session_id for exchange in exchanges
+        exchange.capture_session_id != traffic_manifest.capture_session_id
+        for exchange in exchanges
+    ) or any(
+        receipt.capture_session_id != traffic_manifest.capture_session_id
+        for receipt in replay_receipts
     ):
         message = "traffic capture session does not match its run manifest"
         raise TrafficProvenanceError(message)
@@ -800,49 +912,20 @@ def _agent_http_evidence_summary(
         for exchange, link in zip(exchanges, provenance.links, strict=True)
         if exchange.source == "agent_http"
     )
-    invalid_statuses = {
-        link.status
+    if any(
+        link.status not in {"linked", "observation_only", "missing_observation"}
         for link in agent_links
-        if link.status not in {"linked", "observation_only", "missing_observation"}
-    }
-    if invalid_statuses:
+    ):
         message = "agent HTTP provenance has an invalid link status"
         raise TrafficProvenanceError(message)
     if any(link.status == "missing_observation" for link in agent_links):
         message = "agent HTTP traffic is missing its evidence observation identifier"
         raise TrafficProvenanceError(message)
-    if not agent_links:
-        return _empty_agent_http_evidence_summary()
-
-    evidence_ids = tuple(
-        dict.fromkeys(evidence_id for link in agent_links for evidence_id in link.evidence_refs)
+    return (
+        _traffic_lane_name(traffic_workspace),
+        _traffic_manifest_boundary(traffic_manifest),
+        agent_links,
     )
-    material_evidence_ids = tuple(
-        dict.fromkeys(
-            evidence_id for link in agent_links for evidence_id in link.material_evidence_refs
-        )
-    )
-    links = [
-        {
-            "request_id": link.request_id,
-            "status": link.status,
-            "observation_id": link.observation_id,
-            "evidence_ids": list(link.evidence_refs),
-            "material_evidence_ids": list(link.material_evidence_refs),
-        }
-        for link in agent_links
-    ]
-    return {
-        "status": "available",
-        "request_count": len(agent_links),
-        "linked_request_count": sum(link.status == "linked" for link in agent_links),
-        "observation_only_request_count": sum(
-            link.status == "observation_only" for link in agent_links
-        ),
-        "evidence_count": len(evidence_ids),
-        "material_evidence_count": len(material_evidence_ids),
-        "links": links,
-    }
 
 
 def _empty_agent_http_evidence_summary() -> dict[str, object]:
@@ -857,53 +940,93 @@ def _empty_agent_http_evidence_summary() -> dict[str, object]:
     }
 
 
-def _canonical_traffic_artifacts_present(workspace_dir: Path) -> bool:
-    for candidate in _traffic_workspace_candidates(workspace_dir):
-        try:
-            (candidate / "traffic").lstat()
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            message = "could not safely inspect traffic artifacts"
-            raise TrafficProvenanceError(message) from exc
-        else:
-            return True
-    return False
+def _traffic_lane_name(workspace_dir: Path) -> str:
+    if workspace_dir.name == "agent-graph" and workspace_dir.parent.name == "autonomous-route":
+        return "autonomous_graph"
+    return "base"
 
 
-def _graph_traffic_expected(workspace_dir: Path) -> bool:
-    """Detect new-version graph artifacts that require a traffic store."""
-    for candidate in _traffic_workspace_candidates(workspace_dir):
-        try:
-            (candidate / "graph-http-state.json").lstat()
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            message = "could not safely inspect graph HTTP state"
-            raise TrafficProvenanceError(message) from exc
-        else:
-            # Local graph HTTP persistence and automatic traffic capture shipped
-            # together, so any such state file requires the paired store.
-            return True
-
-        remote_state = _read_bounded_json_object(candidate / "remote-http-state.json")
-        if remote_state.get("version") == _PRIVATE_HTTP_STATE_VERSION and remote_state.get(
-            "target_identity"
-        ):
-            return True
-        for receipt_name in ("graph-route-receipt.json", "remote-graph-receipt.json"):
-            receipt = _read_bounded_json_object(candidate / receipt_name)
-            if "traffic" in receipt:
-                return True
-    return False
-
-
-def _traffic_workspace_candidates(workspace_dir: Path) -> tuple[Path, ...]:
+def _traffic_manifest_boundary(manifest: TrafficRunManifest) -> tuple[object, ...]:
     return (
-        workspace_dir,
-        workspace_dir / "workspace",
-        workspace_dir / "autonomous-route" / "agent-graph",
-        workspace_dir / "workspace" / "autonomous-route" / "agent-graph",
+        manifest.target_url,
+        manifest.target_identity,
+        manifest.origin,
+        manifest.in_scope,
+        manifest.out_of_scope,
+    )
+
+
+def _expected_traffic_manifest_boundary(
+    target_url: str,
+    *,
+    scope: Scope,
+) -> _ExpectedTrafficBoundary:
+    try:
+        expected = TrafficRunManifest.create(
+            target_url=target_url,
+            capture_session_id="report-attribution",
+            in_scope=tuple(str(item) for item in scope.in_scope),
+            out_of_scope=tuple(str(item) for item in scope.out_of_scope),
+        )
+    except TrafficRunError as exc:
+        message = "report target or scope cannot be matched to traffic evidence"
+        raise TrafficProvenanceError(message) from exc
+    raw_target = target_url.strip()
+    decoded_target = unquote(raw_target).casefold()
+    persisted_target = sanitize_url(raw_target)
+    expected_identity = (
+        None
+        if (
+            raw_target in (REDACTED_URL, persisted_target) or "[redacted" in decoded_target
+        )
+        else expected.target_identity
+    )
+    return (
+        expected.target_url,
+        expected_identity,
+        expected.origin,
+        expected.in_scope,
+        expected.out_of_scope,
+    )
+
+
+def _traffic_policy_origin(target_url: str) -> str:
+    parsed = urlsplit(target_url.strip())
+    scheme = parsed.scheme.casefold()
+    invalid_target = "invalid traffic accounting target"
+    if scheme not in {"http", "https"} or parsed.hostname is None:
+        raise ValueError(invalid_target)
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(invalid_target)
+    # Mirror traffic.policy._target_origin exactly. Unicode host casefolding is
+    # not equivalent to the writer's lowercase normalization (for example ß).
+    host = parsed.hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    port = parsed.port
+    default_port = 443 if scheme == "https" else 80
+    netloc = host if port in {None, default_port} else f"{host}:{port}"
+    return urlunsplit((scheme, netloc, "", "", ""))
+
+
+def _traffic_manifest_matches_expected(
+    manifest: TrafficRunManifest,
+    expected: _ExpectedTrafficBoundary,
+) -> bool:
+    return _traffic_boundary_matches_expected(_traffic_manifest_boundary(manifest), expected)
+
+
+def _traffic_boundary_matches_expected(
+    actual: tuple[object, ...],
+    expected: _ExpectedTrafficBoundary,
+) -> bool:
+    expected_target, expected_identity, expected_origin, expected_in, expected_out = expected
+    return (
+        actual[0] == expected_target
+        and (expected_identity is None or actual[1] == expected_identity)
+        and actual[2] == expected_origin
+        and actual[3] == expected_in
+        and actual[4] == expected_out
     )
 
 
@@ -966,8 +1089,11 @@ def _agent_http_evidence_markdown(summary: dict[str, Any]) -> list[str]:
         return lines
     lines.extend(
         [
-            "| Request ID | Status | Observation ID | Evidence IDs | Material evidence IDs |",
-            "| --- | --- | --- | --- | --- |",
+            (
+                "| Lane | Request ID | Status | Observation ID | Evidence IDs | "
+                "Material evidence IDs |"
+            ),
+            "| --- | --- | --- | --- | --- | --- |",
         ]
     )
     for item in links:
@@ -977,6 +1103,7 @@ def _agent_http_evidence_markdown(summary: dict[str, Any]) -> list[str]:
             + " | ".join(
                 _table_cell(value)
                 for value in (
+                    link.get("lane", ""),
                     link.get("request_id", ""),
                     link.get("status", ""),
                     link.get("observation_id", ""),

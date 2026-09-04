@@ -7,7 +7,6 @@ from typing import Callable, TypeVar
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ravage.agent_core.agent_state import AgentState
-from ravage.runtime.common import clip
 from ravage.probes.specialists.shared import (
     _auth_headers_from_state,
     _baseline_value,
@@ -24,11 +23,14 @@ from ravage.probes.specialists.shared import (
     _slow_response,
     _string_items,
     _surface_endpoints,
+    _target_authority_rank,
     _target_brief,
     _target_current_value,
     _target_headers,
     _target_replay,
+    _target_should_replace_previous,
 )
+from ravage.runtime.common import clip
 from ravage.web_core.http_probe import (
     ProbeResponse,
     ProbeSession,
@@ -2088,6 +2090,7 @@ def _ssti_expression_targets(
                     hints=["expression_context_endpoint"],
                     priority=95 + _input_name_priority(name),
                     auth_headers=auth_headers,
+                    authority="target_observed",
                 )
             )
         for name in _common_param_names(endpoint):
@@ -2100,6 +2103,7 @@ def _ssti_expression_targets(
                     hints=["expression_context_heuristic"],
                     priority=40 + _input_name_priority(name),
                     auth_headers=auth_headers,
+                    authority="inferred",
                 )
             )
     if _description_suggests_reminder_template_flow(state):
@@ -2111,19 +2115,19 @@ def _ssti_expression_targets(
                     hints=["description_reminder_expression"],
                     priority=155,
                     auth_headers=auth_headers,
+                    authority="inferred",
                 )
             )
     deduped: dict[tuple[str, str, str], dict[str, object]] = {}
     for target in expression_targets:
         key = (str(target.get("kind")), str(target.get("url")), str(target.get("input")))
         previous = deduped.get(key)
-        if previous is None or _int_value(target.get("priority")) > _int_value(
-            previous.get("priority")
-        ):
+        if _target_should_replace_previous(target, previous):
             deduped[key] = target
     ordered = list(deduped.values())
     ordered.sort(
         key=lambda item: (
+            _target_authority_rank(item),
             -_expression_target_score(item),
             str(item.get("url")),
             str(item.get("input")),
@@ -2178,6 +2182,7 @@ def _expression_query_target(
     hints: list[str],
     priority: int,
     auth_headers: dict[str, str],
+    authority: str,
 ) -> dict[str, object]:
     return {
         "kind": "query_param",
@@ -2186,6 +2191,7 @@ def _expression_query_target(
         "hints": hints,
         "priority": priority,
         "auth_headers": auth_headers,
+        "authority": authority,
     }
 
 

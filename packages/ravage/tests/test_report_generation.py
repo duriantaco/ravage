@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 import pytest
+import ravage.report as report_module
 from ravage import __main__ as cli
 from ravage.agent_core.action_executor import ActionResult
 from ravage.agent_core.ai_agent import AIWebAgentSettings
@@ -63,6 +64,9 @@ _AGENT_HTTP_SECRET = "flag{report-agent-http-secret}"  # noqa: S105 - redaction 
 _AGENT_HTTP_OBSERVATION_ID = "http:obs-report-agent-1"
 _ARGPARSE_ERROR = 2
 _PRIVATE_ARTIFACT_MODE = 0o600
+_DUAL_TRAFFIC_REQUEST_COUNT = 2
+_REPORT_IN_SCOPE = ("http://127.0.0.1:8765",)
+_REPORT_OUT_OF_SCOPE = ("http://127.0.0.1:9999",)
 
 
 def test_json_report_artifact_is_private_atomic_and_has_no_report_side_effects(
@@ -210,6 +214,57 @@ def test_write_pentest_report_generates_redacted_markdown_and_json(tmp_path: Pat
     assert "api_key=<SECRET_REDACTED>" in markdown
 
 
+def test_report_rejects_traffic_accounting_from_another_target(tmp_path: Path) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    TrafficPolicyController.open(
+        workspace.root / "traffic-policy.json",
+        target_url="http://127.0.0.1:8766",
+        config=TrafficPolicyConfig(),
+    )
+    output_path = tmp_path / "run" / "wrong-target-accounting.md"
+
+    with pytest.raises(
+        TrafficProvenanceError,
+        match="traffic accounting does not match the report target",
+    ):
+        write_pentest_report(
+            brief_path=brief_path,
+            target_url="http://127.0.0.1:8765",
+            workspace_dir=workspace.root,
+            output_path=output_path,
+            status="completed",
+            completed=True,
+        )
+
+    assert not output_path.exists()
+    assert not output_path.with_suffix(".json").exists()
+
+
+def test_report_accepts_the_policy_writers_unicode_host_normalization(tmp_path: Path) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    target_url = "http://faß.de/path"
+    TrafficPolicyController.open(
+        workspace.root / "traffic-policy.json",
+        target_url=target_url,
+        config=TrafficPolicyConfig(),
+    )
+    output_path = tmp_path / "run" / "unicode-policy-origin.md"
+
+    report = write_pentest_report(
+        brief_path=brief_path,
+        target_url=target_url,
+        workspace_dir=workspace.root,
+        output_path=output_path,
+        status="completed",
+        completed=True,
+    )
+
+    assert report["traffic_accounting"]["status"] == "exact"
+    assert output_path.exists()
+
+
 def test_report_includes_path_free_scan_coverage_without_overclaiming(tmp_path: Path) -> None:
     brief_path = _brief(tmp_path)
     workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
@@ -324,6 +379,7 @@ def test_report_summarizes_deterministic_scan_work_recon_and_recorded_traffic(
         },
     )
     _add_deterministic_scan_traffic(workspace.root)
+    _add_agent_http_provenance(workspace.root)
     output_path = tmp_path / "run" / "deterministic-report.md"
 
     report = write_pentest_report(
@@ -380,6 +436,64 @@ def test_report_summarizes_deterministic_scan_work_recon_and_recorded_traffic(
     assert "Request accounting status: lower_bound" in markdown
     assert "Surface-map HTTP responses: 2/3 requests" in markdown
     assert "surface_map: received 2/3 HTTP response(s)" in markdown
+
+
+def test_report_revalidates_scan_lane_attribution_after_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    workspace.record_event(
+        kind="scan_probe",
+        payload={"probe": "surface_map", "requests": [], "findings": [], "errors": []},
+    )
+    _add_deterministic_scan_traffic(workspace.root)
+    graph_workspace = workspace.root / "autonomous-route" / "agent-graph"
+    TrafficStore.create(graph_workspace)
+    write_traffic_manifest(
+        graph_workspace,
+        TrafficRunManifest.create(
+            target_url="http://127.0.0.1:8765",
+            capture_session_id="scan-graph-session",
+            in_scope=_REPORT_IN_SCOPE,
+            out_of_scope=_REPORT_OUT_OF_SCOPE,
+        ).complete(),
+    )
+    original_resolver = report_module.resolve_workspaces
+
+    def resolve_then_tamper(supplied: Path) -> tuple[Path, ...]:
+        resolved = original_resolver(supplied)
+        manifest_path = graph_workspace / "traffic" / "run.json"
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload["target_url"] = "http://127.0.0.1:8765/different-target"
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+        manifest_path.chmod(_PRIVATE_ARTIFACT_MODE)
+        return resolved
+
+    monkeypatch.setattr(
+        report_module,
+        "_agent_http_evidence_summary",
+        lambda *_args, **_kwargs: report_module._empty_agent_http_evidence_summary(),
+    )
+    monkeypatch.setattr(report_module, "resolve_workspaces", resolve_then_tamper)
+    output_path = tmp_path / "run" / "tampered-scan-lanes.md"
+
+    with pytest.raises(
+        TrafficProvenanceError,
+        match="traffic history does not match the report target or scope",
+    ):
+        write_pentest_report(
+            brief_path=brief_path,
+            target_url="http://127.0.0.1:8765",
+            workspace_dir=workspace.root,
+            output_path=output_path,
+            status="completed",
+            completed=True,
+        )
+
+    assert not output_path.exists()
+    assert not output_path.with_suffix(".json").exists()
 
 
 def test_report_summarizes_orphan_tool_probe_without_duplicating_agent_actions(
@@ -460,7 +574,9 @@ def test_report_links_nested_agent_http_traffic_to_identifier_only_evidence(
         "material_evidence_count": len(material_evidence_ids),
         "links": [
             {
-                "request_id": request_id,
+                "lane": "autonomous_graph",
+                "request_id": f"autonomous_graph:{request_id}",
+                "local_request_id": request_id,
                 "status": "linked",
                 "observation_id": _AGENT_HTTP_OBSERVATION_ID,
                 "evidence_ids": list(evidence_ids),
@@ -487,6 +603,218 @@ def test_report_links_nested_agent_http_traffic_to_identifier_only_evidence(
     assert "route_fingerprint" not in json.dumps(provenance)
     assert "evidence_records" not in json.dumps(provenance)
     assert "payload" not in json.dumps(provenance)
+
+
+def test_report_aggregates_valid_base_and_graph_agent_http_histories(
+    tmp_path: Path,
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    base_session_id = "base-agent-http-report-session"
+    base_observation_id = "http:obs-report-base-1"
+    base_store = TrafficStore.create(workspace.root)
+    write_traffic_manifest(
+        workspace.root,
+        TrafficRunManifest.create(
+            target_url="http://127.0.0.1:8765",
+            capture_session_id=base_session_id,
+            in_scope=_REPORT_IN_SCOPE,
+            out_of_scope=_REPORT_OUT_OF_SCOPE,
+        ).complete(),
+    )
+    base_blackboard = EvidenceBlackboard(
+        target_url="http://127.0.0.1:8765",
+        state_path=workspace.root / "evidence-blackboard.json",
+    )
+    base_blackboard.record_action_result(
+        producer_node_id="base-agent",
+        action={"action": "http_request", "method": "GET", "url": "/base-proof"},
+        result=ActionResult(
+            ok=True,
+            observation="base target response",
+            outcome="http_response_observed",
+            evidence_source_kind="tool_http_request",
+            evidence_observation="base target response",
+        ),
+        observation_id=base_observation_id,
+    )
+    base_store.append_exchange(
+        build_captured_http_exchange(
+            capture_session_id=base_session_id,
+            source="agent_http",
+            source_observation_id=base_observation_id,
+            method="GET",
+            url="http://127.0.0.1:8765/base-proof",
+            request_sent=True,
+            response_status=200,
+            response_final_url="http://127.0.0.1:8765/base-proof",
+            response_body="base target response",
+            scope_decision="allowed",
+        )
+    )
+    _add_agent_http_provenance(workspace.root)
+    output_path = tmp_path / "run" / "dual-agent-http-report.md"
+
+    report = write_pentest_report(
+        brief_path=brief_path,
+        target_url="http://127.0.0.1:8765",
+        workspace_dir=workspace.root,
+        output_path=output_path,
+        status="completed",
+        completed=True,
+    )
+
+    provenance = report["agent_http_evidence"]
+    assert provenance["status"] == "available"
+    assert provenance["request_count"] == _DUAL_TRAFFIC_REQUEST_COUNT
+    assert provenance["linked_request_count"] == _DUAL_TRAFFIC_REQUEST_COUNT
+    assert len(provenance["links"]) == _DUAL_TRAFFIC_REQUEST_COUNT
+    assert [link["lane"] for link in provenance["links"]] == [
+        "base",
+        "autonomous_graph",
+    ]
+    assert [link["local_request_id"] for link in provenance["links"]] == [
+        "rq_0001",
+        "rq_0001",
+    ]
+    assert [link["request_id"] for link in provenance["links"]] == [
+        "base:rq_0001",
+        "autonomous_graph:rq_0001",
+    ]
+    assert output_path.exists()
+    assert _AGENT_HTTP_SECRET not in output_path.read_text(encoding="utf-8")
+
+
+def test_report_rejects_agent_http_evidence_from_another_target(tmp_path: Path) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    other_target = "http://127.0.0.1:8766"
+    _add_agent_http_provenance(
+        workspace.root,
+        target_url=other_target,
+        in_scope=(other_target,),
+    )
+    output_path = tmp_path / "run" / "spliced-target-evidence.md"
+
+    with pytest.raises(
+        TrafficProvenanceError,
+        match="traffic history does not match the report target or scope",
+    ):
+        write_pentest_report(
+            brief_path=brief_path,
+            target_url="http://127.0.0.1:8765",
+            workspace_dir=workspace.root,
+            output_path=output_path,
+            status="completed",
+            completed=True,
+        )
+
+    assert not output_path.exists()
+    assert not output_path.with_suffix(".json").exists()
+
+
+def test_report_rejects_agent_http_evidence_from_a_broader_scope(tmp_path: Path) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    _add_agent_http_provenance(
+        workspace.root,
+        in_scope=(*_REPORT_IN_SCOPE, "http://127.0.0.1:8765/admin"),
+    )
+    output_path = tmp_path / "run" / "spliced-scope-evidence.md"
+
+    with pytest.raises(
+        TrafficProvenanceError,
+        match="traffic history does not match the report target or scope",
+    ):
+        write_pentest_report(
+            brief_path=brief_path,
+            target_url="http://127.0.0.1:8765",
+            workspace_dir=workspace.root,
+            output_path=output_path,
+            status="completed",
+            completed=True,
+        )
+
+    assert not output_path.exists()
+    assert not output_path.with_suffix(".json").exists()
+
+
+def test_report_binds_unredacted_target_identity_when_url_shapes_match(tmp_path: Path) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    TrafficStore.create(workspace.root)
+    write_traffic_manifest(
+        workspace.root,
+        TrafficRunManifest.create(
+            target_url="http://127.0.0.1:8765/private?token=first",
+            capture_session_id="raw-target-identity",
+            in_scope=_REPORT_IN_SCOPE,
+            out_of_scope=_REPORT_OUT_OF_SCOPE,
+        ).complete(),
+    )
+    output_path = tmp_path / "run" / "wrong-raw-target.md"
+
+    with pytest.raises(
+        TrafficProvenanceError,
+        match="traffic history does not match the report target or scope",
+    ):
+        write_pentest_report(
+            brief_path=brief_path,
+            target_url="http://127.0.0.1:8765/private?token=second",
+            workspace_dir=workspace.root,
+            output_path=output_path,
+            status="completed",
+            completed=True,
+        )
+
+    assert not output_path.exists()
+    assert not output_path.with_suffix(".json").exists()
+
+
+@pytest.mark.parametrize(
+    ("raw_target", "reported_target"),
+    [
+        (
+            "http://127.0.0.1:8765/private?token=first",
+            "http://127.0.0.1:8765/private?token=%5BREDACTED%5D",
+        ),
+        (
+            "http://127.0.0.1:8765/users/123456",
+            "http://127.0.0.1:8765/users/:id",
+        ),
+        ("http://127.0.0.1:8765", "http://127.0.0.1:8765/"),
+    ],
+)
+def test_report_accepts_a_matching_persisted_safe_target(
+    tmp_path: Path,
+    raw_target: str,
+    reported_target: str,
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    TrafficStore.create(workspace.root)
+    write_traffic_manifest(
+        workspace.root,
+        TrafficRunManifest.create(
+            target_url=raw_target,
+            capture_session_id="redacted-target-identity",
+            in_scope=_REPORT_IN_SCOPE,
+            out_of_scope=_REPORT_OUT_OF_SCOPE,
+        ).complete(),
+    )
+    output_path = tmp_path / "run" / "redacted-target.md"
+
+    report = write_pentest_report(
+        brief_path=brief_path,
+        target_url=reported_target,
+        workspace_dir=workspace.root,
+        output_path=output_path,
+        status="completed",
+        completed=True,
+    )
+
+    assert report["agent_http_evidence"]["status"] == "not_available"
+    assert output_path.exists()
 
 
 def test_report_marks_agent_http_evidence_not_available_without_traffic(
@@ -569,6 +897,33 @@ def test_report_fails_closed_when_new_graph_http_state_loses_traffic(
         )
 
 
+def test_report_fails_closed_when_base_agent_http_state_loses_traffic(
+    tmp_path: Path,
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    state_path = workspace.root / "agent-http-state.json"
+    state_path.write_text('{"version":2,"target_identity":"target:marker"}\n', encoding="utf-8")
+    state_path.chmod(0o600)
+    EvidenceBlackboard(
+        target_url="http://127.0.0.1:8765",
+        state_path=workspace.root / "evidence-blackboard.json",
+    )
+
+    with pytest.raises(
+        TrafficProvenanceError,
+        match="traffic artifacts are present but could not be validated",
+    ):
+        write_pentest_report(
+            brief_path=brief_path,
+            target_url="http://127.0.0.1:8765",
+            workspace_dir=workspace.root,
+            output_path=tmp_path / "run" / "missing-base-agent-http-traffic.md",
+            status="completed",
+            completed=True,
+        )
+
+
 def test_report_fails_closed_for_tampered_agent_http_blackboard(tmp_path: Path) -> None:
     brief_path = _brief(tmp_path)
     workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
@@ -644,7 +999,7 @@ def test_report_fails_closed_for_ambiguous_agent_http_provenance(tmp_path: Path)
     assert not output_path.exists()
 
 
-def test_report_fails_closed_for_unvalidated_or_multiple_traffic_roots(
+def test_report_fails_closed_for_unvalidated_or_mismatched_traffic_roots(
     tmp_path: Path,
 ) -> None:
     brief_path = _brief(tmp_path)
@@ -671,7 +1026,7 @@ def test_report_fails_closed_for_unvalidated_or_multiple_traffic_roots(
     write_traffic_manifest(
         workspace.root,
         TrafficRunManifest.create(
-            target_url="http://127.0.0.1:8765",
+            target_url="http://127.0.0.1:9998",
             capture_session_id="agent-http-report-base",
         ),
     )
@@ -688,6 +1043,36 @@ def test_report_fails_closed_for_unvalidated_or_multiple_traffic_roots(
             status="completed",
             completed=True,
         )
+
+
+def test_report_fails_closed_for_malformed_declared_traffic_workspace(
+    tmp_path: Path,
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    declared_workspace = workspace.root / "legacy-http-workspace"
+    (declared_workspace / "traffic").mkdir(parents=True)
+    workspace.root.joinpath("run.json").write_text(
+        json.dumps({"workspace_dir": "legacy-http-workspace"}),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "run" / "malformed-declared-traffic.md"
+
+    with pytest.raises(
+        TrafficProvenanceError,
+        match="traffic artifacts are present but could not be validated",
+    ):
+        write_pentest_report(
+            brief_path=brief_path,
+            target_url="http://127.0.0.1:8765",
+            workspace_dir=workspace.root,
+            output_path=output_path,
+            status="completed",
+            completed=True,
+        )
+
+    assert not output_path.exists()
+    assert not output_path.with_suffix(".json").exists()
 
 
 def test_cli_report_surfaces_malformed_agent_http_store_without_traceback(
@@ -1085,6 +1470,10 @@ def _brief(tmp_path: Path) -> Path:
 
 def _add_agent_http_provenance(
     workspace: Path,
+    *,
+    target_url: str = "http://127.0.0.1:8765",
+    in_scope: tuple[str, ...] = _REPORT_IN_SCOPE,
+    out_of_scope: tuple[str, ...] = _REPORT_OUT_OF_SCOPE,
 ) -> tuple[Path, str, tuple[str, ...], tuple[str, ...]]:
     graph_workspace = workspace / "autonomous-route" / "agent-graph"
     capture_session_id = "agent-http-report-session"
@@ -1092,12 +1481,14 @@ def _add_agent_http_provenance(
     write_traffic_manifest(
         graph_workspace,
         TrafficRunManifest.create(
-            target_url="http://127.0.0.1:8765",
+            target_url=target_url,
             capture_session_id=capture_session_id,
+            in_scope=in_scope,
+            out_of_scope=out_of_scope,
         ).complete(),
     )
     blackboard = EvidenceBlackboard(
-        target_url="http://127.0.0.1:8765",
+        target_url=target_url,
         state_path=graph_workspace / "evidence-blackboard.json",
     )
     blackboard.record_action_result(
@@ -1119,11 +1510,11 @@ def _add_agent_http_provenance(
             source="agent_http",
             source_observation_id=_AGENT_HTTP_OBSERVATION_ID,
             method="GET",
-            url=(f"http://127.0.0.1:8765/proof?token={_AGENT_HTTP_SECRET}"),
+            url=(f"{target_url}/proof?token={_AGENT_HTTP_SECRET}"),
             request_headers={"Authorization": f"Bearer {_AGENT_HTTP_SECRET}"},
             request_sent=True,
             response_status=200,
-            response_final_url="http://127.0.0.1:8765/proof",
+            response_final_url=f"{target_url}/proof",
             response_headers={"Set-Cookie": f"proof={_AGENT_HTTP_SECRET}"},
             response_body=f"target returned {_AGENT_HTTP_SECRET}",
             scope_decision="allowed",
@@ -1152,6 +1543,8 @@ def _add_deterministic_scan_traffic(workspace: Path) -> None:
     manifest = TrafficRunManifest.create(
         target_url="http://127.0.0.1:8765",
         capture_session_id=capture_session_id,
+        in_scope=_REPORT_IN_SCOPE,
+        out_of_scope=_REPORT_OUT_OF_SCOPE,
     )
     write_traffic_manifest(workspace, manifest.complete())
     for path, status in (("/", 200), ("/admin", 403)):

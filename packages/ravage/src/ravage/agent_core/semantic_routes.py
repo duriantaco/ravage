@@ -148,6 +148,16 @@ def _action_body(action: Mapping[str, object]) -> str:
         "run_command": action.get("command"),
         "run_python": action.get("code"),
         "validate_poc": json.dumps(action.get("steps") or [], sort_keys=True, default=str),
+        "http_request": json.dumps(
+            {
+                "url": action.get("url") or action.get("path"),
+                "form": action.get("form"),
+                "json": action.get("json"),
+                "body": action.get("body"),
+            },
+            sort_keys=True,
+            default=str,
+        ),
     }
     kind = str(action.get("action") or "")
     return str(bodies.get(kind) or action.get("probe") or "")
@@ -183,6 +193,9 @@ def _first_marker_class(
 
 def _endpoints(action: Mapping[str, object], *, body: str) -> list[str]:
     candidates = _step_endpoints(action)
+    direct = action.get("url") or action.get("path")
+    if isinstance(direct, str) and direct.strip():
+        candidates.append(direct)
     candidates.extend(match.group(0) for match in _URL_RE.finditer(body))
     if not candidates:
         candidates.extend(match.group(1) for match in _QUOTED_PATH_RE.finditer(body))
@@ -217,7 +230,7 @@ def _normalize_endpoint(value: str) -> str:
 
 
 def _method(action: Mapping[str, object], *, combined: str, has_endpoint: bool) -> str:
-    explicit = str(action.get("method") or "").upper()
+    explicit = str(action.get("method") or "").strip().upper()
     if explicit:
         return explicit
     step_method = _first_step_method(action)
@@ -245,7 +258,7 @@ def _first_step_method(action: Mapping[str, object]) -> str:
     steps = action.get("steps")
     if not isinstance(steps, list) or not steps or not isinstance(steps[0], Mapping):
         return ""
-    return str(steps[0].get("method") or "GET").upper()
+    return str(steps[0].get("method") or "GET").strip().upper()
 
 
 def _inputs(action: Mapping[str, object], *, endpoints: list[str]) -> list[str]:
@@ -256,11 +269,16 @@ def _inputs(action: Mapping[str, object], *, endpoints: list[str]) -> list[str]:
 
 
 def _explicit_inputs(action: Mapping[str, object]) -> list[str]:
-    return [
+    names = [
         str(action.get(key) or "").strip()
         for key in ("param", "parameter", "input", "field")
         if str(action.get(key) or "").strip()
     ]
+    for key in ("form", "json", "params"):
+        values = action.get(key)
+        if isinstance(values, Mapping):
+            names.extend(str(name) for name in values)
+    return names
 
 
 def _step_inputs(action: Mapping[str, object]) -> list[str]:

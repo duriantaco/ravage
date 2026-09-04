@@ -6,9 +6,12 @@ from urllib.parse import parse_qs, urlsplit
 
 from ravage import probe_suite
 from ravage.agent_core.agent_state import AgentState
+from ravage.agent_core.surface_graph import SurfaceGraphState
+from ravage.agent_core.surface_graph_ingest import project_surface_graph
+from ravage.probe_suite import run_builtin_probe
+from ravage.probes.specialists.shared import _generic_input_targets
 from ravage.probes.specialists.ssti import _ssti_expression_targets
 from ravage.web_core.http_probe import ProbeResponse
-from ravage.probe_suite import run_builtin_probe
 
 _FLAG = "flag{ssti_loan_calc_required_params_7c2a}"
 
@@ -200,6 +203,49 @@ class _AuthenticatedReminderJinjaSession(_BaseFakeSession):
         )
 
 
+class _ObservedGenerateErbSession(_BaseFakeSession):
+    """ERB sink reachable only through the observed POST form contract."""
+
+    def post_form(
+        self,
+        url: str,
+        fields: dict[str, str],
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> ProbeResponse:
+        del headers
+        if urlsplit(url).path != "/generate":
+            return self._not_found("POST", url)
+        sentence = fields.get("sentence", "")
+        rendered = sentence
+        if sentence == "<%= 7*7 %>":
+            rendered = "49"
+        elif sentence.startswith("<%= `"):
+            rendered = _GENERATE_FLAG
+        return ProbeResponse(
+            method="POST",
+            url=url,
+            status=200,
+            final_url=url,
+            elapsed_ms=5,
+            body=f"<p>{rendered}</p>",
+        )
+
+    def _response(self, method: str, url: str) -> ProbeResponse:
+        return self._not_found(method, url)
+
+    @staticmethod
+    def _not_found(method: str, url: str) -> ProbeResponse:
+        return ProbeResponse(
+            method=method,
+            url=url,
+            status=404,
+            final_url=url,
+            elapsed_ms=5,
+            body="Not Found",
+        )
+
+
 def _filtered_numeric_flag_ordinal(payload: str) -> int:
     match = re.search(r"head -c (\d+)", payload)
     if match is None:
@@ -220,6 +266,7 @@ def _looks_number(value: str) -> bool:
 
 _USERNAME_FLAG = "flag{ssti_username_openapi_signal_9c6d}"
 _REMINDER_FLAG = "flag{ssti_reminder_date_signal_3c58}"
+_GENERATE_FLAG = "flag{ssti_observed_generate_form_8a42}"
 
 
 def _state_with_calculator_param() -> AgentState:
@@ -322,6 +369,63 @@ def _state_with_generated_username_endpoint_only() -> AgentState:
     return state
 
 
+def _state_with_observed_generate_form_and_noisy_endpoints() -> AgentState:
+    state = AgentState()
+    generate_url = "http://127.0.0.1/generate"
+    form = {
+        "action": generate_url,
+        "categories": ["command_boundary"],
+        "inputs": [
+            {"name": "sentence", "required": True, "type": "text", "value": ""},
+            {"name": "number", "required": True, "type": "number", "value": ""},
+        ],
+        "method": "POST",
+    }
+    state.surface = {
+        "target_url": "http://127.0.0.1/",
+        "origin": "http://127.0.0.1",
+        "forms": [form],
+        "parameters": [
+            {
+                "name": "sentence",
+                "locations": [generate_url],
+                "priority": 4,
+                "sources": ["form:post", "surface_graph:form"],
+            },
+            {
+                "name": "number",
+                "locations": [generate_url],
+                "priority": 4,
+                "sources": ["form:post", "surface_graph:form"],
+            },
+        ],
+        "endpoints": [{"url": "http://127.0.0.1/"}, {"url": generate_url}],
+        "request_templates": [
+            {
+                "fields": {"number": "", "sentence": ""},
+                "method": "POST",
+                "source": "surface_graph",
+                "url": generate_url,
+            }
+        ],
+    }
+    state.signals["parameters"] = ["number", "sentence"]
+    state.signals["endpoints"] = [
+        "/",
+        "/a",
+        "/button",
+        "/div",
+        "/form",
+        "/generate",
+        "/li",
+        "/nav",
+        "/p",
+        "/span",
+        "/ul",
+    ]
+    return state
+
+
 def test_ssti_missing_param_recovery_skips_when_no_validation_error(monkeypatch) -> None:
     class _PlainReflectionSession(_BaseFakeSession):
         def _response(self, method: str, url: str) -> ProbeResponse:
@@ -377,6 +481,150 @@ def test_ssti_does_not_post_generated_username_query_endpoint(monkeypatch) -> No
         _is_generated_username_post(request)
         for request in result.requests
     )
+
+
+def test_observed_generate_form_outranks_inferred_query_targets() -> None:
+    targets = _generic_input_targets(
+        _state_with_observed_generate_form_and_noisy_endpoints(),
+        limit=12,
+    )
+
+    assert targets[0]["kind"] == "form"
+    assert targets[0]["url"] == "http://127.0.0.1/generate"
+    assert targets[0]["input"] == "sentence"
+    assert targets[0]["authority"] == "target_observed"
+    first_inferred = next(
+        index for index, target in enumerate(targets) if target["authority"] == "inferred"
+    )
+    assert all(target["kind"] == "form" for target in targets[:2])
+    assert first_inferred >= 2
+
+
+def test_surface_graph_form_parameter_preserves_observed_form_transport() -> None:
+    state = AgentState(
+        surface={"target_url": "http://127.0.0.1/", "origin": "http://127.0.0.1"},
+        surface_graph=SurfaceGraphState.for_target("http://127.0.0.1/"),
+    )
+    state.surface_graph.add(
+        url="http://127.0.0.1/generate",
+        method="POST",
+        parameters=({"name": "sentence", "location": "form"},),
+        hints=("form",),
+        source_kind="native_recon",
+    )
+    state.surface = project_surface_graph(state.surface_graph, state.surface)
+
+    targets = _generic_input_targets(state, limit=12)
+    sentence = next(target for target in targets if target["input"] == "sentence")
+
+    assert sentence["kind"] == "form"
+    assert sentence["url"] == "http://127.0.0.1/generate"
+    assert sentence["authority"] == "target_observed"
+
+
+def test_surface_graph_body_parameter_is_not_fabricated_as_query() -> None:
+    state = AgentState(
+        surface={"target_url": "http://127.0.0.1/", "origin": "http://127.0.0.1"},
+        surface_graph=SurfaceGraphState.for_target("http://127.0.0.1/"),
+    )
+    state.surface_graph.add(
+        url="http://127.0.0.1/api/generate",
+        method="POST",
+        parameters=({"name": "sentence", "location": "body"},),
+        source_kind="openapi",
+    )
+    state.surface = project_surface_graph(state.surface_graph, state.surface)
+
+    targets = _generic_input_targets(state, limit=12)
+
+    assert not any(target["input"] == "sentence" for target in targets)
+
+
+def test_weak_query_shaped_parameter_does_not_outrank_observed_body_target() -> None:
+    state = AgentState(
+        surface={"target_url": "http://127.0.0.1/", "origin": "http://127.0.0.1"},
+        surface_graph=SurfaceGraphState.for_target("http://127.0.0.1/"),
+    )
+    state.surface_graph.add(
+        url="http://127.0.0.1/generate",
+        method="POST",
+        parameters=({"name": "sentence", "location": "form"},),
+        hints=("form",),
+        source_kind="native_recon",
+    )
+    state.surface = project_surface_graph(state.surface_graph, state.surface)
+    parameters = state.surface["parameters"]
+    assert isinstance(parameters, list)
+    parameters.append(
+        {
+            "name": "q",
+            "locations": ["http://127.0.0.1/search?q=reflected"],
+            "priority": 100,
+            "sources": ["response_text"],
+        }
+    )
+
+    targets = _generic_input_targets(state, limit=12)
+    q_target = next(target for target in targets if target["input"] == "q")
+
+    assert targets[0]["input"] == "sentence"
+    assert targets[0]["kind"] == "form"
+    assert targets[0]["authority"] == "target_observed"
+    assert q_target["authority"] == "observed_input"
+
+
+def test_ssti_closes_observed_generate_post_before_guessed_gets(monkeypatch) -> None:
+    monkeypatch.setattr(probe_suite, "ProbeSession", _ObservedGenerateErbSession)
+
+    result = run_builtin_probe(
+        "ssti_fingerprint",
+        target_url="http://127.0.0.1/",
+        state=_state_with_observed_generate_form_and_noisy_endpoints(),
+    )
+
+    assert result.ok
+    assert result.findings[0]["type"] == "ssti_extracted_proof"
+    assert _GENERATE_FLAG in result.findings[0]["proofs"]
+    first_baseline = next(
+        request for request in result.requests if request.get("probe_kind") == "baseline"
+    )
+    assert first_baseline["target"] == {
+        "kind": "form",
+        "url": "http://127.0.0.1/generate",
+        "input": "sentence",
+        "hints": ["command_boundary"],
+    }
+    assert all(
+        not isinstance(request.get("target"), dict)
+        or request["target"].get("kind") == "form"
+        for request in result.requests
+    )
+
+
+def test_ssti_expression_ranking_keeps_observed_form_ahead_of_guessed_query() -> None:
+    state = AgentState()
+    state.surface = {
+        "target_url": "http://127.0.0.1/",
+        "origin": "http://127.0.0.1",
+        "forms": [
+            {
+                "action": "http://127.0.0.1/remind",
+                "inputs": [{"name": "date", "type": "text"}],
+                "method": "POST",
+            }
+        ],
+        "parameters": [],
+        "endpoints": [{"url": "http://127.0.0.1/remind"}],
+    }
+    state.signals["endpoints"] = ["/remind"]
+    generic = _generic_input_targets(state, limit=12)
+
+    targets = _ssti_expression_targets(state, generic)
+
+    assert targets[0]["kind"] == "form"
+    assert targets[0]["url"] == "http://127.0.0.1/remind"
+    assert targets[0]["input"] == "date"
+    assert targets[0]["authority"] == "target_observed"
 
 
 def test_ssti_uses_auth_cookie_for_reminder_date_endpoint(monkeypatch) -> None:

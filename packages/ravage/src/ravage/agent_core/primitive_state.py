@@ -249,12 +249,13 @@ PRIMITIVE_RULES: tuple[PrimitiveRule, ...] = (
     ),
     PrimitiveRule(
         name="default_credentials_confirmed",
-        probe="idor_boundary",
+        probe="stateful_session",
         task_id="stateful-session",
         directive=(
-            "Default credentials are confirmed. Keep the authenticated context and run "
-            "run_probe idor_boundary to enumerate profile/admin/API object routes for the proof. "
-            "Do not re-spray credentials unless the authenticated session is exhausted."
+            "Default credentials are confirmed. Treat authentication as context, not as IDOR "
+            "evidence: use stateful_session to map the authenticated workflow, then triage and "
+            "mutate the forms and API operations it reveals. Run an "
+            "authorization specialist only after an object or role boundary is actually observed."
         ),
         markers=("default_credentials_valid",),
         tier=1,

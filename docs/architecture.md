@@ -16,6 +16,12 @@ plan. It distinguishes the **base agent loop** from the optional
 snapshot of the base hybrid proposal/selection loop and its bounded
 specialists; it did not exercise the newer graph or authorized remote runtime.
 
+The structured HTTP path is **request-aware gray-box testing**, not white-box
+testing. It can use request shapes observed from the running application and
+typed evidence produced by Ravage, but it does not assume source-code,
+database, server, or deployment access. Source-guided analysis is a separate
+input when an operator deliberately provides source context.
+
 ## Mental Model
 
 Think of Ravage as five control layers:
@@ -117,9 +123,9 @@ Primary operator commands:
   bounded graph route. Any remote target additionally requires
   `--authorized-remote-target`.
 - `ravage scan`: deterministic DAST without model calls.
-- `ravage traffic`: automatic agent-graph structured HTTP history, optional
-  scoped Playwright capture, redacted inspection, single-request replay, and
-  offline comparison.
+- `ravage traffic`: automatic base and agent-graph structured HTTP history,
+  optional scoped Playwright capture, redacted inspection, single-request
+  replay, and offline comparison.
 - `ravage tools`: tool-runtime list/check helpers. Tool installation lives in
   `scripts/install_tools.sh`.
 - `ravage lab`: local lab management helpers.
@@ -222,11 +228,12 @@ and evidence references.
 
 Automatic production ingestion currently comes from native recon, including
 bounded JavaScript request templates; executor-owned typed probe results,
-including OpenAPI and GraphQL structural findings; and the graph executor's own
-structured HTTP exchanges. Code-level adapters also accept already-fetched
-JavaScript, OpenAPI v2/v3 documents, GraphQL SDL or introspection, typed captured
-exchanges with browser/probe provenance, and strict value-free external
-observation batches. These adapters perform no fetching. Standalone
+including OpenAPI and GraphQL structural findings; and the base and graph
+executors' own structured HTTP exchanges. Code-level adapters also accept
+already-fetched JavaScript, OpenAPI v2/v3 documents, GraphQL SDL or
+introspection, typed captured exchanges with browser/probe provenance, and
+strict value-free external observation batches. These adapters perform no
+fetching. Standalone
 `ravage traffic capture` history and unstructured external-tool stdout are not
 automatically imported into attack state. Strict external batches reject a
 malformed or over-limit batch atomically; captured-exchange and document
@@ -247,11 +254,11 @@ base has no confirmed proof and terminates through model-request or exploration
 exhaustion. A solved base, cost stop, error, or interruption does not
 automatically open more work.
 
-The unauthenticated graph reuses the verified local runtime handoff and can call
-the existing bounded probes, proof validators, command/Python actions, and
-structured HTTP executor under the brief's scope. With a managed identity, its
-execute surface is structured HTTP plus proof capture only; no process executor
-is attached. Its state lives below
+The base loop and unauthenticated graph can call the structured HTTP executor
+under the brief's scope. The graph also reuses the verified local runtime
+handoff for its eligible bounded probes, proof validators, and command/Python
+actions. With a managed identity, its execute surface is structured HTTP plus
+proof capture only; no process executor is attached. Its state lives below
 `workspace/autonomous-route/agent-graph/`, separate from base artifacts.
 
 ## Explicit Authorized Remote Runtime
@@ -344,33 +351,61 @@ ravage traffic replay RUN_DIR REQUEST_ID
 ravage traffic diff RUN_DIR REQUEST_ID REPLAY_ID
 ```
 
-The bounded agent graph uses the same private traffic store without requiring a
-separate `traffic capture` process. Its structured HTTP executor records each
-transport result automatically, including each redirect leg and failures with
-no HTTP status. Redirect legs share one safe observation ID, so their request
-IDs can link back to the same evidence records. Capture is strict at this
-boundary: if the store cannot durably append a request, the action fails before
-its observation can reach evidence promotion.
+The base loop and bounded agent graph record structured HTTP automatically; no
+separate `traffic capture` process is required. Each phase owns a separate
+private traffic store and target-bound evidence blackboard: the base lane lives
+under `workspace/`, and the graph lane lives under
+`workspace/autonomous-route/agent-graph/`. Each executor records every
+transport result, including redirect legs and failures with no HTTP status.
+Redirect legs share one safe observation ID, so their request IDs can link back
+to the same evidence records. Capture is strict at this boundary: if the store
+cannot durably append a request, the action fails before its observation can
+reach evidence promotion.
 
-`ravage traffic list RUN_DIR` and `ravage traffic show RUN_DIR REQUEST_ID`
-discover history below `workspace/autonomous-route/agent-graph/`. They validate
-the target-bound evidence blackboard and join only exact, nonempty observation
-IDs. Their evidence view contains identifiers, kind, source, producer, and
-material status—not evidence payloads or request/response content. Markdown and
-JSON reports include the same request-to-observation-to-evidence links in their
-Agent HTTP Evidence section.
+`ravage traffic list RUN_DIR` discovers and validates both canonical lanes. If
+only one lane exists, short IDs such as `rq_0001` keep working. When both lanes
+exist, output uses qualified IDs because each private store can independently
+contain `rq_0001` or `rp_0001`:
 
-Graph resume reopens the same traffic session and reloads the structured HTTP
-state. The consumed request count and remote DNS pins therefore survive an
-interruption; resume cannot reset the request ceiling or silently accept a new
-address. The owner-only HTTP state stores a one-way target identity rather than
-the raw URL. Resume fails closed if graph state, traffic history, HTTP state,
-captured request counts, or the evidence blackboard no longer agree. For a
-managed identity, the persistent ceiling counts every physical health, login,
-refresh, retry, action, and redirect request; credential-bearing lifecycle
-traffic is not added to operator history, so the persisted physical count may
-be greater than—but never lower than—the captured action count. The request
-store also remains bound to the original target, scope, and capture session.
+```bash
+ravage traffic list RUN_DIR
+ravage traffic show RUN_DIR base:rq_0001
+ravage traffic replay RUN_DIR autonomous_graph:rq_0001
+ravage traffic diff RUN_DIR \
+  autonomous_graph:rq_0001 autonomous_graph:rp_0001
+```
+
+An unqualified ID is accepted only when it identifies one record across all
+discovered lanes. `diff` requires both records to come from the same lane/store.
+Passing an exact manifested workspace path intentionally selects only that lane
+and retains its short local IDs.
+Discovery fails closed if a lane is malformed or if the lane manifests disagree
+on target or scope. The commands validate each lane's evidence blackboard and
+join only exact, nonempty observation IDs. Their evidence view contains
+identifiers, kind, source, producer, and material status—not evidence payloads
+or request/response content. Markdown and JSON reports include the same
+request-to-observation-to-evidence links in their Agent HTTP Evidence section.
+
+Within one running process, anonymous base `http_request` actions share a cookie
+jar; configured identities use their trusted managed-session owner. Ravage does
+not write cookie values to the traffic store or HTTP state. A process-level
+resume therefore reopens the durable lane but starts a new in-memory cookie jar
+and releases session-dependent work so authentication must be re-established.
+Durable request counts, remote DNS pins, target identity, scope, and capture
+session do survive interruption. Resume fails closed if HTTP state, traffic
+history, captured counts, or the adjacent evidence blackboard no longer agree.
+For a managed identity, the persistent ceiling counts every physical health,
+login, refresh, retry, action, and redirect request; credential-bearing
+lifecycle traffic is not added to operator history, so the persisted physical
+count may be greater than—but never lower than—the captured action count.
+
+Observed forms and surface-graph operations act as replay templates. After a
+promising evidence result, the evidence-lead lock can require the same origin,
+method, normalized route, body encoding, and affected input locations for the
+next bounded mutations. An authentication denial pauses that obligation rather
+than sending the agent to an unrelated route; a real session-state change
+reactivates it. This routing discipline keeps follow-up requests tied to the
+observed shape, but it is not itself vulnerability proof.
 
 Manual browser capture comes from an executor-owned adapter around Ravage's
 Playwright context. Routed HTTP(S) navigations, redirects, and subresources are
@@ -438,10 +473,13 @@ isolated environment.
 
 ## Runtime Tools
 
-The base model action contract is `run_command`, `run_python`, `run_probe`,
-`validate_poc`, conditional `capture_flag`, and `final`. Typed HTTP, browser, and
-vulnerability operations sit behind probes and validators; names such as
-`http_get` and `browser_open` are not direct base-model actions.
+The base model action contract is `http_request`, `run_command`, `run_python`,
+`run_probe`, `validate_poc`, conditional `capture_flag`, and `final`.
+`http_request` is a direct, scope-checked base action for replaying or mutating
+an observed request shape through the persistent in-process HTTP session. Typed
+browser and vulnerability-specific operations still sit behind probes and
+validators; names such as `http_get` and `browser_open` are not direct
+base-model actions.
 
 The optional graph has a separate contract. It exposes structured
 `http_request` and, only in a process-capable profile, bounded process actions;
@@ -518,10 +556,12 @@ the ledger is missing or unreadable. Findings, captured proofs, and highest
 outcome stage are separate fields, so a no-flag run can still report
 evidence-backed vulnerabilities.
 
-When agent-graph structured HTTP history is present, report JSON includes an
-`agent_http_evidence` summary and Markdown includes **Agent HTTP Evidence**.
-Both contain identifier-only links; the private traffic and evidence stores
-remain the source of detailed captured metadata.
+When base or agent-graph structured HTTP history is present, report JSON
+includes an `agent_http_evidence` summary and Markdown includes **Agent HTTP
+Evidence**. Report request IDs are lane-qualified, so links remain unambiguous
+when both private stores contain the same local ID. Both report forms contain
+identifier-only links; the private traffic and evidence stores remain the
+source of detailed captured metadata.
 
 ## Safety Model
 
@@ -547,10 +587,10 @@ exploitation.
 
 Important limits still remain:
 
-- `ravage traffic` now covers automatic agent structured HTTP provenance and
-  scoped browser history, replay, and diff, but is not a full Burp/Caido
-  replacement. It has no transparent proxy, interception editor, `curl`/Docker
-  tool/scanner traffic capture, or complete mutation UI.
+- `ravage traffic` now covers automatic base and graph structured HTTP
+  provenance and scoped browser history, replay, and diff, but is not a full
+  Burp/Caido replacement. It has no transparent proxy, interception editor,
+  `curl`/Docker tool/scanner traffic capture, or complete mutation UI.
 - Eligible remote observe-mode browser probes require Playwright. Ravage
   disables the Chrome DevTools fallback remotely because it cannot enforce every
   subresource.
@@ -558,9 +598,9 @@ Important limits still remain:
   rate and concurrency flags must also be chosen to fit the engagement ROE.
 - The whole-run and graph low-noise profiles reduce request rate and variability
   but are not anti-detection systems.
-- Browser cookie state is stable within one process but is not yet restored
-  after a process-level resume. Agent-graph structured HTTP request counts and
-  DNS pins are restored separately.
+- Browser and anonymous structured-HTTP cookie state is stable within one
+  process but is not restored after a process-level resume. Base and graph
+  structured HTTP request counts and DNS pins are restored separately.
 - Provider continuity is not a heterogeneous challenger architecture; workers
   currently use the configured model portfolio rather than independently
   optimized role models.

@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 VALID_ACTIONS = {
+    "http_request",
     "run_command",
     "run_python",
     "run_probe",
@@ -13,6 +14,10 @@ VALID_ACTIONS = {
     "final",
     "invalid",
 }
+
+_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"})
+_BODYLESS_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_MAX_VALIDATE_POC_STEPS = 12
 
 REQUIRED_TEXT_FIELDS = {
     "run_command": "command",
@@ -65,6 +70,16 @@ def normalize_action(payload: dict[str, Any]) -> dict[str, object]:
 
     normalized: dict[str, object] = dict(payload)
     normalized["action"] = action
+    if action == "http_request":
+        normalized["method"] = _canonical_http_method(payload.get("method"))
+    elif action == "validate_poc":
+        steps = payload.get("steps")
+        assert isinstance(steps, list)
+        normalized["steps"] = [
+            {**step, "method": _canonical_http_method(step.get("method"))}
+            for step in steps
+            if isinstance(step, dict)
+        ]
     return normalized
 
 
@@ -76,16 +91,90 @@ def _action_name(payload: dict[str, Any]) -> str:
     return str(payload.get("action") or "").strip()
 
 
+def _canonical_http_method(value: object) -> str:
+    return str(value or "GET").strip().upper()
+
+
 def _validation_error(action: str, payload: dict[str, Any]) -> str:
     if action not in VALID_ACTIONS:
         return f"invalid action: {action}"
     required_text_field = REQUIRED_TEXT_FIELDS.get(action)
     if required_text_field and not _has_text(payload.get(required_text_field)):
         return f"{action} requires {required_text_field}"
-    if action == "validate_poc" and not isinstance(payload.get("steps"), list):
-        return "validate_poc requires steps list"
-    if action == "validate_poc" and payload.get("finding") is not None:
-        return _finding_validation_error(payload.get("finding"))
+    if action == "http_request":
+        return _http_request_validation_error(payload)
+    if action == "validate_poc":
+        step_error = _validate_poc_steps_validation_error(payload.get("steps"))
+        if step_error:
+            return step_error
+        if payload.get("finding") is not None:
+            return _finding_validation_error(payload.get("finding"))
+    return ""
+
+
+def _http_request_validation_error(payload: dict[str, Any]) -> str:  # noqa: PLR0911
+    if not (_has_text(payload.get("url")) or _has_text(payload.get("path"))):
+        return "http_request requires url or path"
+    method = _canonical_http_method(payload.get("method"))
+    if method not in _HTTP_METHODS:
+        return f"http_request method is not allowed: {method}"
+    if payload.get("headers") is not None and not isinstance(payload.get("headers"), dict):
+        return "http_request headers must be an object"
+    body_fields = [
+        name for name in ("body", "json", "form") if payload.get(name) is not None
+    ]
+    if len(body_fields) > 1:
+        return "http_request accepts only one of body, json, or form"
+    if method in _BODYLESS_HTTP_METHODS and body_fields:
+        return f"{method} http_request cannot include a body"
+    if payload.get("form") is not None and not isinstance(payload.get("form"), dict):
+        return "http_request form must be an object"
+    if payload.get("json") is not None and not isinstance(payload.get("json"), (dict, list)):
+        return "http_request json must be an object or list"
+    if payload.get("body") is not None and not isinstance(payload.get("body"), str):
+        return "http_request body must be a string"
+    return ""
+
+
+def _validate_poc_steps_validation_error(value: object) -> str:
+    if not isinstance(value, list) or not value:
+        return "validate_poc requires a non-empty steps list"
+    if len(value) > _MAX_VALIDATE_POC_STEPS:
+        return f"validate_poc accepts at most {_MAX_VALIDATE_POC_STEPS} steps"
+    for index, step in enumerate(value, start=1):
+        step_error = _validate_poc_step_validation_error(step)
+        if step_error:
+            return f"validate_poc step {index} {step_error}"
+    return ""
+
+
+def _validate_poc_step_validation_error(value: object) -> str:  # noqa: C901, PLR0911
+    if not isinstance(value, dict):
+        return "must be an object"
+    for location_field in ("url", "path"):
+        location = value.get(location_field)
+        if location is not None and not isinstance(location, str):
+            return f"{location_field} must be a string"
+    if not (_has_text(value.get("url")) or _has_text(value.get("path"))):
+        return "requires url or path"
+
+    method = _canonical_http_method(value.get("method"))
+    if method not in _HTTP_METHODS:
+        return f"method is not allowed: {method}"
+    if value.get("headers") is not None and not isinstance(value.get("headers"), dict):
+        return "headers must be an object"
+    if value.get("json") is not None:
+        return "does not support json; encode JSON in body and set Content-Type"
+
+    body_fields = [name for name in ("body", "form") if value.get(name) is not None]
+    if len(body_fields) > 1:
+        return "accepts only one of body or form"
+    if method in _BODYLESS_HTTP_METHODS and body_fields:
+        return f"{method} request cannot include a body"
+    if value.get("form") is not None and not isinstance(value.get("form"), dict):
+        return "form must be an object"
+    if value.get("body") is not None and not isinstance(value.get("body"), str):
+        return "body must be a string"
     return ""
 
 

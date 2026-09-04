@@ -150,8 +150,84 @@ def test_http_step_payload_masks_and_normalizes() -> None:
         ok=True,
     )
     assert payload["method"] == "POST"
-    assert payload["path"] == "/login?x=1"
+    assert payload["path"] == "/login?x=%5BREDACTED%5D"
     assert payload["fields"]["password"] != "p"
+
+
+def test_http_step_payload_sanitizes_urls_and_response_headers() -> None:
+    payload = http_step_payload(
+        action_id="safe-artifact",
+        index=1,
+        method="get",
+        url=(
+            "https://alice:request-password@target.example/callback"
+            "?view=request-query&token=request-token#request-fragment"
+        ),
+        form=None,
+        status=302,
+        ok=True,
+        response_headers={
+            "Content-Type": "text/plain; charset=utf-8",
+            "Location": (
+                "https://target.example/next"
+                "?view=location-query&code=location-code#location-fragment"
+            ),
+            "Set-Cookie": "session=response-cookie",
+            "X-Debug": "response-header-secret",
+        },
+        body="non-secret response evidence",
+    )
+
+    serialized = json.dumps(payload, sort_keys=True)
+    for secret in (
+        "alice",
+        "request-password",
+        "request-query",
+        "request-token",
+        "request-fragment",
+        "location-query",
+        "location-code",
+        "location-fragment",
+        "response-cookie",
+        "response-header-secret",
+    ):
+        assert secret not in serialized
+    assert payload["url"] == (
+        "https://target.example/callback"
+        "?view=%5BREDACTED%5D&token=%5BREDACTED%5D"
+    )
+    assert payload["path"] == "/callback?view=%5BREDACTED%5D&token=%5BREDACTED%5D"
+    headers = payload["response_headers"]
+    assert isinstance(headers, dict)
+    assert headers["location"] == (
+        "https://target.example/next?view=%5BREDACTED%5D&code=%5BREDACTED%5D"
+    )
+    assert headers["set-cookie"] == "[REDACTED]"
+    assert headers["x-debug"] == "[REDACTED]"
+
+
+def test_describe_invalid_action_sanitizes_url_bearing_error() -> None:
+    described = describe_action(
+        {
+            "action": "invalid",
+            "error": (
+                "failed https://alice:error-password@target.example/callback"
+                "?view=error-query#error-fragment; "
+                "Authorization: Bearer error-authorization"
+            ),
+        }
+    )
+
+    serialized = json.dumps(described, sort_keys=True)
+    for secret in (
+        "alice",
+        "error-password",
+        "error-query",
+        "error-fragment",
+        "error-authorization",
+    ):
+        assert secret not in serialized
+    assert "https://target.example/callback?view=%5BREDACTED%5D" in serialized
 
 
 # ---- dashboard state ----------------------------------------------------

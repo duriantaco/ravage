@@ -21,6 +21,7 @@ TRAFFIC_RUN_SCHEMA = "ravage.traffic-run.v1"
 TRAFFIC_RUN_MANIFEST = "run.json"
 _MAX_MANIFEST_BYTES = 262_144
 _TARGET_IDENTITY_RE = re.compile(r"^target:[0-9a-f]{64}$")
+_PRIVATE_HTTP_STATE_VERSION = 2
 
 
 class TrafficRunError(RuntimeError):
@@ -231,35 +232,11 @@ def read_traffic_manifest(workspace_dir: Path) -> TrafficRunManifest:
 def resolve_workspace(run_dir: Path) -> Path:
     """Resolve an explicit run directory without guessing a latest run."""
     supplied = Path(run_dir)
-    found: list[Path] = []
-    for candidate in (
-        supplied,
-        supplied / "workspace",
-        supplied / "autonomous-route" / "agent-graph",
-        supplied / "workspace" / "autonomous-route" / "agent-graph",
-    ):
-        resolved = _contained_workspace(supplied, candidate)
-        if resolved is not None and resolved not in found:
-            found.append(resolved)
+    explicit = _canonical_workspace(supplied, supplied)
+    if explicit is not None:
+        return explicit
 
-    # A normal scan can store a workspace below its run directory. Never follow
-    # an arbitrary external pointer from an untrusted run bundle; an operator
-    # can pass an external workspace explicitly instead.
-    run_manifest = supplied / "run.json"
-    payload = _read_bounded_json(run_manifest)
-    if isinstance(payload, dict) and payload.get("workspace_dir"):
-        declared = Path(str(payload["workspace_dir"]))
-        declared_candidates = (
-            (declared,) if declared.is_absolute() else (supplied / declared, Path.cwd() / declared)
-        )
-        for declared_candidate in declared_candidates:
-            for possible in (
-                declared_candidate,
-                declared_candidate / "autonomous-route" / "agent-graph",
-            ):
-                resolved = _contained_workspace(supplied, possible)
-                if resolved is not None and resolved not in found:
-                    found.append(resolved)
+    found = resolve_workspaces(supplied)
     if len(found) == 1:
         return found[0]
     if len(found) > 1:
@@ -270,21 +247,168 @@ def resolve_workspace(run_dir: Path) -> Path:
     raise TrafficRunError(f"no traffic history found in run directory {supplied}")
 
 
+def resolve_workspaces(run_dir: Path) -> tuple[Path, ...]:
+    """
+    Return every valid canonical traffic workspace below an explicit run path.
+
+    Discovery is deliberately non-recursive. A run can contain one base lane and
+    one autonomous-graph lane, and their order is always base before graph. An
+    existing canonical ``traffic`` directory is treated as an asserted artifact:
+    if its manifest is missing or invalid, discovery fails closed instead of
+    silently selecting another lane.
+    """
+    supplied = Path(run_dir)
+    candidates: list[Path] = [
+        supplied,
+        supplied / "workspace",
+        supplied / "autonomous-route" / "agent-graph",
+        supplied / "workspace" / "autonomous-route" / "agent-graph",
+    ]
+    # Preserve custom/legacy run layouts declared by the ordinary run manifest,
+    # while subjecting them to the same containment and canonical-child rules.
+    for declared in _declared_workspace_candidates(supplied):
+        candidates.extend((declared, declared / "autonomous-route" / "agent-graph"))
+    _require_expected_traffic_roots(supplied, candidates)
+    found: list[tuple[str, Path, TrafficRunManifest]] = []
+    for candidate in candidates:
+        resolved = _canonical_workspace(supplied, candidate)
+        if resolved is None or any(resolved == item[1] for item in found):
+            continue
+        manifest = read_traffic_manifest(resolved)
+        lane = _workspace_lane(resolved)
+        if any(lane == item[0] for item in found):
+            raise TrafficRunError(f"multiple canonical {lane} traffic histories found")
+        found.append((lane, resolved, manifest))
+
+    found.sort(key=lambda item: 0 if item[0] == "base" else 1)
+    if found:
+        expected = _manifest_boundary(found[0][2])
+        if any(_manifest_boundary(item[2]) != expected for item in found[1:]):
+            raise TrafficRunError("traffic histories disagree on target or scope")
+    return tuple(item[1] for item in found)
+
+
 def _require_posix_traffic_artifacts() -> None:
     if os.name != "posix":
         raise TrafficRunError("traffic artifacts require a POSIX filesystem; on Windows, use WSL")
 
 
-def _contained_workspace(root: Path, candidate: Path) -> Path | None:
-    """Return a real workspace path only when it stays below the supplied root."""
+def _canonical_workspace(root: Path, candidate: Path) -> Path | None:
+    """Return a manifested canonical workspace contained below the supplied root."""
+    resolved_candidate = _contained_candidate(root, candidate)
+    if resolved_candidate is None:
+        return None
+    traffic_root = resolved_candidate / "traffic"
+    try:
+        os.lstat(traffic_root)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise TrafficRunError("could not inspect canonical traffic workspace") from exc
+    # The caller reads and validates the manifest. Returning a workspace as soon
+    # as its canonical traffic root exists ensures malformed roots are not
+    # skipped in favour of another valid lane.
+    read_traffic_manifest(resolved_candidate)
+    return resolved_candidate
+
+
+def _workspace_lane(workspace: Path) -> str:
+    if workspace.name == "agent-graph" and workspace.parent.name == "autonomous-route":
+        return "autonomous_graph"
+    return "base"
+
+
+def _manifest_boundary(manifest: TrafficRunManifest) -> tuple[object, ...]:
+    return (
+        manifest.target_url,
+        manifest.target_identity,
+        manifest.origin,
+        manifest.in_scope,
+        manifest.out_of_scope,
+    )
+
+
+def _require_expected_traffic_roots(root: Path, candidates: list[Path]) -> None:
+    """Reject durable HTTP state whose adjacent canonical traffic lane is missing."""
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = _contained_candidate(root, candidate)
+        if resolved is None or resolved in seen:
+            continue
+        seen.add(resolved)
+        if not _traffic_expected_at(resolved):
+            continue
+        try:
+            os.lstat(resolved / "traffic")
+        except FileNotFoundError as exc:
+            raise TrafficRunError(
+                "durable HTTP state exists without its canonical traffic history"
+            ) from exc
+        except OSError as exc:
+            raise TrafficRunError("could not inspect canonical traffic workspace") from exc
+
+
+def _contained_candidate(root: Path, candidate: Path) -> Path | None:
     try:
         resolved_root = root.resolve(strict=True)
-        resolved_candidate = candidate.resolve(strict=True)
-        resolved_candidate.relative_to(resolved_root)
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return None
-    manifest = resolved_candidate / "traffic" / TRAFFIC_RUN_MANIFEST
-    return resolved_candidate if manifest.is_file() else None
+    except (OSError, RuntimeError) as exc:
+        raise TrafficRunError("could not resolve traffic run directory") from exc
+    try:
+        resolved_candidate = candidate.resolve(strict=True)
+    except FileNotFoundError:
+        return None
+    except (OSError, RuntimeError) as exc:
+        raise TrafficRunError("could not resolve canonical traffic workspace") from exc
+    try:
+        resolved_candidate.relative_to(resolved_root)
+    except ValueError:
+        return None
+    return resolved_candidate
+
+
+def _traffic_expected_at(workspace: Path) -> bool:
+    if any(
+        _artifact_path_present(workspace / name)
+        for name in ("agent-http-state.json", "graph-http-state.json")
+    ):
+        return True
+    remote_state = _read_bounded_json(workspace / "remote-http-state.json")
+    if (
+        isinstance(remote_state, dict)
+        and remote_state.get("version") == _PRIVATE_HTTP_STATE_VERSION
+        and remote_state.get("target_identity")
+    ):
+        return True
+    for receipt_name in ("graph-route-receipt.json", "remote-graph-receipt.json"):
+        receipt = _read_bounded_json(workspace / receipt_name)
+        if isinstance(receipt, dict) and "traffic" in receipt:
+            return True
+    return False
+
+
+def _artifact_path_present(path: Path) -> bool:
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise TrafficRunError("could not inspect durable HTTP state") from exc
+    return True
+
+
+def _declared_workspace_candidates(run_dir: Path) -> tuple[Path, ...]:
+    payload = _read_bounded_json(run_dir / "run.json")
+    if not isinstance(payload, dict) or not payload.get("workspace_dir"):
+        return ()
+    declared = Path(str(payload["workspace_dir"]))
+    if declared.is_absolute():
+        return (declared,)
+    # Older manifests have used both run-relative and process-relative paths.
+    # `_canonical_workspace` later rejects either interpretation if it escapes
+    # the explicitly supplied run directory.
+    return (run_dir / declared, Path.cwd() / declared)
 
 
 def _read_bounded_json(path: Path) -> object | None:
@@ -378,5 +502,6 @@ __all__ = [
     "TrafficRunManifest",
     "read_traffic_manifest",
     "resolve_workspace",
+    "resolve_workspaces",
     "write_traffic_manifest",
 ]
