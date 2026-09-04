@@ -172,8 +172,38 @@ def test_xben_child_invokes_the_public_attack_command(
     assert cmd[cmd.index("--model-tier") + 1] == "high"
     assert cmd[cmd.index("--max-turns") + 1] == "7"
     assert "--allow-degraded" in cmd
+    assert "--source-root" not in cmd
     assert "--benchmark-proof-recognition" not in cmd
     assert captured["timeout"] == DEFAULT_SUBPROCESS_TIMEOUT_SECONDS
+
+
+def test_xben_child_forwards_trusted_source_root_as_cli_opt_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr("ravage.xben_parts.agent.subprocess.run", fake_run)
+    source_root = tmp_path / "benchmarks" / "XBEN-001-24"
+    source_root.mkdir(parents=True)
+
+    _run_agent_subprocess(
+        settings=XbenSettings(mode="white-box"),
+        brief_path=tmp_path / "brief.yaml",
+        target_url=TARGET_URL,
+        db_path=tmp_path / "audit.db",
+        workspace_path=tmp_path / "workspace",
+        stdout=StringIO(),
+        source_root=source_root,
+    )
+
+    cmd = captured["cmd"]
+    assert isinstance(cmd, list)
+    assert cmd[cmd.index("--source-root") + 1] == str(source_root)
 
 
 def test_xben_child_live_output_is_streamed_and_captured(

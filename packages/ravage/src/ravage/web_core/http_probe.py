@@ -311,14 +311,20 @@ class _RequestPacer:
         self._last_started = 0.0
         self._lock = threading.Lock()
 
-    def wait(self) -> None:
+    def wait(self, *, deadline_monotonic: float | None = None) -> None:
         if self.minimum_interval <= 0:
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                raise TimeoutError("probe wall-clock deadline exceeded")
             return
         with self._lock:
             now = time.monotonic()
             delay = self.minimum_interval - (now - self._last_started)
             if delay > 0:
+                if deadline_monotonic is not None and delay >= deadline_monotonic - now:
+                    raise TimeoutError("probe wall-clock deadline exceeded")
                 time.sleep(delay)
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                raise TimeoutError("probe wall-clock deadline exceeded")
             self._last_started = time.monotonic()
 
 
@@ -613,6 +619,7 @@ class ProbeSession:
         traffic_retryable: bool = False,
         traffic_timing_sensitive: bool = False,
         max_body_bytes: int = MAX_BODY_BYTES,
+        _deadline_monotonic: float | None = None,
     ) -> None:
         parsed = assert_tool_target_url(
             target_url,
@@ -667,6 +674,9 @@ class ProbeSession:
         self._traffic_retryable = bool(traffic_retryable)
         self._traffic_timing_sensitive = bool(traffic_timing_sensitive)
         self.max_body_bytes = _validated_body_limit(max_body_bytes)
+        if _deadline_monotonic is not None and not math.isfinite(_deadline_monotonic):
+            raise ValueError("probe deadline must be finite")
+        self._deadline_monotonic = _deadline_monotonic
         # Ordinary probe sessions deliberately fork without cookies. A managed
         # authenticated owner opts its live identity into inheritance so
         # internal isolation does not silently downgrade form-cookie probes.
@@ -753,6 +763,17 @@ class ProbeSession:
         """Install owner preflight with an optional post-dispatch accounting commit."""
         self._request_gate = gate
 
+    def constrain_wall_clock(self, seconds: float) -> None:
+        """Apply a monotonic whole-session deadline, inherited by session forks."""
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+            raise TypeError("probe wall-clock limit must be a number")
+        duration = float(seconds)
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError("probe wall-clock limit must be finite and positive")
+        deadline = time.monotonic() + duration
+        if self._deadline_monotonic is None or deadline < self._deadline_monotonic:
+            self._deadline_monotonic = deadline
+
     def add_traffic_observer(
         self,
         observer: Callable[[dict[str, object]], None],
@@ -813,6 +834,11 @@ class ProbeSession:
     def managed_identity_lease(self) -> object | None:
         return self._managed_identity_lease
 
+    @property
+    def wall_clock_deadline_monotonic(self) -> float | None:
+        """Return the trusted whole-session deadline for an owner-managed delegate."""
+        return self._deadline_monotonic
+
     def update_managed_identity_generation(self, generation: int) -> None:
         if self._managed_request_delegate is None:
             raise RuntimeError("cannot update an unbound managed probe session")
@@ -866,16 +892,16 @@ class ProbeSession:
             traffic_retryable=self._traffic_retryable,
             traffic_timing_sensitive=self._traffic_timing_sensitive,
             max_body_bytes=self.max_body_bytes if max_body_bytes is None else max_body_bytes,
+            _deadline_monotonic=self._deadline_monotonic,
         )
         forked._fork_inherits_managed_identity = self._fork_inherits_managed_identity
         forked._managed_identity_header_names = self._managed_identity_header_names
         forked._request_gate = self._request_gate
         forked._traffic_identity_alias_override = self._traffic_identity_alias_override
         forked._traffic_identity_generation_override = self._traffic_identity_generation_override
-        if (
-            inherit_identity is False
-            and self._traffic_identity_alias_override is not None
-        ) or (not copy_identity and self._managed_identity_header_names):
+        if (inherit_identity is False and self._traffic_identity_alias_override is not None) or (
+            not copy_identity and self._managed_identity_header_names
+        ):
             forked._traffic_identity_alias_override = ""
             forked._traffic_identity_generation_override = 0
         if copy_identity:
@@ -1115,6 +1141,8 @@ class ProbeSession:
         timeout_seconds: float | None = None,
         max_body_bytes: int | None = None,
     ) -> ProbeResponse:
+        requested_timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        effective_timeout = self._deadline_bounded_timeout(requested_timeout)
         delegate = self._managed_request_delegate
         if delegate is not None:
             if max_body_bytes is not None:
@@ -1129,7 +1157,7 @@ class ProbeSession:
                 url,
                 data=data,
                 headers=headers,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=effective_timeout,
             )
         if max_body_bytes is None:
             return self._request_direct(
@@ -1137,14 +1165,14 @@ class ProbeSession:
                 url,
                 data=data,
                 headers=headers,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=effective_timeout,
             )
         return self._request_direct(
             method,
             url,
             data=data,
             headers=headers,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=effective_timeout,
             max_body_bytes=max_body_bytes,
         )
 
@@ -1221,7 +1249,14 @@ class ProbeSession:
             policy = self._traffic_policy
             if policy is not None:
                 try:
-                    decision = policy.acquire(intent, retry=attempt > 0)
+                    if self._deadline_monotonic is None:
+                        decision = policy.acquire(intent, retry=attempt > 0)
+                    else:
+                        decision = policy.acquire(
+                            intent,
+                            retry=attempt > 0,
+                            _deadline_monotonic=self._deadline_monotonic,
+                        )
                 except TrafficPolicyBlocked as exc:
                     return self._policy_blocked_response(
                         normalized_method,
@@ -1262,7 +1297,8 @@ class ProbeSession:
                     headers=request_headers,
                     method=normalized_method,
                 )
-                self._request_pacer.wait()
+                self._request_pacer.wait(deadline_monotonic=self._deadline_monotonic)
+                request_timeout = self._deadline_bounded_timeout(normalized_timeout)
                 gate_commit = _prepare_request_gate(
                     self._request_gate,
                     normalized_method,
@@ -1279,7 +1315,13 @@ class ProbeSession:
                 raise
             if policy is not None and lease is not None:
                 try:
-                    policy.begin_dispatch(lease)
+                    if self._deadline_monotonic is None:
+                        policy.begin_dispatch(lease)
+                    else:
+                        policy.begin_dispatch(
+                            lease,
+                            _deadline_monotonic=self._deadline_monotonic,
+                        )
                 except TrafficPolicyBlocked as exc:
                     _cancel_policy_lease_preserving(
                         policy,
@@ -1301,6 +1343,23 @@ class ProbeSession:
                     )
                     raise
 
+            try:
+                # Whole-run policy pacing happens after the route-local pacer, so
+                # bind the transport timeout again at the actual dispatch edge.
+                request_timeout = self._deadline_bounded_timeout(normalized_timeout)
+            except BaseException as exc:
+                if policy is not None and lease is not None:
+                    _complete_policy_lease_preserving(
+                        policy,
+                        lease,
+                        TrafficOutcome(status=None, transport_error=True),
+                        exc,
+                        message=(
+                            "traffic policy could not persist expired dispatch completion"
+                        ),
+                    )
+                raise
+
             started = time.monotonic()
             try:
                 # This is the accounting boundary: every path below has entered
@@ -1311,7 +1370,7 @@ class ProbeSession:
                     request,
                     method=normalized_method,
                     absolute_url=absolute_url,
-                    request_timeout=normalized_timeout,
+                    request_timeout=request_timeout,
                     started=started,
                     max_body_bytes=response_body_limit,
                 )
@@ -1322,9 +1381,7 @@ class ProbeSession:
                         lease,
                         TrafficOutcome(status=None, transport_error=True),
                         exc,
-                        message=(
-                            "traffic policy could not persist unexpected dispatch completion"
-                        ),
+                        message=("traffic policy could not persist unexpected dispatch completion"),
                     )
                 _commit_request_gate_preserving(
                     gate_commit,
@@ -1372,6 +1429,16 @@ class ProbeSession:
             if policy is None or not policy.should_retry(intent, outcome, attempt):
                 return result
             attempt += 1
+
+    def _deadline_bounded_timeout(self, requested_timeout: float) -> float:
+        normalized = _validated_timeout(requested_timeout)
+        deadline = self._deadline_monotonic
+        if deadline is None:
+            return normalized
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("probe wall-clock deadline exceeded")
+        return min(normalized, remaining)
 
     def _execute_transport_request(
         self,

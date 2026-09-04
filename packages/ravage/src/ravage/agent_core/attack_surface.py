@@ -91,15 +91,86 @@ def merge_surface_state(state: AgentState, surface: dict[str, object]) -> None:
 def compact_surface_for_prompt(surface: dict[str, object]) -> dict[str, object]:
     return {
         "counts": surface.get("counts", {}),
-        "technologies": surface.get("technologies", []),
-        "candidate_workflows": surface.get("candidate_workflows", []),
+        "technologies": _string_list(surface.get("technologies"))[:20],
+        "candidate_workflows": _list_of_dicts(surface.get("candidate_workflows"))[:20],
         "high_value_forms": _ranked_forms(surface)[:10],
         "high_value_parameters": _ranked_parameters(surface)[:16],
-        "reflections": surface.get("reflections", []),
-        "markers": surface.get("markers", []),
+        "reflections": _list_of_dicts(surface.get("reflections"))[:20],
+        "markers": _string_list(surface.get("markers"))[:20],
         "notable_endpoints": _ranked_endpoints(surface)[:16],
-        "request_templates": surface.get("request_templates", [])[:10],
+        "request_templates": _ranked_request_templates(surface)[:10],
+        "source_analysis": _compact_source_analysis(surface.get("source_analysis")),
+        "source_candidates": _compact_source_candidates(
+            surface.get("source_candidates"),
+            limit=8,
+        ),
     }
+
+
+def _compact_source_analysis(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    allowed = (
+        "schema",
+        "analyzer_contract",
+        "source_digest",
+        "candidate_digest",
+        "files_scanned",
+        "files_parsed",
+        "parse_failures",
+        "symlinks_skipped",
+        "directories_scanned",
+        "directory_entries_scanned",
+        "excluded_directories",
+        "analysis_complete",
+        "routes_discovered",
+        "route_patterns_skipped",
+        "flow_patterns_skipped",
+        "candidates_found",
+        "candidates_ingested",
+        "artifact",
+    )
+    return {key: value[key] for key in allowed if key in value}
+
+
+def _compact_source_candidates(value: object, *, limit: int) -> list[dict[str, object]]:
+    allowed = (
+        "candidate_id",
+        "family",
+        "method",
+        "route",
+        "input_name",
+        "input_location",
+        "framework",
+        "route_binding",
+        "relative_file",
+        "line",
+        "sink_kind",
+        "live_validation",
+        "query_fields",
+        "status",
+    )
+    candidates = _list_of_dicts(value)
+    selected: list[dict[str, object]] = []
+    selected_ids: set[int] = set()
+    represented_families: set[str] = set()
+    for index, item in enumerate(candidates):
+        family = str(item.get("family") or "").strip().casefold()
+        if not family or family in represented_families:
+            continue
+        selected.append(item)
+        selected_ids.add(index)
+        represented_families.add(family)
+        if len(selected) == limit:
+            break
+    if len(selected) < limit:
+        for index, item in enumerate(candidates):
+            if index in selected_ids:
+                continue
+            selected.append(item)
+            if len(selected) == limit:
+                break
+    return [{key: item[key] for key in allowed if key in item} for item in selected]
 
 
 def _workflow_names_for_surface(surface: dict[str, object]) -> list[str]:
@@ -357,18 +428,10 @@ def _request_template_payload(template: dict[str, object], page_url: str) -> dic
     }
     fields = template.get("fields")
     if isinstance(fields, dict):
-        payload["fields"] = {
-            str(key): str(value)
-            for key, value in fields.items()
-            if str(key)
-        }
+        payload["fields"] = {str(key): str(value) for key, value in fields.items() if str(key)}
     headers = template.get("headers")
     if isinstance(headers, dict):
-        payload["headers"] = {
-            str(key): str(value)
-            for key, value in headers.items()
-            if str(key)
-        }
+        payload["headers"] = {str(key): str(value) for key, value in headers.items() if str(key)}
     return payload
 
 
@@ -492,19 +555,42 @@ def _candidate_workflows(
     if forms or parameters:
         _add_workflow(workflows, "input mapping", "forms or parameters are reachable", 90)
     if reflected:
-        _add_workflow(workflows, "reflection sink analysis", "recon confirmed reflected marker input", 95)
+        _add_workflow(
+            workflows, "reflection sink analysis", "recon confirmed reflected marker input", 95
+        )
     if _has_auth_workflow(forms=forms, cookies=cookies):
-        _add_workflow(workflows, "session and role workflow", "auth forms or cookies are present", 85)
+        _add_workflow(
+            workflows, "session and role workflow", "auth forms or cookies are present", 85
+        )
     if _has_file_workflow(parameters=parameters, evidence=evidence):
-        _add_workflow(workflows, "file read or upload workflow", "file-like inputs or upload markers are present", 85)
+        _add_workflow(
+            workflows,
+            "file read or upload workflow",
+            "file-like inputs or upload markers are present",
+            85,
+        )
     if _has_fetch_workflow(parameters=parameters, evidence=evidence):
-        _add_workflow(workflows, "server-side fetch workflow", "url-like inputs or webhook/fetch wording observed", 82)
+        _add_workflow(
+            workflows,
+            "server-side fetch workflow",
+            "url-like inputs or webhook/fetch wording observed",
+            82,
+        )
     if _text_contains_one(evidence, ("xml", "soap", "svg")):
-        _add_workflow(workflows, "structured parser workflow", "xml/soap/svg markers are present", 78)
+        _add_workflow(
+            workflows, "structured parser workflow", "xml/soap/svg markers are present", 78
+        )
     if _text_contains_one(evidence, ("template", "jinja", "render", "{{", "{%")):
-        _add_workflow(workflows, "server-side rendering workflow", "template/rendering markers are present", 88)
+        _add_workflow(
+            workflows,
+            "server-side rendering workflow",
+            "template/rendering markers are present",
+            88,
+        )
     if _text_contains_one(evidence, ("sql", "sqlite", "mysql", "postgres", "query", "search")):
-        _add_workflow(workflows, "data query workflow", "database/search/query signals are present", 82)
+        _add_workflow(
+            workflows, "data query workflow", "database/search/query signals are present", 82
+        )
     if _text_contains_one(
         evidence,
         (
@@ -523,9 +609,19 @@ def _candidate_workflows(
             "struts",
         ),
     ):
-        _add_workflow(workflows, "command boundary workflow", "command-shaped wording or host/domain inputs observed", 76)
+        _add_workflow(
+            workflows,
+            "command boundary workflow",
+            "command-shaped wording or host/domain inputs observed",
+            76,
+        )
     if _text_contains_one(evidence, ("backup", "debug", "robots", ".git", "env", "config")):
-        _add_workflow(workflows, "exposed secret workflow", "debug/backup/config words or markers observed", 80)
+        _add_workflow(
+            workflows,
+            "exposed secret workflow",
+            "debug/backup/config words or markers observed",
+            80,
+        )
     workflows.sort(key=_workflow_sort_key)
     return workflows
 
@@ -611,11 +707,31 @@ def _ranked_forms(surface: dict[str, object]) -> list[dict[str, object]]:
 
 
 def _ranked_parameters(surface: dict[str, object]) -> list[dict[str, object]]:
-    return _list_of_dicts(surface.get("parameters"))
+    return sorted(
+        _list_of_dicts(surface.get("parameters")),
+        key=_parameter_sort_key,
+    )
 
 
 def _ranked_endpoints(surface: dict[str, object]) -> list[dict[str, object]]:
-    return _list_of_dicts(surface.get("endpoints"))
+    return sorted(
+        _list_of_dicts(surface.get("endpoints")),
+        key=_endpoint_sort_key,
+    )
+
+
+def _ranked_request_templates(surface: dict[str, object]) -> list[dict[str, object]]:
+    return sorted(
+        _list_of_dicts(surface.get("request_templates")),
+        key=_request_template_sort_key,
+    )
+
+
+def _request_template_sort_key(template: dict[str, object]) -> tuple[int, str, str]:
+    priority = -_int_value(template.get("priority"))
+    method = str(template.get("method") or "GET").upper()
+    url = str(template.get("url") or "")
+    return priority, method, url
 
 
 def _form_priority(form: dict[str, object]) -> int:
@@ -656,9 +772,25 @@ def _form_categories(*, action: str, names: list[str], input_types: list[str]) -
         categories.append("csrf")
     if _has_file_field_name(names):
         categories.append("file")
-    if _text_contains_one(text, ("cmd", "command", "exec", "shell", "ping", "host", "domain", "health", "status", "validate")):
+    if _text_contains_one(
+        text,
+        (
+            "cmd",
+            "command",
+            "exec",
+            "shell",
+            "ping",
+            "host",
+            "domain",
+            "health",
+            "status",
+            "validate",
+        ),
+    ):
         categories.append("command_boundary")
-    if any(name.lower() in {"url", "uri", "endpoint", "target"} for name in names) and _text_contains_one(
+    if any(
+        name.lower() in {"url", "uri", "endpoint", "target"} for name in names
+    ) and _text_contains_one(
         text,
         ("add_url", "check", "validate", "status", "health", "service"),
     ):
@@ -687,7 +819,9 @@ def _parameter_hints(name: str) -> list[str]:
     hints = []
     if _looks_like_file(lowered):
         hints.append("file")
-    if _text_contains_one(lowered, ("url", "uri", "endpoint", "webhook", "callback", "next", "redirect")):
+    if _text_contains_one(
+        lowered, ("url", "uri", "endpoint", "webhook", "callback", "next", "redirect")
+    ):
         hints.append("url")
     if _text_contains_one(lowered, ("id", "uid", "user", "account", "post", "order")):
         hints.append("object_id")

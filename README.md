@@ -92,6 +92,38 @@ ravage doctor --workflow attack --brief ravage-brief.yaml
 ravage attack ravage-brief.yaml --allow-paid-models --report
 ~~~
 
+For an application checkout you are authorized to test, opt into source-guided
+validation with a local Python source directory:
+
+~~~bash
+ravage attack ravage-brief.yaml \
+  --source-root /path/to/application \
+  --allow-paid-models \
+  --report
+~~~
+
+This mode maps bounded Flask and FastAPI route-to-sink flows locally, adds only
+structural metadata to the attack surface, and automatically validates only
+statically bound, non-mutating GET/query SQL-injection hypotheses whose complete
+scalar query shape is known. POST, body, form, path, dynamic, and relatively
+bound candidates remain prioritization hints. Traversal is capped by files,
+bytes, directories, and directory entries; included source that exceeds a cap
+fails closed. Hidden, temporary, version-control, virtual-environment,
+dependency, cache, and build directories are excluded and reported. These
+exclusions and static matches are not live proof: Ravage still requires
+differential runtime
+evidence. The private source map contains structural identifiers such as route
+and input names, relative file paths, and line numbers; a bounded subset is
+sent to the configured model. Source snippets, function bodies, unrelated
+constant values, and absolute source paths are not stored or sent.
+Dynamic routes, unsupported route or direct-flow patterns, skipped symlinks,
+and files that cannot be parsed can reduce coverage; the run records that
+coverage as incomplete instead of claiming a clean result. Here,
+<code>analysis_complete</code> means every included file parsed and every
+recognized bounded pattern was handled. It is not a claim of whole-program
+coverage. Resume requires the same source snapshot, analyzer contract, and
+candidate map.
+
 <code>--allow-paid-models</code> is an explicit acknowledgement that the run
 can incur provider charges. Model selection, local providers, and reproducible
 profiles are documented in [Model providers](docs/model-providers.md).
@@ -275,6 +307,7 @@ model assertion as a confirmed finding.
 | --- | --- | --- |
 | Deterministic recon and probes | <code>ravage scan</code> | No model required |
 | Model-driven assessment | <code>ravage attack</code> | Evidence-gated and scoped |
+| Source-guided validation | <code>ravage attack --source-root</code> | Local Flask/FastAPI mapping; live proof required |
 | Managed authentication | <code>ravage auth</code> | Sessions, role-aware map, authorization matrix |
 | Traffic inspection and replay | <code>ravage traffic</code> | Scoped artifacts |
 | Knowledge skills | <code>ravage skills</code>, <code>ravage code-bug</code> | Advisory |

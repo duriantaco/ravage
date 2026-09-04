@@ -8,9 +8,12 @@ from collections.abc import Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
+from pathlib import PurePosixPath
 from urllib.parse import parse_qsl, unquote, urljoin, urlsplit
 
 from ravage.agent_core.surface_graph import (
+    MAX_SURFACE_OBSERVATIONS,
+    MAX_SURFACE_OPERATIONS,
     SurfaceAccessObservation,
     SurfaceGraphError,
     SurfaceGraphState,
@@ -42,6 +45,26 @@ _MAX_EXTERNAL_ARRAY_ITEMS = 64
 _MAX_CAPTURED_EXCHANGE_IMPORTS = 2_048
 _MAX_OPENAPI_REF_DEPTH = 32
 _MAX_OPENAPI_REF_CHARS = 512
+_MAX_SOURCE_CODE_CANDIDATES = 512
+_MAX_SOURCE_ROUTE_CHARS = 1_024
+_MAX_SOURCE_FILE_CHARS = 240
+_MAX_SOURCE_LINE = 10_000_000
+_SOURCE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$")
+_SOURCE_INPUT_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:\[\]-]{0,127}$")
+_SOURCE_FILE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.@+\-\[\]()$]+$")
+_SOURCE_CANDIDATE_REQUIRED_FIELDS = frozenset(
+    {
+        "candidate_id",
+        "family",
+        "input_location",
+        "input_name",
+        "line",
+        "method",
+        "relative_file",
+        "route",
+    }
+)
+_SOURCE_CANDIDATE_OPTIONAL_FIELDS = frozenset({"sink_kind"})
 
 
 @dataclass(slots=True)
@@ -53,6 +76,88 @@ class _InspectionBudget:
             return False
         self.remaining -= 1
         return True
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceCodeCandidate:
+    candidate_id: str
+    family: str
+    input_location: str
+    input_name: str
+    line: int
+    method: str
+    relative_file: str
+    route: str
+    sink_kind: str = ""
+
+    @classmethod
+    def from_mapping(cls, value: object) -> _SourceCodeCandidate:
+        if not isinstance(value, Mapping):
+            raise SurfaceGraphError("source code candidate must be a mapping")
+        fields = set(value)
+        allowed = _SOURCE_CANDIDATE_REQUIRED_FIELDS | _SOURCE_CANDIDATE_OPTIONAL_FIELDS
+        if any(not isinstance(field, str) for field in fields) or fields - allowed:
+            raise SurfaceGraphError("source code candidate contains unsupported fields")
+        if missing := _SOURCE_CANDIDATE_REQUIRED_FIELDS - fields:
+            raise SurfaceGraphError(
+                f"source code candidate is missing required field: {min(missing)}"
+            )
+
+        method = _source_identifier(value.get("method"), label="source method").upper()
+        if method not in _HTTP_METHODS:
+            raise SurfaceGraphError("source code candidate has unsupported HTTP method")
+        family = _source_identifier(value.get("family"), label="source family").casefold()
+        candidate_id = _source_identifier(
+            value.get("candidate_id"),
+            label="source candidate id",
+        )
+        input_name = _source_input_name(value.get("input_name"))
+        input_location = _source_input_location(value.get("input_location"))
+        sink_kind = (
+            _source_identifier(value.get("sink_kind"), label="source sink kind").casefold()
+            if "sink_kind" in value
+            else ""
+        )
+        line = _source_line(value.get("line"))
+        return cls(
+            candidate_id=candidate_id,
+            family=family,
+            input_location=input_location,
+            input_name=input_name,
+            line=line,
+            method=method,
+            relative_file=_source_relative_file(value.get("relative_file")),
+            route=_source_route(value.get("route")),
+            sink_kind=sink_kind,
+        )
+
+    @property
+    def parameter(self) -> SurfaceParameter:
+        return SurfaceParameter.create(name=self.input_name, location=self.input_location)
+
+    @property
+    def content_types(self) -> tuple[str, ...]:
+        if self.input_location == "body":
+            return ("application/json",)
+        if self.input_location == "form":
+            return ("application/x-www-form-urlencoded",)
+        return ()
+
+    @property
+    def hints(self) -> tuple[str, ...]:
+        # Only validated structural identifiers enter the graph.  Source text,
+        # values, defaults, examples, and absolute filesystem paths are not part
+        # of this contract and therefore cannot leak through these hints.
+        hints = [
+            "source_code",
+            self.family,
+            f"source_family:{self.family}",
+            f"source_location:{self.relative_file}:{self.line}",
+            f"source_candidate:{self.candidate_id}",
+        ]
+        if self.sink_kind:
+            hints.extend((self.sink_kind, f"source_sink:{self.sink_kind}"))
+        return tuple(hints)
 
 
 @dataclass(slots=True)
@@ -293,6 +398,91 @@ def ingest_captured_exchanges(
             raise SurfaceGraphError("captured exchange import requires typed exchanges")
         staged.ingest_exchange(exchange)
         imported += 1
+    graph.merge_snapshot(staged)
+    return imported
+
+
+def ingest_source_code_candidates(
+    graph: SurfaceGraphState,
+    candidates: Iterable[Mapping[str, object]],
+    *,
+    target_url: str,
+) -> int:
+    """
+    Atomically ingest bounded, value-free routes derived from declared source.
+
+    ``target_url`` is the sole authority for network origin.  Candidate mappings
+    may describe only a relative route, one input, and a relative code location;
+    they cannot provide a URL, origin, request value, response, or evidence.
+    Static source establishes useful attack-surface candidates, but every access
+    observation remains declaration-only until a managed runtime validates it.
+    """
+    staged = SurfaceGraphState.for_target(target_url)
+    if graph.target_origin and staged.target_origin != graph.target_origin:
+        raise SurfaceGraphError("source code target does not match surface graph target")
+
+    existing_operation_ids = set(graph.operations or {})
+    existing_observation_ids = set(graph.observations or {})
+    operation_slots = max(0, MAX_SURFACE_OPERATIONS - len(existing_operation_ids))
+    observation_slots = max(0, MAX_SURFACE_OBSERVATIONS - len(existing_observation_ids))
+    staged_operation_ids: set[str] = set()
+    staged_observation_ids: set[str] = set()
+    imported = 0
+    for index, raw_candidate in enumerate(candidates):
+        if index >= _MAX_SOURCE_CODE_CANDIDATES:
+            raise SurfaceGraphError("source code candidates exceed the item limit")
+        candidate = _SourceCodeCandidate.from_mapping(raw_candidate)
+        url = f"{staged.target_origin}{candidate.route}"
+        operation = SurfaceOperation.create(
+            url=url,
+            method=candidate.method,
+            parameters=(candidate.parameter,),
+            content_types=candidate.content_types,
+            hints=candidate.hints,
+            provenance=("source_code",),
+        )
+        observation = SurfaceAccessObservation.create(
+            operation_id=operation.operation_id,
+            identity_alias="anonymous",
+            source_kind="source_code",
+            access_level="declared",
+            response_status=None,
+            scope_decision="unknown",
+            replayability="unknown",
+            evidence_refs=(),
+        )
+        operation_is_new = operation.operation_id not in (
+            existing_operation_ids | staged_operation_ids
+        )
+        observation_is_new = observation.observation_id not in (
+            existing_observation_ids | staged_observation_ids
+        )
+        if (operation_is_new and not operation_slots) or (
+            observation_is_new and not observation_slots
+        ):
+            continue
+        staged.add(
+            url=url,
+            method=candidate.method,
+            parameters=(candidate.parameter,),
+            content_types=candidate.content_types,
+            hints=candidate.hints,
+            source_kind="source_code",
+            identity_alias="anonymous",
+            access_level="declared",
+            response_status=None,
+            scope_decision="unknown",
+            replayability="unknown",
+            evidence_refs=(),
+        )
+        if operation_is_new:
+            operation_slots -= 1
+            staged_operation_ids.add(operation.operation_id)
+        if observation_is_new:
+            observation_slots -= 1
+            staged_observation_ids.add(observation.observation_id)
+        imported += 1
+
     graph.merge_snapshot(staged)
     return imported
 
@@ -688,13 +878,24 @@ def project_surface_graph(
             str(item.get("method") or "GET").upper(),
             str(item.get("url") or ""),
             str(item.get("selector") or ""),
-        ): _copy_legacy_record(item, mapping_fields=("fields",))
+        ): _copy_legacy_record(
+            item,
+            list_fields=("content_types", "hints"),
+            mapping_fields=("fields", "input_locations"),
+        )
         for item in _mapping_items(legacy.get("request_templates"))[:512]
     }
     parameters_by_name = {
         str(item.get("name") or ""): _copy_legacy_record(
             item,
-            list_fields=("sources", "locations", "hints", "data_types"),
+            list_fields=(
+                "sources",
+                "locations",
+                "hints",
+                "data_types",
+                "input_locations",
+                "methods",
+            ),
         )
         for item in _mapping_items(legacy.get("parameters"))[:512]
         if str(item.get("name") or "")
@@ -706,6 +907,7 @@ def project_surface_graph(
     ):
         url = operation.structural_url
         structural = "{" in operation.route_shape
+        source_backed = "source_code" in operation.provenance
         endpoint = existing_endpoints.setdefault(
             url,
             {
@@ -721,6 +923,11 @@ def project_surface_graph(
         )
         endpoint["hints"] = sorted(set(_string_items(endpoint.get("hints"))) | set(operation.hints))
         endpoint["structural"] = bool(endpoint.get("structural")) or structural
+        if source_backed:
+            endpoint["priority"] = max(
+                300,
+                _projection_priority(endpoint.get("priority")),
+            )
         if not structural:
             template_key = (operation.method, url, operation.selector)
             template = templates_by_key.setdefault(
@@ -733,11 +940,14 @@ def project_surface_graph(
                     **({"selector": operation.selector} if operation.selector else {}),
                 },
             )
-            fields = template.setdefault("fields", {})
-            if isinstance(fields, dict):
-                for parameter in operation.parameters:
-                    if parameter.location in {"body", "form", "graphql", "query"}:
-                        fields.setdefault(parameter.name, "")
+            if source_backed:
+                _project_source_template(template, operation)
+            for parameter in operation.parameters:
+                _project_template_parameter(
+                    template,
+                    parameter,
+                    include_location=source_backed,
+                )
         for parameter in operation.parameters:
             payload = parameters_by_name.setdefault(
                 parameter.name,
@@ -752,12 +962,18 @@ def project_surface_graph(
                 },
             )
             source = f"surface_graph:{parameter.location}"
-            payload["sources"] = sorted(set(_string_items(payload.get("sources"))) | {source})
+            payload["sources"] = sorted(
+                set(_string_items(payload.get("sources")))
+                | {source}
+                | ({"source_code"} if source_backed else set())
+            )[:16]
             payload["locations"] = sorted(set(_string_items(payload.get("locations"))) | {url})[:16]
             payload["data_types"] = sorted(
                 set(_string_items(payload.get("data_types"))) | {parameter.data_type}
             )[:16]
             payload["required"] = bool(payload.get("required")) or parameter.required
+            if source_backed:
+                _project_source_parameter(payload, operation, parameter)
     legacy["endpoints"] = list(existing_endpoints.values())[:512]
     legacy["request_templates"] = list(templates_by_key.values())[:512]
     legacy["parameters"] = list(parameters_by_name.values())[:512]
@@ -780,6 +996,77 @@ def project_surface_graph(
 def _operation_is_actionable_projection(operation: SurfaceOperation) -> bool:
     """Keep all probe history canonical without promoting attack-made candidates."""
     return operation.actionable
+
+
+def _project_source_template(
+    template: dict[str, object],
+    operation: SurfaceOperation,
+) -> None:
+    if str(template.get("source") or "") in {"", "source_code", "surface_graph"}:
+        template["source"] = "source_code"
+    template["hints"] = sorted(set(_string_items(template.get("hints"))) | set(operation.hints))[
+        :16
+    ]
+    template["content_types"] = sorted(
+        set(_string_items(template.get("content_types"))) | set(operation.content_types)
+    )[:16]
+    template["priority"] = max(300, _projection_priority(template.get("priority")))
+    if encoding := _source_operation_encoding(operation):
+        template.setdefault("encoding", encoding)
+
+
+def _project_template_parameter(
+    template: dict[str, object],
+    parameter: SurfaceParameter,
+    *,
+    include_location: bool,
+) -> None:
+    if parameter.location not in {"body", "form", "graphql", "query"}:
+        return
+    fields = template.setdefault("fields", {})
+    if isinstance(fields, dict):
+        fields.setdefault(parameter.name, "")
+    if not include_location:
+        return
+    input_locations = template.setdefault("input_locations", {})
+    if isinstance(input_locations, dict):
+        input_locations.setdefault(parameter.name, parameter.location)
+
+
+def _project_source_parameter(
+    payload: dict[str, object],
+    operation: SurfaceOperation,
+    parameter: SurfaceParameter,
+) -> None:
+    payload["input_locations"] = sorted(
+        set(_string_items(payload.get("input_locations"))) | {parameter.location}
+    )[:16]
+    payload["methods"] = sorted(set(_string_items(payload.get("methods"))) | {operation.method})[
+        :16
+    ]
+    payload["hints"] = sorted(set(_string_items(payload.get("hints"))) | set(operation.hints))[:16]
+    payload["priority"] = max(300, _projection_priority(payload.get("priority")))
+
+
+def _source_operation_encoding(operation: SurfaceOperation) -> str:
+    content_types = set(operation.content_types)
+    if "application/json" in content_types or any(
+        parameter.location == "body" for parameter in operation.parameters
+    ):
+        return "application/json"
+    if "application/x-www-form-urlencoded" in content_types or any(
+        parameter.location == "form" for parameter in operation.parameters
+    ):
+        return "application/x-www-form-urlencoded"
+    return ""
+
+
+def _projection_priority(value: object) -> int:
+    try:
+        priority = int(str(value))
+    except (TypeError, ValueError):
+        return 0
+    return max(0, priority)
 
 
 def import_legacy_surface(
@@ -1190,6 +1477,117 @@ def _graphql_probe_parameters(value: object) -> tuple[SurfaceParameter, ...]:
     return tuple(parameters)
 
 
+def _source_identifier(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or value != value.strip():
+        raise SurfaceGraphError(f"{label} must be a bounded structural identifier")
+    if not _SOURCE_IDENTIFIER_RE.fullmatch(value):
+        raise SurfaceGraphError(f"{label} must be a bounded structural identifier")
+    return value
+
+
+def _source_input_name(value: object) -> str:
+    if not isinstance(value, str) or value != value.strip():
+        raise SurfaceGraphError("source input name must be a bounded structural identifier")
+    if not _SOURCE_INPUT_NAME_RE.fullmatch(value):
+        raise SurfaceGraphError("source input name must be a bounded structural identifier")
+    return value
+
+
+def _source_input_location(value: object) -> str:
+    if not isinstance(value, str) or value != value.strip():
+        raise SurfaceGraphError("source input location must be a string")
+    location = value.casefold()
+    # SurfaceParameter owns the canonical location allow-list.  Constructing a
+    # temporary parameter keeps this adapter aligned with that typed contract.
+    return SurfaceParameter.create(name="input", location=location).location
+
+
+def _source_line(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SurfaceGraphError("source line must be a positive integer")
+    if value <= 0 or value > _MAX_SOURCE_LINE:
+        raise SurfaceGraphError("source line must be a positive integer")
+    return value
+
+
+def _source_relative_file(value: object) -> str:
+    if not isinstance(value, str) or value != value.strip():
+        raise SurfaceGraphError("source file must be a normalized relative path")
+    if not value or len(value) > _MAX_SOURCE_FILE_CHARS or "\\" in value:
+        raise SurfaceGraphError("source file must be a normalized relative path")
+    if re.match(r"^[A-Za-z]:", value):
+        raise SurfaceGraphError("source file must be a normalized relative path")
+    path = PurePosixPath(value)
+    parts = value.split("/")
+    if (
+        path.is_absolute()
+        or path.as_posix() != value
+        or any(part in {"", ".", ".."} for part in parts)
+        or any(not _SOURCE_FILE_SEGMENT_RE.fullmatch(part) for part in parts)
+    ):
+        raise SurfaceGraphError("source file must be a normalized relative path")
+    return value
+
+
+def _source_route(value: object) -> str:
+    if not isinstance(value, str) or value != value.strip():
+        raise SurfaceGraphError("source route must be a normalized absolute path")
+    if _source_route_has_unsafe_syntax(value):
+        raise SurfaceGraphError("source route must be a normalized absolute path")
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise SurfaceGraphError("source route must be a normalized absolute path") from exc
+    if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+        raise SurfaceGraphError("source route must be a normalized absolute path")
+
+    decoded = _decode_source_route(value)
+    if any(part in {".", ".."} for part in decoded.split("/")) or "//" in decoded:
+        raise SurfaceGraphError("source route must be a normalized absolute path")
+    return value
+
+
+def _source_route_has_unsafe_syntax(value: str) -> bool:
+    unsafe_character = any(
+        character.isspace() or not character.isprintable() for character in value
+    )
+    return any(
+        (
+            not value.startswith("/"),
+            value.startswith("//"),
+            len(value) > _MAX_SOURCE_ROUTE_CHARS,
+            "\\" in value,
+            "?" in value,
+            "#" in value,
+            unsafe_character,
+            re.search(r"%(?![0-9A-Fa-f]{2})", value) is not None,
+            re.search(r"%2[fF]|%5[cC]", value) is not None,
+        )
+    )
+
+
+def _decode_source_route(value: str) -> str:
+    decoded = value
+    for _depth in range(4):
+        expanded = unquote(decoded)
+        if expanded == decoded:
+            return decoded
+        if expanded.count("/") != decoded.count("/"):
+            raise SurfaceGraphError("source route must be a normalized absolute path")
+        decoded = expanded
+        if (
+            decoded.startswith("//")
+            or "\\" in decoded
+            or "?" in decoded
+            or "#" in decoded
+            or any(character.isspace() or not character.isprintable() for character in decoded)
+        ):
+            raise SurfaceGraphError("source route must be a normalized absolute path")
+    if unquote(decoded) != decoded:
+        raise SurfaceGraphError("source route must be a normalized absolute path")
+    return decoded
+
+
 def _mapping_items(
     value: object,
     *,
@@ -1259,6 +1657,7 @@ __all__ = [
     "ingest_openapi_document",
     "ingest_probe_result",
     "ingest_recon_surface",
+    "ingest_source_code_candidates",
     "ingest_surface_observation_batch",
     "project_surface_graph",
 ]

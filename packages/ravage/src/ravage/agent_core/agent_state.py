@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from ravage.agent_core.agent_strategy import ActionLedger
 from ravage.agent_core.surface_graph import SurfaceGraphError, SurfaceGraphState
@@ -109,6 +112,11 @@ class AgentState:
         return state
 
     def to_prompt_context(self) -> str:
+        # Import lazily because attack_surface uses AgentState for merge helpers.
+        from ravage.agent_core.attack_surface import (  # noqa: PLC0415
+            compact_surface_for_prompt,
+        )
+
         ledger = self.ledger.to_json()
         payload = {
             "phase": self.phase,
@@ -119,7 +127,7 @@ class AgentState:
             "flags": self.flags,
             "signals": _copy_recent_signals(self.signals, limit=20),
             "confirmed_primitives": dict(self.primitives),
-            "surface": self.surface,
+            "surface": compact_surface_for_prompt(self.surface),
             "tasks": self.tasks[-20:],
             "last_observation": self.last_observation,
             "repetition_ledger": _recent_ledger_items(ledger, limit=20),
@@ -165,15 +173,31 @@ def resolve_agent_state_path(
 
 
 def save_agent_state(path: Path, *, target_url: str, state: AgentState) -> None:
-    path.write_text(
+    payload = (
         json.dumps(
             {"target_url": target_url, "turn": state.turn, "state": state.to_json()},
             indent=2,
             sort_keys=True,
         )
-        + "\n",
-        encoding="utf-8",
+        + "\n"
     )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+        path.chmod(0o600)
+    except BaseException:
+        with suppress(OSError):
+            temporary.unlink(missing_ok=True)
+        raise
 
 
 def append_unique(items: list[str], value: str, *, limit: int) -> None:

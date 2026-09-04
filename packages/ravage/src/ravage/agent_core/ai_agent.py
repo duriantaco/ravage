@@ -74,6 +74,11 @@ from ravage.agent_core.recovery_action_contract import select_recovery_branch_ac
 from ravage.agent_core.recovery_policy import RecoveryDecision, RecoveryRole, RecoveryStatus
 from ravage.agent_core.recovery_runtime import RecoveryCampaign, RecoveryTurnResult
 from ravage.agent_core.semantic_routes import semantic_action_fingerprint
+from ravage.agent_core.source_guided import (
+    SourceGuidedPreparation,
+    assert_source_resume_available,
+    prepare_source_guided_analysis,
+)
 from ravage.agent_core.stateful_http import StatefulHttpActionSession
 from ravage.agent_core.surface_graph import SurfaceGraphState
 from ravage.agent_core.surface_graph_ingest import ingest_recon_surface, project_surface_graph
@@ -296,6 +301,7 @@ class AIWebAgentSettings:
     report_agent: bool = False
     resume_from: Path | None = None
     workspace_dir: Path | None = None
+    source_root: Path | None = None
     model_config: Path | None = None
     model_profile: str = "local-ollama"
     model_tier: ModelTier = "mid"
@@ -373,6 +379,35 @@ class ProviderChatClient:
         return ChatClient(route).chat(payload)
 
 
+def resolve_source_root(
+    *,
+    explicit: Path | None,
+) -> Path | None:
+    """Resolve only an operator-provided source directory."""
+    if explicit is None:
+        return None
+    return _resolve_source_directory(explicit, label="source root")
+
+
+def _resolve_source_directory(path: Path, *, label: str) -> Path:
+    expanded = path.expanduser()
+    if expanded.is_symlink():
+        message = f"{label} must not be a symbolic link: {expanded}"
+        raise ValueError(message)
+    try:
+        resolved = expanded.resolve(strict=True)
+    except FileNotFoundError:
+        message = f"{label} does not exist: {expanded}"
+        raise ValueError(message) from None
+    except (OSError, RuntimeError) as exc:
+        message = f"cannot resolve {label} {expanded}: {exc}"
+        raise ValueError(message) from None
+    if not resolved.is_dir():
+        message = f"{label} is not a directory: {resolved}"
+        raise ValueError(message)
+    return resolved
+
+
 def run_ai_web_agent(
     *,
     brief_path: Path,
@@ -380,6 +415,9 @@ def run_ai_web_agent(
     settings: AIWebAgentSettings,
 ) -> None:
     brief = load_engagement_brief(brief_path)
+    source_root = resolve_source_root(explicit=settings.source_root)
+    if source_root != settings.source_root:
+        settings = replace(settings, source_root=source_root)
     flag_objective = _brief_has_flag_objective(brief)
     stop_after_first_finding = _brief_stops_after_first_finding(brief)
     assert_authorized_target(
@@ -420,8 +458,29 @@ def run_ai_web_agent(
     spent_cost_usd = 0.0
     cost_accounting_complete = True
     termination_reason: str | None = None
+    source_preparation: SourceGuidedPreparation | None = None
     recovery_state_path = workspace.root / "recovery-state.json"
     try:
+        if resumed_state:
+            assert_source_resume_available(state=state, source_root=settings.source_root)
+        if settings.source_root is not None:
+            # Bind the run to an exact source snapshot before recon, managed-auth
+            # seeding, or any other target traffic is allowed to start.
+            source_preparation = prepare_source_guided_analysis(
+                source_root=settings.source_root,
+                target_url=target_url,
+                state=state,
+                workspace=workspace,
+                resumed=resumed_state,
+            )
+            # Persist the source binding before the persistent HTTP lane can
+            # create durable traffic/evidence artifacts. An interrupted seed is
+            # therefore always recognized as a resumable run.
+            save_agent_state(
+                workspace.state_path,
+                target_url=target_url,
+                state=state,
+            )
         runtime = _make_tool_runtime(settings, brief, target_url=target_url)
         state.surface["flag_objective"] = flag_objective
         state.surface["stop_after_first_finding"] = stop_after_first_finding
@@ -455,6 +514,9 @@ def run_ai_web_agent(
                 "evidence_lead_replay_generation",
                 "http_session_dirty",
                 "http_state_epoch",
+                "source_analysis",
+                "source_candidates",
+                "source_validation",
             )
             if key in state.surface
         }
@@ -462,9 +524,7 @@ def run_ai_web_agent(
         client = settings.model_client or ChatClient(route)
         knowledge_pack_metadata = _knowledge_pack_metadata_payload(settings)
         knowledge_pack_sha256 = (
-            str(knowledge_pack_metadata["sha256"])
-            if knowledge_pack_metadata is not None
-            else None
+            str(knowledge_pack_metadata["sha256"]) if knowledge_pack_metadata is not None else None
         )
 
         started_payload: dict[str, object] = {
@@ -479,6 +539,7 @@ def run_ai_web_agent(
             "traffic_policy": traffic_policy.config.to_json(),
             "traffic_policy_snapshot": traffic_policy.snapshot().to_json(),
             "structured_http_replay": True,
+            "source_guided": settings.source_root is not None,
         }
         session_mode = _authentication_session_mode(settings.authentication)
         if session_mode:
@@ -505,6 +566,7 @@ def run_ai_web_agent(
             "autonomous_route": settings.autonomous_route,
             "flag_objective": flag_objective,
             "stop_after_first_finding": stop_after_first_finding,
+            "source_guided": settings.source_root is not None,
         }
         if session_mode:
             workspace_started_payload["session_mode"] = session_mode
@@ -526,6 +588,19 @@ def run_ai_web_agent(
         workspace.record_event(kind="traffic_policy_started", payload=traffic_started_payload)
         if knowledge_pack_metadata:
             workspace.record_event(kind="knowledge_pack_loaded", payload=knowledge_pack_metadata)
+        if source_preparation is not None:
+            source_payload = _authenticated_artifact_mapping(
+                settings.authentication,
+                source_preparation.event_payload(workspace=workspace),
+            )
+            _record(
+                audit,
+                brief.engagement_id,
+                actor="agent",
+                action="source_analysis_completed",
+                payload=source_payload,
+            )
+            workspace.record_event(kind="source_analysis_completed", payload=source_payload)
 
         safe_context = _safe_runtime_context(brief.context or {}, brief_path=brief_path)
         description = str(safe_context.get("description") or "")
@@ -551,6 +626,11 @@ def run_ai_web_agent(
             session_mode=("anonymous:baseline" if settings.authentication is not None else ""),
             authentication=settings.authentication,
             traffic_policy=traffic_policy,
+            http_executor=(
+                http_session
+                if source_preparation is not None and settings.authentication is None
+                else None
+            ),
         )
         state.surface.update(persisted_http_surface)
         # Recon replaces the discovered-surface mapping. Reapply policy and mission
@@ -593,6 +673,26 @@ def run_ai_web_agent(
             state.surface.pop("authorized_seed_credentials", None)
         elif seed_credentials:
             state.surface["authorized_seed_credentials"] = seed_credentials
+        source_terminal_outcome: ActionResult | None = None
+        if source_preparation is not None:
+            source_terminal_outcome = _seed_source_guided_validation(
+                preparation=source_preparation,
+                target_url=target_url,
+                runtime=runtime,
+                state=state,
+                workspace=workspace,
+                audit=audit,
+                engagement_id=brief.engagement_id,
+                proof_recognition_enabled=settings.proof_recognition_enabled,
+                authentication=settings.authentication,
+                traffic_policy=traffic_policy,
+                http_executor=http_session,
+            )
+            save_agent_state(
+                workspace.state_path,
+                target_url=target_url,
+                state=state,
+            )
         if recovery is not None:
             _record_recovery_enabled(
                 recovery,
@@ -621,7 +721,14 @@ def run_ai_web_agent(
             state=state,
         )
         first_turn = recovery.next_turn if recovery is not None else max(state.turn + 1, 1)
-        for turn in range(first_turn, max(settings.max_turns, 1) + 1):
+        if source_terminal_outcome is not None and source_terminal_outcome.stop:
+            termination_reason = (
+                "agent_final" if source_terminal_outcome.outcome == "final" else "objective_met"
+            )
+            turn_range: Iterable[int] = ()
+        else:
+            turn_range = range(first_turn, max(settings.max_turns, 1) + 1)
+        for turn in turn_range:
             if recovery is not None and recovery.scheduler.status is not RecoveryStatus.RUNNING:
                 termination_reason = f"recovery_{recovery.scheduler.status.value}"
                 break
@@ -2738,9 +2845,8 @@ def _proof_objective_completion_met(
         return False
     if not _continue_after_proof_enabled(state):
         return True
-    return (
-        not _has_open_assessment_tasks(state)
-        and not _has_executable_live_primitive_route(state, settings=settings)
+    return not _has_open_assessment_tasks(state) and not _has_executable_live_primitive_route(
+        state, settings=settings
     )
 
 
@@ -2932,9 +3038,7 @@ def _open_run_traffic_policy(
             require_public_addresses=False,
         )
         if baseline != config:
-            raise TrafficPolicyError(
-                "traffic policy configuration does not match agent settings"
-            )
+            raise TrafficPolicyError("traffic policy configuration does not match agent settings")
         config = configured
     if settings.traffic_policy_reference is not None:
         referenced = TrafficPolicyController.from_reference(
@@ -3092,19 +3196,14 @@ def _execute_recovery_action(  # noqa: PLR0913 - mirrors the executor boundary.
             lead,
             primary_origin=state.surface_graph.target_origin,
         )
-    ) or (
-        awaiting_session_lead(state) is not None
-        and _is_evidence_session_recovery_action(action)
-    )
+    ) or (awaiting_session_lead(state) is not None and _is_evidence_session_recovery_action(action))
     # An exact evidence replay has its own executor-owned lifecycle: two
     # completed no-progress attempts, with authentication pauses excluded.
     # Auth recovery is likewise bounded by the repeat/global budgets. The
     # generic recovery throttle may already have counted the pre-auth 401/403,
     # so letting it block here can strand the lead before a usable session or
     # after only one real replay.
-    if not lead_owned_route and not recovery.scheduler.route_is_available(
-        route_fingerprint
-    ):
+    if not lead_owned_route and not recovery.scheduler.route_is_available(route_fingerprint):
         payload = {
             "turn": state.turn,
             "branch_id": recovery.scheduler.active_branch_id,
@@ -3267,10 +3366,16 @@ def _seed_recon(
     session_mode: str = "",
     authentication: ManagedAttackAuthentication | None = None,
     traffic_policy: TrafficPolicyController | None = None,
+    http_executor: StatefulHttpActionSession | None = None,
 ) -> None:
     if not state.surface_graph.target_origin:
         state.surface_graph = SurfaceGraphState.for_target(target_url)
     try:
+        recon_session = (
+            http_executor.session_for_native_probe(timeout_seconds=8)
+            if http_executor is not None
+            else None
+        )
         recon = run_recon(
             target_url,
             max_pages=12,
@@ -3279,7 +3384,8 @@ def _seed_recon(
             in_scope=tuple(in_scope),
             out_of_scope=tuple(out_of_scope),
             max_rps=max_rps,
-            traffic_policy=traffic_policy,
+            session=recon_session,
+            traffic_policy=traffic_policy if recon_session is None else None,
         )
     except Exception as exc:  # noqa: BLE001 - recon is helpful, not a run gate.
         safe_error = (
@@ -3371,6 +3477,263 @@ def _seed_authenticated_surface(
         authentication=authentication,
         traffic_policy=traffic_policy,
     )
+
+
+def _seed_source_guided_validation(  # noqa: PLR0913
+    *,
+    preparation: SourceGuidedPreparation,
+    target_url: str,
+    runtime: ToolRuntime,
+    state: AgentState,
+    workspace: AgentWorkspace,
+    audit: AuditStore,
+    engagement_id: UUID,
+    proof_recognition_enabled: bool,
+    authentication: ManagedAttackAuthentication | None,
+    traffic_policy: TrafficPolicyController,
+    http_executor: StatefulHttpActionSession,
+) -> ActionResult | None:
+    """Run bounded live confirmation; source metadata itself is never evidence."""
+    last_outcome: ActionResult | None = None
+    completed = _completed_source_validation_actions(state, preparation=preparation)
+    for index, raw_action in enumerate(preparation.validation_actions, start=1):
+        action = dict(raw_action)
+        probe = str(action.get("probe") or "")
+        validation_id = _source_validation_action_id(preparation, action=action)
+        if not probe or validation_id in completed:
+            continue
+        action_id = f"source-guided-{index}-{probe}"
+        state.surface["source_validation_probe"] = probe
+        repeat_count = 1
+        candidate_ids = _string_list(action.get("source_candidate_ids"))
+        state.surface["source_validation_candidate_ids"] = candidate_ids
+        started_payload = _authenticated_artifact_mapping(
+            authentication,
+            {
+                "action_id": action_id,
+                "probe": probe,
+                "validation_id": validation_id,
+                "source_digest": preparation.source_digest,
+                "candidate_ids": candidate_ids,
+                "candidate_count": len(candidate_ids),
+            },
+        )
+        _record(
+            audit,
+            engagement_id,
+            actor="agent",
+            action="source_validation_started",
+            payload=started_payload,
+        )
+        workspace.record_event(kind="source_validation_started", payload=started_payload)
+        try:
+            outcome = execute_action(
+                action,
+                target_url=target_url,
+                runtime=runtime,
+                state=state,
+                workspace=workspace,
+                audit=audit,
+                engagement_id=engagement_id,
+                repeat_count=repeat_count,
+                max_observation_chars=MAX_OBSERVATION_CHARS,
+                max_transcript_chars=MAX_TRANSCRIPT_CHARS,
+                proof_recognition_enabled=proof_recognition_enabled,
+                action_id=action_id,
+                authentication=authentication,
+                traffic_policy=traffic_policy,
+                http_executor=http_executor,
+            )
+        finally:
+            state.surface.pop("source_validation_probe", None)
+            state.surface.pop("source_validation_candidate_ids", None)
+        outcome = _continue_after_proof_outcome(state, outcome)
+        outcome = _stop_after_finding_outcome(state, outcome)
+        outcome_payload = outcome.to_json()
+        lead_outcome: dict[str, object] = dict(outcome_payload)
+        if outcome.evidence_observation:
+            lead_outcome["_evidence_observation"] = outcome.evidence_observation
+        record_aligned_outcome(state, action, lead_outcome)
+        _update_state_from_action(state, action=action, outcome=outcome_payload)
+        validation_complete, completion_reason = _source_validation_attempt_complete(
+            outcome,
+            probe=probe,
+            candidate_ids=candidate_ids,
+        )
+        if validation_complete:
+            completed.add(validation_id)
+        previous_validation = state.surface.get("source_validation")
+        prior_attempts = (
+            previous_validation.get("attempts")
+            if isinstance(previous_validation, Mapping)
+            else None
+        )
+        attempts = (
+            [dict(item) for item in prior_attempts if isinstance(item, Mapping)]
+            if isinstance(prior_attempts, list)
+            else []
+        )
+        attempts.append(
+            {
+                "validation_id": validation_id,
+                "probe": probe,
+                "candidate_ids": candidate_ids,
+                "status": "completed" if validation_complete else "retryable",
+                "reason": completion_reason,
+                "timed_out": outcome.timed_out,
+            }
+        )
+        state.surface["source_validation"] = {
+            "analyzer_contract": preparation.analyzer_contract,
+            "source_digest": preparation.source_digest,
+            "candidate_digest": preparation.candidate_digest,
+            "completed_actions": sorted(completed),
+            "attempts": attempts[-20:],
+        }
+        save_agent_state(
+            workspace.state_path,
+            target_url=target_url,
+            state=state,
+        )
+        completed_payload = _authenticated_artifact_mapping(
+            authentication,
+            {
+                "action_id": action_id,
+                "probe": probe,
+                "validation_id": validation_id,
+                "source_digest": preparation.source_digest,
+                "candidate_ids": candidate_ids,
+                "validation_status": "completed" if validation_complete else "retryable",
+                "completion_reason": completion_reason,
+                "ok": outcome.ok,
+                "outcome": outcome.outcome,
+                "stop": outcome.stop,
+            },
+        )
+        completion_event = (
+            "source_validation_completed" if validation_complete else "source_validation_incomplete"
+        )
+        _record(
+            audit,
+            engagement_id,
+            actor="agent",
+            action=completion_event,
+            payload=completed_payload,
+        )
+        workspace.record_event(kind=completion_event, payload=completed_payload)
+        last_outcome = outcome
+        if outcome.stop:
+            break
+    return last_outcome
+
+
+def _completed_source_validation_actions(
+    state: AgentState,
+    *,
+    preparation: SourceGuidedPreparation,
+) -> set[str]:
+    value = state.surface.get("source_validation")
+    if not isinstance(value, Mapping):
+        return set()
+    expected_binding = (
+        preparation.analyzer_contract,
+        preparation.source_digest,
+        preparation.candidate_digest,
+    )
+    actual_binding = (
+        str(value.get("analyzer_contract") or ""),
+        str(value.get("source_digest") or ""),
+        str(value.get("candidate_digest") or ""),
+    )
+    if actual_binding != expected_binding:
+        return set()
+    return set(_string_list(value.get("completed_actions")))
+
+
+def _source_validation_action_id(
+    preparation: SourceGuidedPreparation,
+    *,
+    action: Mapping[str, object],
+) -> str:
+    context = ":".join(
+        (
+            preparation.analyzer_contract,
+            preparation.source_digest,
+            preparation.candidate_digest,
+            ",".join(sorted(_string_list(action.get("source_candidate_ids")))),
+        )
+    )
+    return semantic_action_fingerprint(action, context=context)
+
+
+def _source_validation_attempt_complete(
+    outcome: ActionResult,
+    *,
+    probe: str,
+    candidate_ids: list[str],
+) -> tuple[bool, str]:
+    if outcome.timed_out:
+        return False, "probe_timed_out"
+    try:
+        payload = json.loads(outcome.evidence_observation)
+    except (TypeError, json.JSONDecodeError):
+        return False, "missing_probe_envelope"
+    if not isinstance(payload, Mapping) or str(payload.get("probe") or "") != probe:
+        return False, "invalid_probe_envelope"
+    if payload.get("http_request_count_status") != "exact":
+        return False, "inexact_request_accounting"
+    request_count = payload.get("http_request_count")
+    if isinstance(request_count, bool) or not isinstance(request_count, int) or request_count <= 0:
+        return False, "no_physical_requests"
+    errors = payload.get("errors")
+    if not isinstance(errors, list) or errors:
+        return False, "probe_reported_errors"
+    requests = payload.get("requests")
+    if not isinstance(requests, list):
+        return False, "missing_request_results"
+    expected = set(candidate_ids)
+    baseline_responses: set[str] = set()
+    differential_responses: set[str] = set()
+    responded_requests = 0
+    retryable_http_status = False
+    unhealthy_baseline_status = False
+    for raw_request in requests:
+        if not isinstance(raw_request, Mapping):
+            continue
+        target = raw_request.get("target")
+        if not isinstance(target, Mapping):
+            continue
+        raw_ids = target.get("source_candidate_ids")
+        request_ids = set(_string_list(raw_ids)) & expected
+        if not request_ids:
+            continue
+        status = raw_request.get("status")
+        error = str(raw_request.get("error") or "")
+        if isinstance(status, bool) or not isinstance(status, int) or error:
+            continue
+        responded_requests += 1
+        probe_kind = str(raw_request.get("probe_kind") or "")
+        if status in {429, 502, 503, 504}:
+            retryable_http_status = True
+            continue
+        if probe_kind in {"baseline", "auth_bypass_baseline"}:
+            if status >= 500:
+                unhealthy_baseline_status = True
+                continue
+            baseline_responses.update(request_ids)
+        else:
+            differential_responses.update(request_ids)
+    if request_count < responded_requests:
+        return False, "inconsistent_request_accounting"
+    if retryable_http_status:
+        return False, "retryable_http_status"
+    if unhealthy_baseline_status:
+        return False, "unhealthy_baseline_status"
+    if not expected.issubset(baseline_responses):
+        return False, "baseline_incomplete"
+    if not expected.issubset(differential_responses):
+        return False, "differential_incomplete"
+    return True, "all_candidates_received_live_differential_responses"
 
 
 def _authentication_session_mode(
@@ -3616,9 +3979,8 @@ def _report_status(
         "required_proof_count_unmet",
     }:
         return "incomplete"
-    if (
-        state.surface.get("flag_objective") is not False
-        and not _proof_objective_completion_met(state, settings=settings)
+    if state.surface.get("flag_objective") is not False and not _proof_objective_completion_met(
+        state, settings=settings
     ):
         return "incomplete"
     if state.flags:
@@ -3879,7 +4241,8 @@ def _build_messages(
             "Use active strategy cards as checklists, not as answer keys.",
             "Choose exactly one active task and include its task_id in every non-final action.",
             "Do not repeat an action from repetition_ledger unless you change a material variable.",
-            "Treat surface_graph operations and discovered forms as canonical request templates. Preserve their exact method, route, body location, field names, and active session.",
+            "Treat discovered forms and runtime-derived surface_graph operations as canonical request templates. Preserve their exact method, route, body location, field names, and active session.",
+            "Treat operations whose provenance includes source_code as route/input hypotheses, not complete request templates. Only automatic_get_query source candidates carry a complete replayable query_fields shape.",
             "When a real form or API request exists, use http_request to mutate that observed template before inventing query parameters, alternate methods, or guessed endpoints.",
             (
                 "When evidence_lead_lock.status is awaiting_session, use http_request in "
@@ -4466,6 +4829,7 @@ def _require_accountable_paid_reply(
         f"usage_reported={reply.usage_reported} cost_known={reply.cost_known}"
     )
     raise RuntimeError(message)
+
 
 def route_has_paid_transport_risk(route: ResolvedModelRoute) -> bool:
     if route_is_nonbillable_local(route):

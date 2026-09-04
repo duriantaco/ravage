@@ -1345,6 +1345,29 @@ def test_scoped_redirect_is_counted_and_sensitive_headers_do_not_cross_origin() 
     assert clock.sleeps[0] >= 1.15
 
 
+def test_transport_timeout_is_rebounded_after_deadline_aware_pacing() -> None:
+    transport = QueuedTransport([_response(), _response()])
+    clock = FakeClock()
+    executor = _executor(transport, clock=clock)
+    executor(
+        node_id="node-001",
+        arguments={"path": "/app/first", "timeout_seconds": 10},
+        action_id="action-first",
+    )
+    deadline = clock() + 2.0
+
+    executor(
+        node_id="node-001",
+        arguments={"path": "/app/second", "timeout_seconds": 10},
+        action_id="action-second",
+        _deadline_monotonic=deadline,
+    )
+
+    assert len(transport.calls) == 2
+    assert clock.sleeps
+    assert transport.calls[-1].timeout_seconds == pytest.approx(deadline - clock())
+
+
 def test_dns_change_after_first_request_fails_closed() -> None:
     transport = QueuedTransport([_response(), _response()])
     resolutions = iter(

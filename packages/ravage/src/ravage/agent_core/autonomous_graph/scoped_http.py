@@ -7,6 +7,7 @@ import errno
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import socket
@@ -109,6 +110,48 @@ _REQUEST_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 
 class ScopedHttpError(ValueError):
     """Raised before an unsafe or unaccountable HTTP request is sent."""
+
+
+def _remaining_deadline(
+    deadline_monotonic: float | None,
+    *,
+    clock: Callable[[], float],
+) -> float | None:
+    if deadline_monotonic is None:
+        return None
+    if isinstance(deadline_monotonic, bool) or not isinstance(
+        deadline_monotonic,
+        (int, float),
+    ):
+        raise ScopedHttpError("probe wall-clock deadline is invalid")
+    deadline = float(deadline_monotonic)
+    if not math.isfinite(deadline):
+        raise ScopedHttpError("probe wall-clock deadline is invalid")
+    remaining = deadline - clock()
+    if remaining <= 0:
+        raise TimeoutError("probe wall-clock deadline exceeded")
+    return remaining
+
+
+def _require_wait_within_deadline(
+    delay_seconds: float,
+    deadline_monotonic: float | None,
+    *,
+    clock: Callable[[], float],
+) -> None:
+    remaining = _remaining_deadline(deadline_monotonic, clock=clock)
+    if remaining is not None and delay_seconds >= remaining:
+        raise TimeoutError("probe wall-clock deadline exceeded")
+
+
+def _deadline_bounded_timeout(
+    timeout_seconds: float,
+    deadline_monotonic: float | None,
+    *,
+    clock: Callable[[], float],
+) -> float:
+    remaining = _remaining_deadline(deadline_monotonic, clock=clock)
+    return timeout_seconds if remaining is None else min(timeout_seconds, remaining)
 
 
 def _cleanup_preserving(
@@ -643,9 +686,14 @@ class _RequestGate:
         self._last_started_at: float | None = None
         self._on_acquire = on_acquire
 
-    def wait_until_available(self) -> float:
+    def wait_until_available(
+        self,
+        *,
+        _deadline_monotonic: float | None = None,
+    ) -> float:
         """Apply route-local pacing without claiming a physical request."""
         with self._lock:
+            _remaining_deadline(_deadline_monotonic, clock=self.clock)
             if self._request_count >= self.profile.max_total_requests:
                 raise ScopedHttpError("remote HTTP target-request ceiling reached")
             sequence = self._request_count + 1
@@ -658,11 +706,23 @@ class _RequestGate:
                 )
                 delay = max(earliest - self.clock(), 0.0)
                 if delay:
+                    _require_wait_within_deadline(
+                        delay,
+                        _deadline_monotonic,
+                        clock=self.clock,
+                    )
                     self.sleeper(delay)
+                    _remaining_deadline(_deadline_monotonic, clock=self.clock)
             return delay
 
-    def acquire(self, *, pace: bool = True) -> tuple[int, float]:
+    def acquire(
+        self,
+        *,
+        pace: bool = True,
+        _deadline_monotonic: float | None = None,
+    ) -> tuple[int, float]:
         with self._lock:
+            _remaining_deadline(_deadline_monotonic, clock=self.clock)
             if self._request_count >= self.profile.max_total_requests:
                 raise ScopedHttpError("remote HTTP target-request ceiling reached")
             sequence = self._request_count + 1
@@ -675,7 +735,13 @@ class _RequestGate:
                 )
                 delay = max(earliest - self.clock(), 0.0)
                 if delay:
+                    _require_wait_within_deadline(
+                        delay,
+                        _deadline_monotonic,
+                        clock=self.clock,
+                    )
                     self.sleeper(delay)
+                    _remaining_deadline(_deadline_monotonic, clock=self.clock)
             self._request_count = sequence
             self._last_started_at = self.clock()
             if self._on_acquire is not None:
@@ -803,6 +869,7 @@ class ScopedGraphHttpExecutor:
         self._session_dirty = session_dirty
         self._pin_lock = threading.Lock()
         self._execution_lock = threading.Lock()
+        self._clock = clock
         self._gate = _RequestGate(
             profile,
             clock=clock,
@@ -856,12 +923,14 @@ class ScopedGraphHttpExecutor:
         node_id: str,
         arguments: dict[str, object],
         action_id: str,
+        _deadline_monotonic: float | None = None,
     ) -> ActionExecution:
         with self._execution_lock:
             return self._execute(
                 node_id=node_id,
                 arguments=arguments,
                 action_id=action_id,
+                _deadline_monotonic=_deadline_monotonic,
             )
 
     def _execute(  # noqa: C901, PLR0912, PLR0915 - redirect/retry lifecycle.
@@ -870,7 +939,9 @@ class ScopedGraphHttpExecutor:
         node_id: str,
         arguments: dict[str, object],
         action_id: str,
+        _deadline_monotonic: float | None,
     ) -> ActionExecution:
+        _remaining_deadline(_deadline_monotonic, clock=self._clock)
         authored_proofs = _request_authored_proofs(arguments)
         method, url, headers, body, timeout = _request_from_arguments(
             arguments,
@@ -895,10 +966,23 @@ class ScopedGraphHttpExecutor:
                 raise ScopedHttpError("managed authentication transport binding is invalid")
             managed_transport = self.transport
             self.authentication.configure_request_gate(
-                cast("Callable[[str, str], None]", self._account_managed_request)
+                cast(
+                    "Callable[[str, str], None]",
+                    lambda method, request_url: self._account_managed_request(
+                        method,
+                        request_url,
+                        _deadline_monotonic=_deadline_monotonic,
+                    ),
+                )
             )
             try:
-                managed_transport.begin_action(timeout_seconds=timeout)
+                managed_transport.begin_action(
+                    timeout_seconds=_deadline_bounded_timeout(
+                        timeout,
+                        _deadline_monotonic,
+                        clock=self._clock,
+                    )
+                )
             except BaseException as exc:
                 _cleanup_preserving(
                     exc,
@@ -923,6 +1007,7 @@ class ScopedGraphHttpExecutor:
                             body=body,
                             timeout=timeout,
                             attempt_index=attempt_index,
+                            _deadline_monotonic=_deadline_monotonic,
                         )
                     except BaseException as exc:
                         # The gate commits at the physical dispatch boundary. If
@@ -1132,11 +1217,17 @@ class ScopedGraphHttpExecutor:
         body: bytes | None,
         timeout: float,
         attempt_index: int,
+        _deadline_monotonic: float | None,
     ) -> _ScopedDispatch:
         self._managed_request_acquisitions.clear()
         if self.authentication is not None:
+            request_timeout = _deadline_bounded_timeout(
+                timeout,
+                _deadline_monotonic,
+                clock=self._clock,
+            )
             response = self.transport.send(
-                _transport_request(method, url, headers, body, timeout)
+                _transport_request(method, url, headers, body, request_timeout)
             )
             if not self._managed_request_acquisitions:
                 raise ScopedHttpError(
@@ -1152,9 +1243,19 @@ class ScopedGraphHttpExecutor:
                 body=body,
                 timeout=timeout,
                 attempt_index=attempt_index,
+                _deadline_monotonic=_deadline_monotonic,
             )
-        sequence, delay = self._gate.acquire()
-        response = self.transport.send(_transport_request(method, url, headers, body, timeout))
+        sequence, delay = self._gate.acquire(
+            _deadline_monotonic=_deadline_monotonic,
+        )
+        request_timeout = _deadline_bounded_timeout(
+            timeout,
+            _deadline_monotonic,
+            clock=self._clock,
+        )
+        response = self.transport.send(
+            _transport_request(method, url, headers, body, request_timeout)
+        )
         return _ScopedDispatch(response, sequence, delay)
 
     def _dispatch_with_policy(  # noqa: C901, PLR0912, PLR0915 - policy state machine.
@@ -1166,6 +1267,7 @@ class ScopedGraphHttpExecutor:
         body: bytes | None,
         timeout: float,
         attempt_index: int,
+        _deadline_monotonic: float | None,
     ) -> _ScopedDispatch:
         policy = self.traffic_policy
         if policy is None:
@@ -1182,7 +1284,15 @@ class ScopedGraphHttpExecutor:
             retryable=method in {"GET", "HEAD"},
         )
         try:
-            decision = policy.acquire(intent, retry=attempt_index > 0)
+            if _deadline_monotonic is None:
+                decision = policy.acquire(intent, retry=attempt_index > 0)
+            else:
+                decision = policy.acquire(
+                    intent,
+                    retry=attempt_index > 0,
+                    _deadline_monotonic=_deadline_monotonic,
+                    _monotonic_clock=self._clock,
+                )
         except TrafficPolicyError as exc:
             detail = f"whole-run traffic policy failed: {exc}"
             raise ScopedHttpError(detail) from exc
@@ -1204,7 +1314,9 @@ class ScopedGraphHttpExecutor:
         if lease is None:
             raise ScopedHttpError("whole-run traffic policy returned an empty dispatch lease")
         try:
-            delay = self._gate.wait_until_available()
+            delay = self._gate.wait_until_available(
+                _deadline_monotonic=_deadline_monotonic,
+            )
         except BaseException as exc:
             _cleanup_preserving(
                 exc,
@@ -1213,7 +1325,14 @@ class ScopedGraphHttpExecutor:
             )
             raise
         try:
-            policy_sequence = policy.begin_dispatch(lease)
+            if _deadline_monotonic is None:
+                policy_sequence = policy.begin_dispatch(lease)
+            else:
+                policy_sequence = policy.begin_dispatch(
+                    lease,
+                    _deadline_monotonic=_deadline_monotonic,
+                    _monotonic_clock=self._clock,
+                )
         except TrafficPolicyBlocked as exc:
             _cleanup_preserving(
                 exc,
@@ -1238,8 +1357,29 @@ class ScopedGraphHttpExecutor:
             )
             raise
         try:
+            request_timeout = _deadline_bounded_timeout(
+                timeout,
+                _deadline_monotonic,
+                clock=self._clock,
+            )
+        except TimeoutError as exc:
+            _cleanup_preserving(
+                exc,
+                lambda: policy.complete(
+                    lease,
+                    TrafficOutcome(status=None, transport_error=True),
+                ),
+                message="whole-run traffic policy could not close expired dispatch",
+            )
+            _cleanup_preserving(
+                exc,
+                lambda: self._gate.acquire(pace=False),
+                message="graph HTTP state could not close expired dispatch",
+            )
+            raise
+        try:
             response = self.transport.send(
-                _transport_request(method, url, headers, body, timeout)
+                _transport_request(method, url, headers, body, request_timeout)
             )
         except (OSError, URLError, TimeoutError) as exc:
             response = _transport_error_response(url, exc)
@@ -1276,9 +1416,17 @@ class ScopedGraphHttpExecutor:
             outcome=outcome,
         )
 
-    def _account_managed_request(self, method: str, url: str) -> Callable[[], None]:
+    def _account_managed_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        _deadline_monotonic: float | None = None,
+    ) -> Callable[[], None]:
         del method, url
-        delay = self._gate.wait_until_available()
+        delay = self._gate.wait_until_available(
+            _deadline_monotonic=_deadline_monotonic,
+        )
         committed = False
 
         def commit() -> None:

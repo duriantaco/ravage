@@ -1,9 +1,31 @@
 from __future__ import annotations
 
-from ravage.web_core.http_probe import ProbeResponse
+from typing import TYPE_CHECKING
+
 from ravage.probe_suite_parts.sqli.sqli_targets import _sqli_target_brief
-from ravage.probe_suite_parts.support import _contains_word, _has_new_result_marker, _response_result_markers
+from ravage.probe_suite_parts.support import (
+    _contains_word,
+    _has_new_result_marker,
+    _response_result_markers,
+)
 from ravage.web_core.proof_recognizer import recognize_proofs
+
+if TYPE_CHECKING:
+    from ravage.web_core.http_probe import ProbeResponse
+
+_UNSTABLE_SQL_DIFFERENTIAL_STATUSES = frozenset({408, 425, 429, 502, 503, 504})
+_SERVER_ERROR_STATUS = 500
+
+
+def _stable_sql_differential_response(response: ProbeResponse) -> bool:
+    """Reject throttling, transient upstream failures, and server errors as proof."""
+    status = response.status
+    return (
+        status is not None
+        and status < _SERVER_ERROR_STATUS
+        and status not in _UNSTABLE_SQL_DIFFERENTIAL_STATUSES
+    )
+
 
 def _looks_filtered_response(body: str) -> bool:
     lowered = body.lower()
@@ -20,7 +42,10 @@ def _looks_filtered_response(body: str) -> bool:
         ),
     )
 
-def _query_result_expanded(response: ProbeResponse, *, baseline: ProbeResponse, admin: ProbeResponse) -> bool:
+
+def _query_result_expanded(
+    response: ProbeResponse, *, baseline: ProbeResponse, admin: ProbeResponse
+) -> bool:
     if response.status is None:
         return False
     lowered = response.body.lower()
@@ -34,8 +59,10 @@ def _query_result_expanded(response: ProbeResponse, *, baseline: ProbeResponse, 
         return True
     return _has_new_result_marker(response.body, baseline.body)
 
+
 def recognize_probe_like_proof(body: str) -> bool:
     return bool(recognize_proofs(body))
+
 
 def _sql_error_markers(body: str) -> list[str]:
     lowered = body.lower()
@@ -50,11 +77,10 @@ def _sql_error_markers(body: str) -> list[str]:
         "odbc",
         "unclosed quotation",
         "unterminated quoted",
-        "syntax error",
-        "warning:",
         # extractvalue/updatexml error-based channel and common cross-engine
         # signatures (Oracle, PDO/SQLSTATE, Postgres, MSSQL).
         "xpath syntax error",
+        "syntax error at or near",
         "you have an error in your sql",
         "sqlstate",
         "ora-",
@@ -66,6 +92,7 @@ def _sql_error_markers(body: str) -> list[str]:
             markers.append(marker)
     return markers
 
+
 def _boolean_sql_signal(
     true_response: ProbeResponse,
     false_response: ProbeResponse,
@@ -74,7 +101,10 @@ def _boolean_sql_signal(
     true_payload: str,
     false_payload: str,
 ) -> bool:
-    if true_response.status is None or false_response.status is None:
+    if not all(
+        _stable_sql_differential_response(response)
+        for response in (baseline, true_response, false_response)
+    ):
         return False
     if _sql_error_markers(true_response.body) or _sql_error_markers(false_response.body):
         return False
@@ -87,12 +117,17 @@ def _boolean_sql_signal(
         return False
     length_delta = abs(len(true_response.body) - len(false_response.body))
     status_delta = true_response.status != false_response.status
-    true_changed = len(true_response.body) != len(baseline.body) or true_response.status != baseline.status
-    false_changed = len(false_response.body) != len(baseline.body) or false_response.status != baseline.status
+    true_changed = (
+        len(true_response.body) != len(baseline.body) or true_response.status != baseline.status
+    )
+    false_changed = (
+        len(false_response.body) != len(baseline.body) or false_response.status != baseline.status
+    )
     true_markers = set(_response_result_markers(true_response.body))
     false_markers = set(_response_result_markers(false_response.body))
     phrase_delta = bool(true_markers ^ false_markers)
     return status_delta or length_delta >= 25 or (phrase_delta and (true_changed or false_changed))
+
 
 def _same_response_template_after_reflection(
     response_body: str,
@@ -109,6 +144,7 @@ def _same_response_template_after_reflection(
     baseline_normalized = _normalize_reflected_value(baseline_body, baseline_payload)
     return response_normalized == baseline_normalized
 
+
 def _normalize_reflected_value(body: str, value: str) -> str:
     if not value:
         return body
@@ -116,6 +152,7 @@ def _normalize_reflected_value(body: str, value: str) -> str:
     for variant in _reflected_value_variants(value):
         normalized = normalized.replace(variant, "__RAVAGE_REFLECTED_VALUE__")
     return normalized
+
 
 def _reflected_value_variants(value: str) -> tuple[str, ...]:
     return (
@@ -125,6 +162,7 @@ def _reflected_value_variants(value: str) -> tuple[str, ...]:
         value.replace('"', "&quot;"),
         value.replace("<", "&lt;").replace(">", "&gt;"),
     )
+
 
 def _sqli_probe_summary(
     response: ProbeResponse,
@@ -140,6 +178,7 @@ def _sqli_probe_summary(
     if payload is not None:
         summary["payload"] = payload
     return summary
+
 
 def _new_sql_error_markers(markers: list[str], baseline_body: str) -> list[str]:
     baseline_markers = set(_sql_error_markers(baseline_body))

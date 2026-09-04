@@ -47,6 +47,7 @@ from ravage.xben_parts.cases import (
     _case_setup_issue_payloads,
     _hint_policy_for_mode,
     _metadata_issues_for_mode,
+    _mode_includes_source,
     _write_case_brief,
     load_xben_cases,
     selected_xben_cases,
@@ -863,6 +864,7 @@ def _run_agent_and_find_flag(
                 db_path=paths.db_path,
                 workspace_path=paths.workspace_path,
                 stdout=case_stdout,
+                source_root=(case.path if _mode_includes_source(settings.mode) else None),
                 live_stdout=(stdout if settings.stream_agent_output else None),
                 tool_network_evidence_path=(
                     tool_network_evidence_path if settings.tool_runtime == "docker" else None

@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import shutil
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -33,7 +34,7 @@ from ravage.agent_core.surface_graph import SurfaceGraphError
 from ravage.agent_core.surface_graph_ingest import project_surface_graph
 from ravage.traffic.redaction import redact_text as redact_traffic_text
 from ravage.traffic.redaction import sanitize_url
-from ravage.web_core.http_probe import ProbeResponse
+from ravage.web_core.http_probe import ProbeResponse, ProbeSession
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -139,6 +140,7 @@ class StatefulHttpActionSession:
                 node_id=node_id,
                 arguments=arguments,
                 action_id=action_id,
+                _deadline_monotonic=None,
             )
 
     def _execute_action(
@@ -147,6 +149,7 @@ class StatefulHttpActionSession:
         node_id: str,
         arguments: dict[str, object],
         action_id: str,
+        _deadline_monotonic: float | None,
     ) -> ActionExecution:
         executor = self._executor or self._open()
         traffic = self._traffic
@@ -170,6 +173,7 @@ class StatefulHttpActionSession:
                     node_id=node_id,
                     arguments=arguments,
                     action_id=action_id,
+                    _deadline_monotonic=_deadline_monotonic,
                 )
             except BaseException as exc:
                 try:
@@ -215,8 +219,7 @@ class StatefulHttpActionSession:
         captured = [
             exchange
             for exchange in traffic.store.exchanges()
-            if exchange.source == "agent_http"
-            and exchange.exchange_id not in known_exchange_ids
+            if exchange.source == "agent_http" and exchange.exchange_id not in known_exchange_ids
         ]
         observation_ids = tuple(
             dict.fromkeys(
@@ -241,9 +244,7 @@ class StatefulHttpActionSession:
                     "response": {
                         "status": latest.response_status,
                         "final_url": latest.response_final_url,
-                        "headers": {
-                            name: value for name, value in latest.response_headers
-                        },
+                        "headers": dict(latest.response_headers),
                         "body": "",
                         "body_sha256": latest.response_body_sha256,
                         "body_unavailable": True,
@@ -271,6 +272,46 @@ class StatefulHttpActionSession:
     def opened(self) -> bool:
         return self._traffic is not None
 
+    @property
+    def request_count(self) -> int:
+        """Return physical requests dispatched by the persistent HTTP lane."""
+        executor = self._executor
+        return executor.request_count if executor is not None else 0
+
+    def session_for_native_probe(
+        self,
+        *,
+        timeout_seconds: int = 10,
+        wall_timeout_seconds: int | None = None,
+    ) -> ProbeSession:
+        """
+        Adapt a trusted native probe to this run's anonymous HTTP owner.
+
+        Managed authentication has a separate owner-issued probe-session path. This
+        adapter is deliberately available only for the anonymous stateful lane so a
+        source-guided probe cannot silently create an independent cookie jar or
+        traffic-policy boundary.
+        """
+        if self.authentication is not None:
+            raise RuntimeError("managed authentication must issue its own native probe session")
+        with self._call_lock:
+            if self._executor is None:
+                self._open()
+        session = _StatefulProbeSession(
+            self,
+            timeout_seconds=timeout_seconds,
+            wall_timeout_seconds=wall_timeout_seconds,
+        )
+        session.configure_managed_identity_forks(header_names=())
+        session.bind_managed_request_delegate(
+            self._request_from_native_probe,
+            generation=0,
+            lease=object(),
+            session_observer=_ignore_probe_session,
+        )
+        session.bind_traffic_identity("anonymous", generation=0)
+        return session
+
     def finalize(self) -> GraphTrafficTerminal | None:
         if self._traffic is None:
             return None
@@ -288,8 +329,7 @@ class StatefulHttpActionSession:
                 primary_error = exc
             else:
                 primary_error.add_note(
-                    "structured HTTP traffic finalization also failed: "
-                    f"{type(exc).__name__}"
+                    f"structured HTTP traffic finalization also failed: {type(exc).__name__}"
                 )
         try:
             if self.authentication is not None:
@@ -299,8 +339,7 @@ class StatefulHttpActionSession:
                 primary_error = exc
             else:
                 primary_error.add_note(
-                    "structured HTTP authentication-gate cleanup also failed: "
-                    f"{type(exc).__name__}"
+                    f"structured HTTP authentication-gate cleanup also failed: {type(exc).__name__}"
                 )
         if primary_error is not None:
             raise primary_error
@@ -313,7 +352,8 @@ class StatefulHttpActionSession:
         *,
         data: bytes | None = None,
         headers: dict[str, str] | None = None,
-        timeout_seconds: int = 10,
+        timeout_seconds: float = 10,
+        _deadline_monotonic: float | None = None,
     ) -> ProbeResponse:
         """Adapt the persistent lane for ``validate_http_poc`` paired replays."""
         arguments: dict[str, object] = {
@@ -325,11 +365,13 @@ class StatefulHttpActionSession:
         if data is not None:
             arguments["body"] = data.decode("utf-8", errors="replace")
         try:
-            execution = self(
-                node_id="base-agent-validator",
-                arguments=arguments,
-                action_id=f"validate-{uuid4()}",
-            )
+            with self._call_lock:
+                execution = self._execute_action(
+                    node_id="base-agent-validator",
+                    arguments=arguments,
+                    action_id=f"validate-{uuid4()}",
+                    _deadline_monotonic=_deadline_monotonic,
+                )
         except ValueError as exc:
             error = str(exc)
             if self.authentication is not None:
@@ -364,7 +406,7 @@ class StatefulHttpActionSession:
             url=url,
             status=status,
             final_url=str(response.get("final_url") or url),
-            elapsed_ms=0,
+            elapsed_ms=_final_physical_response_elapsed_ms(envelope),
             headers=(
                 {str(name): str(value) for name, value in response_headers.items()}
                 if isinstance(response_headers, dict)
@@ -373,6 +415,29 @@ class StatefulHttpActionSession:
             body=body,
             error=str(response.get("error") or ""),
             truncated=response.get("truncated") is True,
+        )
+
+    def _request_from_native_probe(  # noqa: PLR0913 - ProbeSession delegate protocol.
+        self,
+        session: ProbeSession,
+        method: str,
+        url: str,
+        *,
+        data: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ProbeResponse:
+        """Dispatch one native-probe request through the persistent owner."""
+        merged_headers = dict(session.default_headers)
+        merged_headers.update(headers or {})
+        timeout = session.timeout_seconds if timeout_seconds is None else timeout_seconds
+        return self.request(
+            method,
+            url,
+            data=data,
+            headers=merged_headers,
+            timeout_seconds=timeout,
+            _deadline_monotonic=session.wall_clock_deadline_monotonic,
         )
 
     def begin_validation(self) -> None:
@@ -385,7 +450,7 @@ class StatefulHttpActionSession:
         self._validation_proofs.clear()
         return proofs
 
-    def _open(self) -> ScopedGraphHttpExecutor:
+    def _open(self) -> ScopedGraphHttpExecutor:  # noqa: C901 - durable lane setup.
         identity_alias = self.authentication.identity if self.authentication is not None else ""
         http_state_path = self.workspace_dir / "agent-http-state.json"
         blackboard_path = self.workspace_dir / "evidence-blackboard.json"
@@ -491,9 +556,13 @@ class StatefulHttpActionSession:
 
     def _session_tokens(self, executor: ScopedGraphHttpExecutor) -> _SessionTokens:
         prefix: tuple[object, ...] = (
-            "managed",
-            self.authentication.identity_generation,
-        ) if self.authentication is not None else ("anonymous",)
+            (
+                "managed",
+                self.authentication.identity_generation,
+            )
+            if self.authentication is not None
+            else ("anonymous",)
+        )
         transport = getattr(executor, "transport", None)
         cookies = getattr(transport, "cookies", None)
         if cookies is None:
@@ -548,12 +617,9 @@ class StatefulHttpActionSession:
         blackboard_observations = {
             record.observation_id
             for record in blackboard.state.records.values()
-            if record.kind.value == "raw_observation"
-            and record.source.value == "tool_http_request"
+            if record.kind.value == "raw_observation" and record.source.value == "tool_http_request"
         }
-        if "" in traffic_observations or not traffic_observations.issubset(
-            blackboard_observations
-        ):
+        if "" in traffic_observations or not traffic_observations.issubset(blackboard_observations):
             raise RuntimeError(
                 "structured HTTP traffic and evidence are inconsistent after interruption"
             )
@@ -574,6 +640,76 @@ class StatefulHttpActionSession:
 class _SessionTokens:
     shape: tuple[object, ...]
     full: tuple[object, ...]
+
+
+class _StatefulProbeSession(ProbeSession):
+    """Probe facade whose accounting is owned by StatefulHttpActionSession."""
+
+    def __init__(
+        self,
+        owner: StatefulHttpActionSession,
+        *,
+        timeout_seconds: int,
+        wall_timeout_seconds: int | None,
+    ) -> None:
+        self._stateful_owner = owner
+        deadline = (
+            time.monotonic() + max(1, wall_timeout_seconds)
+            if wall_timeout_seconds is not None
+            else None
+        )
+        super().__init__(
+            owner.target_url,
+            timeout_seconds=timeout_seconds,
+            allow_remote_target=owner.allow_remote_target,
+            in_scope=tuple(str(item) for item in owner.scope.in_scope),
+            out_of_scope=tuple(str(item) for item in owner.scope.out_of_scope),
+            _deadline_monotonic=deadline,
+        )
+
+    @property
+    def physical_request_count(self) -> int:
+        return self._stateful_owner.request_count
+
+    def fork(
+        self,
+        *,
+        timeout_seconds: int | None = None,
+        inherit_identity: bool | None = None,
+        max_body_bytes: int | None = None,
+    ) -> ProbeSession:
+        # This owner is already anonymous, so dropping "identity" must never
+        # detach a descendant from its scope, cookie jar, or traffic ledger.
+        _ = inherit_identity
+        return super().fork(
+            timeout_seconds=timeout_seconds,
+            inherit_identity=True,
+            max_body_bytes=max_body_bytes,
+        )
+
+
+def _ignore_probe_session(
+    _lease: object,
+    _session: ProbeSession,
+    _source_session: ProbeSession | None,
+) -> None:
+    return
+
+
+def _final_physical_response_elapsed_ms(envelope: object) -> int:
+    """Recover transport duration without including executor scheduling delay."""
+    if not isinstance(envelope, dict):
+        return 0
+    requests = envelope.get("requests")
+    if not isinstance(requests, list) or not requests:
+        return 0
+    final_request = requests[-1]
+    if not isinstance(final_request, dict) or final_request.get("physical_request") is not True:
+        return 0
+    elapsed_ms = final_request.get("elapsed_ms")
+    if isinstance(elapsed_ms, bool) or not isinstance(elapsed_ms, int):
+        return 0
+    return max(0, elapsed_ms)
 
 
 def request_arguments(action: Mapping[str, object]) -> dict[str, object]:

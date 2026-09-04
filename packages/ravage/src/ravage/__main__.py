@@ -39,6 +39,7 @@ from ravage.agent_core.agent_state import (
 )
 from ravage.agent_core.ai_agent import (
     AIWebAgentSettings,
+    resolve_source_root,
     route_has_paid_transport_risk,
     run_ai_web_agent,
 )
@@ -394,6 +395,11 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
     parser.add_argument("--target-url", required=True)
     parser.add_argument("--db-path", type=Path)
     parser.add_argument("--workspace-dir", type=Path)
+    parser.add_argument(
+        "--source-root",
+        type=Path,
+        help="local source directory for source-assisted analysis",
+    )
     parser.add_argument("--resume-from", type=Path)
     parser.add_argument("--agent", choices=["ai-web"], default="ai-web")
     parser.add_argument(
@@ -520,6 +526,10 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
     if args.report_path is not None:
         _validate_report_output(parser, args.report_path)
     brief = load_engagement_brief(args.brief)
+    try:
+        args.source_root = resolve_source_root(explicit=args.source_root)
+    except ValueError as exc:
+        parser.error(str(exc))
     args.identity = _selected_attack_identity(
         parser,
         brief=brief,
@@ -652,6 +662,7 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
             report_agent=args.report,
             resume_from=args.resume_from,
             workspace_dir=args.workspace_dir,
+            source_root=args.source_root,
             model_config=args.model_config,
             model_profile=args.model_profile,
             model_tier=args.model_tier,
@@ -1993,6 +2004,11 @@ def _attack(  # noqa: C901, PLR0912, PLR0915 - CLI options are intentionally exp
     parser.add_argument("--db-path", type=Path)
     parser.add_argument("--workspace-dir", type=Path)
     parser.add_argument(
+        "--source-root",
+        type=Path,
+        help="local source directory for source-assisted analysis",
+    )
+    parser.add_argument(
         "--resume-from",
         type=Path,
         help=("existing run directory, workspace, working_state.json, or report to resume"),
@@ -2158,6 +2174,10 @@ def _attack(  # noqa: C901, PLR0912, PLR0915 - CLI options are intentionally exp
 
     target_url = _target_url_from_brief(parsed.brief, explicit=parsed.target_url)
     brief = load_engagement_brief(parsed.brief)
+    try:
+        parsed.source_root = resolve_source_root(explicit=parsed.source_root)
+    except ValueError as exc:
+        parser.error(str(exc))
     parsed.identity = _selected_attack_identity(
         parser,
         brief=brief,
@@ -2746,6 +2766,8 @@ def _local_attack_command(  # noqa: C901, PLR0912, PLR0913
         command.extend(["--traffic-request-profile", parsed.traffic_request_profile])
     if parsed.model_config is not None:
         command.extend(["--model-config", str(parsed.model_config)])
+    if parsed.source_root is not None:
+        command.extend(["--source-root", str(parsed.source_root)])
     if parsed.identity:
         command.extend(["--identity", str(parsed.identity)])
     if parsed.identity and auth_env_file is not None:

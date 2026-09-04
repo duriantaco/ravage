@@ -193,6 +193,9 @@ _MIN_IDENTIFIER_LENGTH = 2
 _MAX_IDENTIFIER_LENGTH = 80
 _MAX_REFERENCE_LENGTH = 160
 _MAX_INPUT_NAME_LENGTH = 120
+_MAX_SOURCE_CANDIDATE_IDS = 32
+_MAX_SOURCE_CANDIDATE_ID_INPUTS = 128
+_SOURCE_MAP_ARTIFACT = "artifacts/source-map.json"
 _HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
 
 
@@ -222,6 +225,24 @@ def _safe_reference(value: object) -> str:
     ):
         return ""
     return text
+
+
+def _source_candidate_ids(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    candidate_ids: list[str] = []
+    seen: set[str] = set()
+    for item in value[:_MAX_SOURCE_CANDIDATE_ID_INPUTS]:
+        if not isinstance(item, str):
+            continue
+        candidate_id = _safe_reference(item)
+        if not candidate_id or candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        candidate_ids.append(candidate_id)
+        if len(candidate_ids) >= _MAX_SOURCE_CANDIDATE_IDS:
+            break
+    return candidate_ids
 
 
 def _contract(  # noqa: PLR0913
@@ -736,6 +757,20 @@ def outcome_evidence_payload(  # noqa: PLR0913
     evidence_kind = (
         "native_probe_contract_missing" if contract_missing else "native_probe_validation"
     )
+    provenance: dict[str, object] = {
+        "evidence_kind": evidence_kind,
+        "source_kind": "tool_run_probe",
+        "source_observation_id": source_observation_id,
+        "action_id": action_id,
+        "probe": qualified.probe,
+        "finding_type": qualified.finding_type,
+        "assessment_source": "executor_policy",
+        "model_claims_used": False,
+    }
+    source_candidate_ids = _source_candidate_ids(qualified.request.get("source_candidate_ids"))
+    if source_candidate_ids:
+        provenance["source_candidate_ids"] = source_candidate_ids
+        provenance["source_map_artifact"] = _SOURCE_MAP_ARTIFACT
     payload: dict[str, object] = {
         "schema_version": OUTCOME_EVIDENCE_SCHEMA_VERSION,
         "evidence_id": qualified.evidence_id(engagement_id),
@@ -759,16 +794,7 @@ def outcome_evidence_payload(  # noqa: PLR0913
         "source_kind": "tool_run_probe",
         "source_observation_id": source_observation_id,
         "action_id": action_id,
-        "provenance": {
-            "evidence_kind": evidence_kind,
-            "source_kind": "tool_run_probe",
-            "source_observation_id": source_observation_id,
-            "action_id": action_id,
-            "probe": qualified.probe,
-            "finding_type": qualified.finding_type,
-            "assessment_source": "executor_policy",
-            "model_claims_used": False,
-        },
+        "provenance": provenance,
     }
     return payload
 
@@ -801,6 +827,20 @@ def native_confirmed_finding_payload(
             "indicator": _bounded_json(qualified.indicator),
         }
     )
+    provenance: dict[str, object] = {
+        "evidence_kind": "native_probe_validation",
+        "source_kind": "tool_run_probe",
+        "source_observation_id": source_observation_id,
+        "action_id": action_id,
+        "probe": qualified.probe,
+        "finding_type": qualified.finding_type,
+        "assessment_source": "executor_policy",
+        "model_claims_used": False,
+    }
+    source_candidate_ids = _source_candidate_ids(qualified.request.get("source_candidate_ids"))
+    if source_candidate_ids:
+        provenance["source_candidate_ids"] = source_candidate_ids
+        provenance["source_map_artifact"] = _SOURCE_MAP_ARTIFACT
     return {
         "finding_id": qualified.finding_id(engagement_id),
         "engagement_id": str(engagement_id),
@@ -831,16 +871,7 @@ def native_confirmed_finding_payload(
         "source_observation_id": source_observation_id,
         "action_id": action_id,
         "finding_record_path": finding_record_path,
-        "provenance": {
-            "evidence_kind": "native_probe_validation",
-            "source_kind": "tool_run_probe",
-            "source_observation_id": source_observation_id,
-            "action_id": action_id,
-            "probe": qualified.probe,
-            "finding_type": qualified.finding_type,
-            "assessment_source": "executor_policy",
-            "model_claims_used": False,
-        },
+        "provenance": provenance,
     }
 
 
@@ -1140,7 +1171,7 @@ def _public_input(value: object, *, endpoint: Mapping[str, object]) -> dict[str,
 
 def _public_provenance(value: object) -> dict[str, object]:
     raw = value if isinstance(value, dict) else {}
-    return {
+    provenance: dict[str, object] = {
         "evidence_kind": _safe_identifier(raw.get("evidence_kind")),
         "source_kind": _safe_identifier(raw.get("source_kind")),
         "source_observation_id": _safe_reference(raw.get("source_observation_id")),
@@ -1150,6 +1181,12 @@ def _public_provenance(value: object) -> dict[str, object]:
         "assessment_source": _safe_identifier(raw.get("assessment_source")),
         "model_claims_used": raw.get("model_claims_used") is True,
     }
+    source_candidate_ids = _source_candidate_ids(raw.get("source_candidate_ids"))
+    if source_candidate_ids:
+        provenance["source_candidate_ids"] = source_candidate_ids
+        if raw.get("source_map_artifact") == _SOURCE_MAP_ARTIFACT:
+            provenance["source_map_artifact"] = _SOURCE_MAP_ARTIFACT
+    return provenance
 
 
 def _public_evidence(payload: Mapping[str, object]) -> dict[str, object]:
@@ -1382,29 +1419,62 @@ def _request_summary(value: Mapping[str, object], *, target_url: str) -> dict[st
     )
     for name, _raw in query_pairs:
         _append_param(params, seen, name=name, location="query")
-    location = "query" if method in {"GET", "HEAD", "DELETE", "OPTIONS"} else "body"
+    location = _request_input_location(value, method=method)
+    affected_name = _safe_input_name(value.get("payload_field"))
     _append_param(
         params,
         seen,
-        name=str(value.get("payload_field") or ""),
+        name=affected_name,
         location=location,
     )
-    for container_key in ("form", "fields", "json", "body"):
-        container = value.get(container_key)
-        if isinstance(container, dict):
-            for name in container:
-                _append_param(params, seen, name=str(name), location="body")
+    _append_body_params(
+        params,
+        seen,
+        value,
+        affected_name=affected_name,
+        affected_location=location,
+    )
     summary: dict[str, object] = {"method": method, "url": url, "params": params[:32]}
-    affected_name = _safe_input_name(value.get("payload_field"))
     if affected_name:
         summary["affected_parameter"] = {
             "name": affected_name,
             "location": location,
         }
+        summary["input_location"] = location
+    source_candidate_ids = _source_candidate_ids(value.get("source_candidate_ids"))
+    if source_candidate_ids:
+        summary["source_candidate_ids"] = source_candidate_ids
     encoding = str(value.get("encoding") or "").strip()[:120]
     if encoding:
         summary["encoding"] = encoding
     return summary
+
+
+def _request_input_location(value: Mapping[str, object], *, method: str) -> str:
+    explicit = str(value.get("input_location") or "").strip().lower()
+    if explicit == "query":
+        return "query"
+    if explicit in {"body", "form"}:
+        return "body"
+    return "query" if method in {"GET", "HEAD", "DELETE", "OPTIONS"} else "body"
+
+
+def _append_body_params(
+    params: list[dict[str, str]],
+    seen: set[tuple[str, str]],
+    request: Mapping[str, object],
+    *,
+    affected_name: str,
+    affected_location: str,
+) -> None:
+    for container_key in ("form", "fields", "json", "body"):
+        container = request.get(container_key)
+        if not isinstance(container, dict):
+            continue
+        for name in container:
+            if affected_location == "query" and str(name) == affected_name:
+                continue
+            _append_param(params, seen, name=str(name), location="body")
 
 
 def _input_identity(

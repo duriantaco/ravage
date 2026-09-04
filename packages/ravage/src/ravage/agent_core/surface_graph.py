@@ -118,6 +118,7 @@ _ALLOWED_SOURCE_KINDS = frozenset(
         "graphql",
         "browser",
         "probe",
+        "source_code",
         "agent_http_response",
         "external_tool",
         "legacy_import",

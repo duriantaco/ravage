@@ -12,6 +12,11 @@ from ravage.probe_suite_parts.sqli.sqli_values import _sqli_baseline_value
 from ravage.probe_suite_parts.support import _dict_value
 from ravage.probes.captcha_form_state import prepare_stateful_form_fields
 
+_MAX_SOURCE_CANDIDATE_IDS = 32
+_MAX_SOURCE_CANDIDATE_ID_INPUTS = 128
+_MAX_SOURCE_CANDIDATE_ID_CHARS = 160
+
+
 def _send_sqli_target(session: ProbeSession, target: dict[str, object], value: str) -> ProbeResponse:
     kind = str(target.get("kind") or "")
     url = str(target.get("url") or session.target_url)
@@ -83,6 +88,11 @@ def _send_replay_target(session: ProbeSession, target: dict[str, object], value:
     url = str(target.get("url") or session.target_url)
     payload_field = str(target.get("input") or target.get("payload_field") or "")
     headers = _replay_headers(target)
+    if str(target.get("input_location") or "").lower() == "query":
+        query_url = inject_query_param(url, payload_field, value)
+        if method == "GET":
+            return safe_get(session, query_url)
+        return session.request(method, query_url, headers=headers or None)
     if isinstance(target.get("form"), dict):
         fields: dict[str, str] = {}
         for key, raw_value in _dict_value(target.get("form")).items():
@@ -113,15 +123,15 @@ def _send_replay_target(session: ProbeSession, target: dict[str, object], value:
             return session.request(method, url, data=body, headers=replay_headers)
         return session.post_form(url, fields, headers=headers or None)
     if method == "POST":
-        fields: dict[str, str] = {}
+        post_fields: dict[str, str] = {}
         if payload_field:
-            fields[payload_field] = value
+            post_fields[payload_field] = value
         if "json" in str(target.get("encoding") or "").lower():
-            body = json.dumps(fields).encode("utf-8")
+            body = json.dumps(post_fields).encode("utf-8")
             replay_headers = dict(headers)
             replay_headers["Content-Type"] = "application/json"
             return session.request("POST", url, data=body, headers=replay_headers)
-        return session.post_form(url, fields, headers=headers or None)
+        return session.post_form(url, post_fields, headers=headers or None)
     return safe_get(session, inject_query_param(url, payload_field, value))
 
 def _sqli_replay(target: dict[str, object], value: str) -> dict[str, object]:
@@ -135,6 +145,12 @@ def _sqli_replay(target: dict[str, object], value: str) -> dict[str, object]:
             "payload_field": input_name,
             "replay_hint": "Replay this confirmed request template verbatim; change only payload_field.",
         }
+        input_location = str(target.get("input_location") or "")
+        if input_location:
+            replay["input_location"] = input_location
+        source_candidate_ids = _source_candidate_ids(target.get("source_candidate_ids"))
+        if source_candidate_ids:
+            replay["source_candidate_ids"] = source_candidate_ids
         form = _dict_value(target.get("form"))
         if form:
             fields: dict[str, str] = {}
@@ -276,3 +292,29 @@ def _heuristic_post_fields(url: str, input_name: str, value: str) -> dict[str, s
         fields = {"id": "1", "q": "ravage", "search": "ravage"}
     fields[input_name] = value
     return fields
+
+
+def _source_candidate_ids(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    candidate_ids: list[str] = []
+    seen: set[str] = set()
+    for item in value[:_MAX_SOURCE_CANDIDATE_ID_INPUTS]:
+        if not isinstance(item, str):
+            continue
+        candidate_id = item.strip()
+        if (
+            not candidate_id
+            or len(candidate_id) > _MAX_SOURCE_CANDIDATE_ID_CHARS
+            or any(
+                not (character.isascii() and (character.isalnum() or character in "-_.:"))
+                for character in candidate_id
+            )
+            or candidate_id in seen
+        ):
+            continue
+        seen.add(candidate_id)
+        candidate_ids.append(candidate_id)
+        if len(candidate_ids) >= _MAX_SOURCE_CANDIDATE_IDS:
+            break
+    return candidate_ids

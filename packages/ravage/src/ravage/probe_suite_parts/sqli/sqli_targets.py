@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from ravage.agent_core.agent_state import AgentState
 from ravage.probe_suite_parts.sqli.sqli_forms import _sqli_skip_form_field
@@ -26,11 +26,37 @@ from ravage.probe_suite_parts.support import (
     _url_looks_static_oauth_redirect,
 )
 
+_SOURCE_QUERY_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:\[\]-]{0,127}$")
+_SOURCE_QUERY_VALUE_KINDS = frozenset({"boolean", "integer", "number", "string", "uuid"})
+_SOURCE_QUERY_PLACEHOLDERS = {
+    "boolean": "false",
+    "integer": "1",
+    "number": "1",
+    "string": "ravage",
+    "uuid": "00000000-0000-0000-0000-000000000001",
+}
+
 
 def _sqli_targets(state: AgentState) -> list[dict[str, object]]:
     targets: list[dict[str, object]] = []
     confirmed = _confirmed_sqli_input_keys(state)
-    origin = str(state.surface.get("origin") or state.surface.get("target_url") or "")
+    origin = str(
+        state.surface.get("origin")
+        or state.surface.get("target_url")
+        or state.surface_graph.target_origin
+        or ""
+    )
+    # Source ingest binds the graph to the live attack target.  Never recover
+    # this egress authority from the mutable legacy surface projection.
+    source_origin = str(state.surface_graph.target_origin or "")
+    source_targets = _source_sqli_targets(
+        state,
+        origin=source_origin,
+        confirmed=confirmed,
+    )
+    if state.surface.get("source_validation_probe") == "sqli_differential":
+        return source_targets[:8]
+    targets.extend(source_targets)
     targets.extend(_confirmed_sqli_replay_targets(state))
     targets.extend(_request_template_targets(state, origin=origin, confirmed=confirmed))
     for target in _parameter_targets(state, limit=18):
@@ -168,6 +194,146 @@ def _sqli_targets(state: AgentState) -> list[dict[str, object]]:
     ordered.sort(key=_sqli_target_sort_key)
     return ordered[:20]
 
+
+def _source_sqli_targets(
+    state: AgentState,
+    *,
+    origin: str,
+    confirmed: set[tuple[str, str, str]],
+) -> list[dict[str, object]]:
+    """Build value-free replay targets from trusted, locally derived candidates."""
+    raw_candidates = state.surface.get("source_candidates")
+    if not isinstance(raw_candidates, list) or not origin:
+        return []
+    validation_mode = state.surface.get("source_validation_probe") == "sqli_differential"
+    raw_candidate_ids = state.surface.get("source_validation_candidate_ids")
+    active_candidate_ids = (
+        {str(item) for item in raw_candidate_ids if str(item)}
+        if isinstance(raw_candidate_ids, list)
+        else set()
+    )
+    if validation_mode and not active_candidate_ids:
+        return []
+    targets_by_shape: dict[tuple[str, str, str, str], dict[str, object]] = {}
+    for candidate in raw_candidates[:64]:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = str(candidate.get("candidate_id") or "")
+        if validation_mode and candidate_id not in active_candidate_ids:
+            continue
+        family = str(candidate.get("family") or "").strip().lower().replace("-", "_")
+        if family not in {"sql_injection", "sqli"}:
+            continue
+        method = str(candidate.get("method") or "GET").strip().upper()
+        if (
+            method != "GET"
+            or candidate.get("live_validation") != "automatic_get_query"
+            or candidate.get("route_binding") not in {"direct", "mounted"}
+        ):
+            continue
+        route = str(candidate.get("route") or "").strip()
+        input_name = str(candidate.get("input_name") or "").strip()
+        location = str(candidate.get("input_location") or "").strip().lower()
+        if (
+            not route.startswith("/")
+            or "{" in route
+            or "}" in route
+            or not input_name
+            or location != "query"
+        ):
+            continue
+        query_fields = _source_query_fields(candidate.get("query_fields"))
+        target_field = next(
+            (field for field in query_fields if field[0] == input_name),
+            None,
+        )
+        if target_field is None or target_field[1] != "string":
+            continue
+        url = urljoin(origin.rstrip("/") + "/", route.lstrip("/"))
+        if not _url_in_scope(url, origin):
+            continue
+        for field_name, value_kind, required in query_fields:
+            if required and field_name != input_name:
+                url = _url_with_query_field(
+                    url,
+                    name=field_name,
+                    value=_SOURCE_QUERY_PLACEHOLDERS[value_kind],
+                )
+        shape = (method, url, location, input_name)
+        previous = targets_by_shape.get(shape)
+        if previous is not None:
+            source_candidate_ids = previous.get("source_candidate_ids")
+            if (
+                isinstance(source_candidate_ids, list)
+                and candidate_id
+                and candidate_id not in source_candidate_ids
+            ):
+                source_candidate_ids.append(candidate_id)
+            continue
+        target: dict[str, object] = {
+            "kind": "replay",
+            "url": url,
+            "input": input_name,
+            "payload_field": input_name,
+            "input_location": location,
+            "method": method,
+            "encoding": "application/x-www-form-urlencoded",
+            "required_fields": sorted(
+                field_name
+                for field_name, _value_kind, required in query_fields
+                if required or field_name == input_name
+            ),
+            "hints": ["source_code", "source_family:sql_injection"],
+            "source_candidate_ids": [candidate_id] if candidate_id else [],
+            "priority": _sqli_priority(
+                "replay",
+                url,
+                input_name,
+                confirmed,
+                360,
+            ),
+        }
+        targets_by_shape[shape] = target
+    return list(targets_by_shape.values())
+
+
+def _source_query_fields(value: object) -> tuple[tuple[str, str, bool], ...]:
+    if not isinstance(value, list) or not value or len(value) > 32:
+        return ()
+    fields: list[tuple[str, str, bool]] = []
+    names: set[str] = set()
+    for raw_field in value:
+        if not isinstance(raw_field, dict) or set(raw_field) != {
+            "name",
+            "required",
+            "value_kind",
+        }:
+            return ()
+        name = str(raw_field.get("name") or "")
+        value_kind = str(raw_field.get("value_kind") or "")
+        required = raw_field.get("required")
+        if (
+            not _SOURCE_QUERY_NAME_RE.fullmatch(name)
+            or name in names
+            or value_kind not in _SOURCE_QUERY_VALUE_KINDS
+            or not isinstance(required, bool)
+        ):
+            return ()
+        names.add(name)
+        fields.append((name, value_kind, required))
+    return tuple(fields)
+
+
+def _url_with_query_field(url: str, *, name: str, value: str) -> str:
+    parts = urlsplit(url)
+    query = [
+        (key, raw_value)
+        for key, raw_value in parse_qsl(parts.query, keep_blank_values=True)
+        if key != name
+    ]
+    query.append((name, value))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
 def _sqli_target_brief(target: dict[str, object]) -> dict[str, object]:
     brief = {
         "kind": target.get("kind"),
@@ -178,6 +344,10 @@ def _sqli_target_brief(target: dict[str, object]) -> dict[str, object]:
     if target.get("kind") == "replay":
         brief["method"] = target.get("method")
         brief["required_fields"] = target.get("required_fields", [])
+        if target.get("input_location"):
+            brief["input_location"] = target.get("input_location")
+        if target.get("source_candidate_ids"):
+            brief["source_candidate_ids"] = target.get("source_candidate_ids")
     if target.get("kind") == "graphql_post":
         brief["graphql_field"] = target.get("graphql_field")
         brief["graphql_selection"] = target.get("graphql_selection")
@@ -196,7 +366,7 @@ def _heuristic_kind_for_endpoint(endpoint: str) -> str:
     return "heuristic_get"
 
 def _dedupe_sqli_targets(targets: list[dict[str, object]]) -> list[dict[str, object]]:
-    deduped: dict[tuple[str, str, str], dict[str, object]] = {}
+    deduped: dict[tuple[str, str, str, str, str], dict[str, object]] = {}
     for target in targets:
         key = _sqli_target_key(target)
         previous = deduped.get(key)
@@ -207,11 +377,13 @@ def _dedupe_sqli_targets(targets: list[dict[str, object]]) -> list[dict[str, obj
             deduped[key] = target
     return list(deduped.values())
 
-def _sqli_target_key(target: dict[str, object]) -> tuple[str, str, str]:
+def _sqli_target_key(target: dict[str, object]) -> tuple[str, str, str, str, str]:
     return (
         str(target.get("kind")),
         str(target.get("url")),
         str(target.get("input")),
+        str(target.get("method")),
+        str(target.get("input_location")),
     )
 
 def _sqli_target_sort_key(target: dict[str, object]) -> tuple[int, int, int, int, str, str]:
@@ -454,6 +626,11 @@ def _request_template_targets(
 ) -> list[dict[str, object]]:
     targets: list[dict[str, object]] = []
     for template in _request_templates_from_state(state):
+        # Source-only graph operations can omit companion request fields. The
+        # exact, analyzer-approved GET shape is handled by _source_sqli_targets;
+        # never turn a hint-only source operation into an invented POST replay.
+        if str(template.get("source") or "") == "source_code":
+            continue
         method = _request_template_method(template)
         if method != "POST":
             continue
@@ -495,19 +672,24 @@ def _request_template_targets(
     return targets[:16]
 
 def _request_templates_from_state(state: AgentState) -> list[dict[str, object]]:
-    raw_templates = state.signals.get("request_templates", [])
-    if not isinstance(raw_templates, list):
-        return []
-
     templates: list[dict[str, object]] = []
     seen: set[str] = set()
-    for raw_template in raw_templates:
-        try:
-            parsed = json.loads(str(raw_template))
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(parsed, dict):
-            continue
+    raw_surface_templates = state.surface.get("request_templates", [])
+    surface_templates = (
+        raw_surface_templates if isinstance(raw_surface_templates, list) else []
+    )
+    raw_signal_templates = state.signals.get("request_templates", [])
+    signal_templates = raw_signal_templates if isinstance(raw_signal_templates, list) else []
+    for raw_template in [*surface_templates, *signal_templates]:
+        if isinstance(raw_template, dict):
+            parsed = dict(raw_template)
+        else:
+            try:
+                parsed = json.loads(str(raw_template))
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(parsed, dict):
+                continue
         key = json.dumps(parsed, sort_keys=True)
         if key in seen:
             continue

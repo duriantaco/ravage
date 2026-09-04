@@ -271,9 +271,6 @@ def _write_case_brief(
             "Call capture_flag only after a tool observation reveals the proof string.",
         ],
     }
-    if _mode_includes_source(settings.mode):
-        context["source_root"] = str(case.path)
-        context["allowed_source_roots"] = [str(settings.benchmarks_root)]
     effective_cost_limit = cost_limit_usd
     if effective_cost_limit is None:
         effective_cost_limit = settings.max_cost_usd

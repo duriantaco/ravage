@@ -285,9 +285,7 @@ def execute_action(  # noqa: C901, PLR0911, PLR0912, PLR0913, PLR0915
             )
         except ValueError as exc:
             safe_error = (
-                authentication.redact_text(str(exc))
-                if authentication is not None
-                else str(exc)
+                authentication.redact_text(str(exc)) if authentication is not None else str(exc)
             )
             return _http_request_blocked(
                 error=safe_error,
@@ -406,6 +404,19 @@ def execute_action(  # noqa: C901, PLR0911, PLR0912, PLR0913, PLR0915
                 traffic_policy=traffic_policy,
                 progress_sink=progress_sink,
             )
+        elif _uses_stateful_source_probe(
+            probe=probe,
+            state=state,
+            http_executor=http_executor,
+        ):
+            session_mode = "anonymous:persistent"
+            probe_result = _run_stateful_probe_action(
+                probe,
+                target_url=target_url,
+                state=state,
+                timeout_seconds=timeout_seconds,
+                http_executor=http_executor,
+            )
         else:
             probe_result = _run_probe_action(
                 probe,
@@ -519,9 +530,7 @@ def execute_action(  # noqa: C901, PLR0911, PLR0912, PLR0913, PLR0915
         executor_recognized_proofs: Sequence[str] = ()
         try:
             if authentication is not None and persistent_request is None:
-                poc_session = authentication.session_for_model_action(
-                    timeout_seconds=poc_timeout
-                )
+                poc_session = authentication.session_for_model_action(timeout_seconds=poc_timeout)
             validation_result = validate_http_poc(
                 target_url=target_url,
                 steps=action.get("steps"),
@@ -1875,8 +1884,7 @@ def _decoded_replay_request_text(step: Mapping[str, object]) -> str:
         parsed = urlsplit(location)
         parts.append(unquote(parsed.path))
         parts.extend(
-            f"{name}={value}"
-            for name, value in parse_qsl(parsed.query, keep_blank_values=True)
+            f"{name}={value}" for name, value in parse_qsl(parsed.query, keep_blank_values=True)
         )
     except ValueError:
         parts.append(location)
@@ -1887,8 +1895,7 @@ def _decoded_replay_request_text(step: Mapping[str, object]) -> str:
     if body is not None:
         if _replay_content_type(step) == "application/x-www-form-urlencoded":
             parts.extend(
-                f"{name}={value}"
-                for name, value in parse_qsl(str(body), keep_blank_values=True)
+                f"{name}={value}" for name, value in parse_qsl(str(body), keep_blank_values=True)
             )
         else:
             parts.append(str(body))
@@ -2007,9 +2014,7 @@ def _replay_input_shape(
     raw_url = urljoin(target_url, _replay_step_location(step))
     for name, _value in parse_qsl(urlsplit(raw_url).query, keep_blank_values=True):
         names.append(f"query:{name}")
-    names.extend(
-        f"body:{name}" for name, _value in _replay_body_parameter_values(step)
-    )
+    names.extend(f"body:{name}" for name, _value in _replay_body_parameter_values(step))
     headers = step.get("headers")
     if isinstance(headers, Mapping):
         names.extend(f"header:{str(name).lower()}" for name in headers)
@@ -2620,11 +2625,7 @@ def _http_response_memory(response: Mapping[str, object]) -> dict[str, object]:
     headers = dict(headers_value) if isinstance(headers_value, Mapping) else {}
     status = response.get("status")
     return {
-        "status": (
-            status
-            if isinstance(status, int) and not isinstance(status, bool)
-            else None
-        ),
+        "status": (status if isinstance(status, int) and not isinstance(status, bool) else None),
         "final_url": sanitize_url(response.get("final_url")),
         "headers": mask_headers(headers),
         "header_names": sorted(str(name).casefold() for name in headers)[:32],
@@ -2798,9 +2799,7 @@ def record_probe_result(  # noqa: PLR0913
         executor_recognized_proofs,
         authentication=authentication,
     )
-    recognized_proofs.extend(
-        proof for proof in scanned_proofs if proof not in recognized_proofs
-    )
+    recognized_proofs.extend(proof for proof in scanned_proofs if proof not in recognized_proofs)
     if kind == "tool_run_probe":
         _ingest_probe_surface_graph(
             text,
@@ -2830,9 +2829,7 @@ def record_probe_result(  # noqa: PLR0913
         source_kind=kind,
         recognized_proofs=recognized_proofs,
     )
-    signals = (
-        extract_probe_signals(text) if kind == "tool_run_probe" else extract_signals(text)
-    )
+    signals = extract_probe_signals(text) if kind == "tool_run_probe" else extract_signals(text)
     merge_signals(state, signals)
     known_proof_replayed = _only_known_auto_capture_proofs(
         text,
@@ -3272,6 +3269,8 @@ def _run_authenticated_probe_action(  # noqa: PLR0913
             if use_managed_identity
             else None
         )
+        if session is not None and state.surface.get("source_validation_probe") == probe:
+            session.constrain_wall_clock(_probe_wall_timeout(timeout_seconds, probe=probe))
         authenticated_progress_sink = (
             _authenticated_probe_progress_sink(authentication, progress_sink)
             if progress_sink is not None
@@ -3295,6 +3294,17 @@ def _run_authenticated_probe_action(  # noqa: PLR0913
         )
     except AuthenticationError:
         raise
+    except TimeoutError as exc:
+        safe_error = authentication.redact_text(str(exc))
+        return _ProbeActionResult(
+            text=_probe_failure_text(
+                probe=probe,
+                summary="authenticated source-validation probe timed out",
+                errors=[safe_error or "probe wall-clock deadline exceeded"],
+            ),
+            ok=False,
+            timed_out=True,
+        )
     except Exception as exc:  # noqa: BLE001 - match anonymous probe failure behavior.
         raw_error = str(exc)
         safe_error = (
@@ -3369,8 +3379,7 @@ def _run_probe_action(  # noqa: PLR0913
             text=_probe_failure_text(
                 probe=probe,
                 summary=(
-                    f"probe timed out after {timeout_seconds}s request timeout "
-                    "and wall-clock guard"
+                    f"probe timed out after {timeout_seconds}s request timeout and wall-clock guard"
                 ),
                 errors=[str(exc)],
             ),
@@ -3386,6 +3395,77 @@ def _run_probe_action(  # noqa: PLR0913
             ),
             ok=False,
         )
+
+
+def _uses_stateful_source_probe(
+    *,
+    probe: str,
+    state: AgentState,
+    http_executor: HttpActionExecutor | None,
+) -> bool:
+    """Keep only internal source SQL validation on the persistent probe lane."""
+    return (
+        http_executor is not None
+        and probe == "sqli_differential"
+        and state.surface.get("source_validation_probe") == probe
+    )
+
+
+def _run_stateful_probe_action(
+    probe: str,
+    *,
+    target_url: str,
+    state: AgentState,
+    timeout_seconds: int,
+    http_executor: HttpActionExecutor | None,
+) -> _ProbeActionResult:
+    """Run a trusted source-validation probe through the persistent HTTP owner."""
+    wall_timeout = _probe_wall_timeout(timeout_seconds, probe=probe)
+    try:
+        session_factory = getattr(http_executor, "session_for_native_probe", None)
+        if not callable(session_factory):
+            return _ProbeActionResult(
+                text=_probe_failure_text(
+                    probe=probe,
+                    summary="persistent source-validation probe failed",
+                    errors=["persistent HTTP executor cannot issue a native probe session"],
+                ),
+                ok=False,
+            )
+        session = session_factory(
+            timeout_seconds=timeout_seconds,
+            wall_timeout_seconds=wall_timeout,
+        )
+        result = run_builtin_probe(
+            probe,
+            target_url=target_url,
+            state=state,
+            timeout_seconds=timeout_seconds,
+            session=session,
+        )
+    except TimeoutError as exc:
+        return _ProbeActionResult(
+            text=_probe_failure_text(
+                probe=probe,
+                summary=(
+                    f"persistent source-validation probe timed out after {wall_timeout}s "
+                    "wall-clock guard"
+                ),
+                errors=[str(exc)],
+            ),
+            ok=False,
+            timed_out=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - match isolated probe failure behavior.
+        return _ProbeActionResult(
+            text=_probe_failure_text(
+                probe=probe,
+                summary="persistent source-validation probe failed",
+                errors=[f"{type(exc).__name__}: {exc}"],
+            ),
+            ok=False,
+        )
+    return _ProbeActionResult(text=result.to_text(), ok=result.ok)
 
 
 def _run_probe_with_wall_clock(  # noqa: PLR0913

@@ -162,6 +162,44 @@ ravage attack ravage-brief.yaml \
   --report
 ```
 
+If you also have the application checkout and the engagement permits source
+review, add source-guided validation:
+
+```bash
+ravage attack ravage-brief.yaml \
+  --source-root /path/to/application \
+  --allow-paid-models \
+  --report
+```
+
+`--source-root` is CLI-only opt-in; fields inside a brief cannot enable local
+source access. Ravage scans local Python files for direct Flask and
+FastAPI route-input flows into SQL, template, shell, file-read, and outbound-URL
+sinks. Traversal is capped by file count, per-file and total bytes, directory
+count, and directory-entry count; included source that exceeds any cap fails
+closed. Hidden, temporary, version-control, virtual-environment, dependency,
+cache, and build directories are excluded by policy. The private map stores
+structural identifiers such as method, route and input names, input location,
+framework, relative file, line, and sink; a bounded subset is sent to the configured
+model. It does not store or send source snippets, function bodies, unrelated
+constant values, defaults, or absolute source paths. Automatic replay is limited
+to statically bound, non-mutating GET/query SQL candidates where Ravage knows
+the complete supported scalar query shape and the tested field is a string.
+POST, body, form, path, dynamic, relatively bound, and other sink-family
+candidates remain prioritization hints in this version. A source-code graph
+operation is therefore a route/input hypothesis, not necessarily a complete
+request template. Only live differential evidence can produce a finding.
+
+The source map is `RUN_DIR/workspace/artifacts/source-map.json` with private file
+permissions. It reports traversal counts, including excluded directories;
+exclusions are not live proof or coverage of the skipped code. Parse failures,
+skipped symlinks, and dynamic or unsupported recognized route and direct-flow
+patterns are recorded as incomplete coverage. `analysis_complete` means every
+included file parsed and every recognized bounded pattern was handled; it does
+not mean whole-program coverage. A resumed source-guided run must use the same
+`--source-root` snapshot, analyzer contract, and candidate map; drift fails
+before target traffic starts.
+
 For the authenticated brief used above, add `--identity user` to the attack
 command. A brief with one configured identity is auto-selected by the public
 wrapper, but keeping the flag makes the intended role reviewable. A brief with
