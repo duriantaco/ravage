@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import urllib.request
 from typing import TYPE_CHECKING
+from urllib.parse import parse_qs, urlsplit
 
 import ravage.live_dashboard as ld
 from ravage.agent_core.live_events import (
@@ -193,8 +194,7 @@ def test_http_step_payload_sanitizes_urls_and_response_headers() -> None:
     ):
         assert secret not in serialized
     assert payload["url"] == (
-        "https://target.example/callback"
-        "?view=%5BREDACTED%5D&token=%5BREDACTED%5D"
+        "https://target.example/callback?view=%5BREDACTED%5D&token=%5BREDACTED%5D"
     )
     assert payload["path"] == "/callback?view=%5BREDACTED%5D&token=%5BREDACTED%5D"
     headers = payload["response_headers"]
@@ -261,15 +261,19 @@ def test_dashboard_replay_mode_when_target_reaped(tmp_path: Path) -> None:
 
 
 def test_command_output_extracts_tool_result_and_reasoning() -> None:
-    assert _command_output(
-        {"kind": "tool_validate_poc", "payload": {"result": "admin panel reached"}}
-    ) == "admin panel reached"
+    assert (
+        _command_output({"kind": "tool_validate_poc", "payload": {"result": "admin panel reached"}})
+        == "admin panel reached"
+    )
     assert _command_output(
         {"kind": "tool_run_command", "payload": {"stdout": "root:x:0:0", "stderr": ""}}
     ).startswith("root:x:0:0")
-    assert _command_output(
-        {"kind": "model_reply_received", "payload": {"content": "try IDOR on /profile"}}
-    ) == "try IDOR on /profile"
+    assert (
+        _command_output(
+            {"kind": "model_reply_received", "payload": {"content": "try IDOR on /profile"}}
+        )
+        == "try IDOR on /profile"
+    )
     assert _command_output({"kind": "agent_started", "payload": {}}) == ""
 
 
@@ -316,9 +320,7 @@ def test_stream_cursor_appends_only_new_step(tmp_path: Path) -> None:
 # ---- teardown -----------------------------------------------------------
 
 
-def test_teardown_flips_manifest_to_replay(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_teardown_flips_manifest_to_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _seed_run(tmp_path, events=ACTION_EVENTS)
     monkeypatch.setattr(ld, "_teardown_docker_project", lambda _project: 3)
     settings = DashboardSettings(workspace_dir=tmp_path, run_root=tmp_path)
@@ -338,23 +340,32 @@ def test_cockpit_server_serves_state_and_stream(tmp_path: Path) -> None:
     try:
         port = cockpit.server.server_address[1]
         base = f"http://127.0.0.1:{port}"
-        with urllib.request.urlopen(base + "/api/state", timeout=5) as response:  # noqa: S310
+        token = parse_qs(urlsplit(cockpit.url).fragment)["token"][0]
+        opener = urllib.request.build_opener()
+        login = urllib.request.Request(  # noqa: S310 - fixed loopback test server.
+            base + "/api/session",
+            headers={"Authorization": f"Bearer {token}", "Origin": base},
+            method="POST",
+        )
+        with opener.open(login, timeout=5) as response:
+            assert response.status == 200
+            session = json.loads(response.read())["session_token"]
+        opener.addheaders = [("Authorization", f"Bearer {session}")]
+        with opener.open(base + "/api/state", timeout=5) as response:
             state = json.loads(response.read())
         assert state["manifest"]["run_id"] == "XBEN-001-24"
 
-        with urllib.request.urlopen(base + "/", timeout=5) as response:  # noqa: S310
+        with opener.open(base + "/index.html", timeout=5) as response:
             frontend = response.read().decode("utf-8")
         assert response.status == 200
         assert "Ravage Cockpit" in frontend
 
-        with urllib.request.urlopen(  # noqa: S310
-            base + "/assets/ravage_logo.png", timeout=5
-        ) as response:
+        with opener.open(base + "/assets/ravage_logo.png", timeout=5) as response:
             logo = response.read()
         assert response.status == 200
         assert logo.startswith(b"\x89PNG\r\n\x1a\n")
 
-        with urllib.request.urlopen(base + "/api/events/stream", timeout=5) as response:  # noqa: S310
+        with opener.open(base + "/api/events/stream", timeout=5) as response:
             frame = response.read(64)
         assert frame  # the stream produces bytes immediately (state event / keepalive)
     finally:

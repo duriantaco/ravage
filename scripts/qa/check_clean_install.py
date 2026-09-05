@@ -5,15 +5,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from http import HTTPStatus
 from pathlib import Path
-from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlsplit
+from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[2]
 _COMMAND_TIMEOUT_SECONDS = 300
@@ -141,9 +144,7 @@ def _run_smoke(work_dir: Path) -> int:
         env=environment,
     )
 
-    sys.stdout.write(
-        "clean install check passed: wheels, CLI, doctor, labs, and cockpit UI\n"
-    )
+    sys.stdout.write("clean install check passed: wheels, CLI, doctor, labs, and cockpit UI\n")
     return 0
 
 
@@ -198,13 +199,19 @@ def _assert_observe_ui(
         text=True,
     )
     try:
-        _wait_for_cockpit(process, port=port)
+        token = _wait_for_cockpit(process, port=port)
+        _assert_private_cockpit_state(port=port, token=token)
         frontend = _read_url(f"http://127.0.0.1:{port}/")
         if b"Ravage Cockpit" not in frontend:
             raise SmokeCheckError("clean `ravage observe` did not serve the cockpit UI")
         javascript = _read_url(f"http://127.0.0.1:{port}/src/main.js")
         if not javascript:
             raise SmokeCheckError("clean `ravage observe` served empty cockpit JavaScript")
+        transport = _read_url(f"http://127.0.0.1:{port}/src/transport.js")
+        if not transport:
+            raise SmokeCheckError(
+                "clean `ravage observe` omitted authenticated transport JavaScript"
+            )
         stylesheet = _read_url(f"http://127.0.0.1:{port}/src/styles.css")
         if not stylesheet:
             raise SmokeCheckError("clean `ravage observe` served empty cockpit CSS")
@@ -221,31 +228,61 @@ def _available_loopback_port() -> int:
         return int(listener.getsockname()[1])
 
 
-def _wait_for_cockpit(process: subprocess.Popen[str], *, port: int) -> None:
+def _wait_for_cockpit(process: subprocess.Popen[str], *, port: int) -> str:
     deadline = time.monotonic() + 10
-    url = f"http://127.0.0.1:{port}/api/state"
+    output: queue.Queue[str] = queue.Queue()
+
+    def read_output() -> None:
+        if process.stdout is not None:
+            for line in process.stdout:
+                output.put(line)
+
+    threading.Thread(target=read_output, daemon=True).start()
     while time.monotonic() < deadline:
         returncode = process.poll()
         if returncode is not None:
-            stdout, stderr = process.communicate()
-            detail = "\n".join(part for part in (stdout, stderr) if part).strip()
+            detail = process.stderr.read().strip() if process.stderr is not None else ""
             raise SmokeCheckError(
                 f"clean `ravage observe` exited before serving (exit {returncode}): {detail}"
             )
         try:
-            _read_url(url)
-        except URLError:
-            time.sleep(0.05)
+            line = output.get(timeout=0.05)
+        except queue.Empty:
             continue
-        return
+        _, marker, suffix = line.partition("http://")
+        if not marker:
+            continue
+        parsed = urlsplit(marker + suffix.strip())
+        tokens = parse_qs(parsed.fragment).get("token", [])
+        if parsed.hostname == "127.0.0.1" and parsed.port == port and tokens and not parsed.query:
+            return tokens[0]
     raise SmokeCheckError("clean `ravage observe` did not start within 10 seconds")
 
 
-def _read_url(url: str) -> bytes:
-    with urlopen(url, timeout=2) as response:  # noqa: S310 - fixed loopback smoke target.
+def _assert_private_cockpit_state(*, port: int, token: str) -> None:
+    url = f"http://127.0.0.1:{port}/api/state"
+    try:
+        _read_url(url)
+    except HTTPError as exc:
+        if exc.code != HTTPStatus.UNAUTHORIZED:
+            raise SmokeCheckError(
+                "clean cockpit did not deny unauthenticated state correctly"
+            ) from exc
+    else:
+        raise SmokeCheckError("clean cockpit exposed state without authentication")
+    state = json.loads(_read_url(url, token=token))
+    if state.get("schema") != "ravage.live_dashboard.v1":
+        raise SmokeCheckError("clean cockpit did not serve authenticated dashboard state")
+
+
+def _read_url(url: str, *, token: str = "") -> bytes:
+    request = Request(  # noqa: S310 - fixed loopback smoke target.
+        url, headers={"Authorization": f"Bearer {token}"} if token else {}
+    )
+    with urlopen(request, timeout=2) as response:  # noqa: S310 - fixed loopback smoke target.
         if response.status != HTTPStatus.OK:
             raise SmokeCheckError(f"clean cockpit returned HTTP {response.status} for {url}")
-        return response.read()
+        return bytes(response.read())
 
 
 def _stop_process(process: subprocess.Popen[str]) -> None:
