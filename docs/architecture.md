@@ -107,12 +107,15 @@ both -> typed observations -> proof gate -> durable audit and terminal outcome
   reports, source-guided workflows, and the additive autonomous graph.
 - `packages/schemas`: shared schema package published as `ravage-schemas`,
   imported as `pentest_schemas`.
-- `packages/agents/*`: early specialist-agent packages.
-- `packages/mcp_servers/*`: MCP wrappers for external tools.
+- `packages/agents/*`: early specialist-agent scaffolds outside the active workspace.
+- `packages/mcp_servers/*`: unimplemented MCP scaffolds outside the active workspace;
+  these packages do not provide external-tool servers.
 - `ravage xben`: XBEN runner used for controlled benchmark execution.
 
 The console command is `ravage`, implemented by
 `packages/ravage/src/ravage/__main__.py`.
+The repository root is a virtual UV workspace. Only `ravage` and
+`ravage-schemas` are installable workspace distributions.
 
 ## Entry Points
 
@@ -137,7 +140,10 @@ Benchmark entry points:
 
 - `ravage xben ...`: official-style XBEN validation benchmark runs.
 - `ravage benchmark ...`: compatibility alias for `ravage xben`.
-- `scripts/run_memory_eval.py`: memory off/read comparison.
+- `scripts/run_memory_eval.py`: retired compatibility entry point; reports that
+  memory evaluation is unavailable and exits without running models or writing results.
+- `scripts/eval_proof_bundles.py`: offline recorded-verdict fixture scoring;
+  this checks supplied records and does not independently verify a vulnerability.
 - `scripts/grade_xben_failures.py`: post-run failure categorization.
 
 ## Base Agent Loop And Evaluated Snapshot
@@ -151,12 +157,11 @@ scope, executes the tool, records the observation, and appends the observation
 to the next model turn. Tool output is wrapped as untrusted observation data so
 target-controlled text cannot masquerade as agent instructions.
 
-The agent supports two modes:
-
-- `hybrid`: normal local/manual operation with runtime recommendations,
-  deterministic proof support, and evidence gates.
-- `ctf-free-roam`: benchmark/CTF mode that encourages bounded autonomous
-  exploration and flag capture.
+The CLI retains `hybrid` and `ctf-free-roam` as compatibility labels recorded
+in run metadata. The base execution loop does not select different behavior
+from these labels. Runtime capabilities and evidence requirements come from
+the brief, identity, traffic policy, and execution settings. XBEN separately
+requires the `ctf-free-roam` label for its official-style configuration.
 
 The frozen 2026-07-12 XBEN result came from an earlier snapshot of this base
 architecture. It used one
@@ -496,32 +501,17 @@ identity removes process/browser execution and gives the graph managed
 
 ## Source-Guided Workflows
 
-When source context is available, Ravage parses routes, parameters, sinks,
-headers, credentials, JWT/session logic, upload flows, GraphQL shapes, and
-framework-specific patterns. Source-guided workflows then attempt bounded
-dynamic proof against the running target.
+The shipped analyzer contract is `ravage.python-web-direct-flows.v2`. It reads
+bounded Python source and recognizes direct request-input flows in supported
+Flask/FastAPI handlers. Its static candidates cover SQL, template rendering,
+shell execution, file reads, and outbound URLs. Unsupported syntax and skipped
+files are reported; this is not whole-program or multi-language analysis.
 
-Implemented workflow areas include:
-
-- SQL injection;
-- XSS;
-- SSTI;
-- command injection;
-- LFI and path traversal;
-- IDOR and privilege boundaries;
-- SSRF;
-- XXE;
-- JWT forgery and header trust;
-- auth bypass;
-- GraphQL IDOR;
-- file upload;
-- insecure deserialization;
-- encrypted cookies;
-- SSH/source-secret pivots.
-
-These workflows are not benchmark shortcuts. They are reusable proof loops that
-turn source signals into scoped runtime attempts and still require live target
-evidence before reporting.
+Automatic source-guided replay supports a bounded subset of non-mutating
+GET/query SQL candidates. Other candidate shapes remain hints. The broader
+deterministic probe catalog does not imply that those families have source
+analysis support. See [How To Use](how-to-use.md) for the supported inputs and
+proof requirements.
 
 ## Evidence And Reporting
 

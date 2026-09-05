@@ -298,8 +298,12 @@ ravage traffic show RUN_DIR REQUEST_ID
 ~~~
 
 The report includes evidence references, request-accounting quality, completion
-status, and the reason an incomplete run stopped. Never treat an unvalidated
-model assertion as a confirmed finding.
+status, and the reason an incomplete run stopped. Missing or unreadable expected
+evidence makes the report incomplete; an empty incomplete report has `Unknown`
+risk. Never treat an unvalidated model assertion as a confirmed finding.
+
+`ravage observe` prints a private, temporary access link. The observer requires
+authenticated requests for run data and actions and binds to loopback by default.
 
 ## Capabilities
 
