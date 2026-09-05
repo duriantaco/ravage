@@ -19,17 +19,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "22"
 
@@ -51,8 +51,10 @@ jobs:
       - name: Check maintained documentation
         run: python scripts/check_docs.py
 
-      - name: Check cockpit JavaScript syntax
-        run: npm --prefix packages/ravage-cockpit run check
+      - name: Check cockpit JavaScript
+        run: |
+          npm --prefix packages/ravage-cockpit run check
+          npm --prefix packages/ravage-cockpit test
 
       - name: Ruff clean baseline
         run: |
@@ -120,6 +122,27 @@ jobs:
             packages/ravage/tests/test_control_plane_runner_protocol.py \
             packages/ravage/tests/test_runner_service.py
 
+      - name: Evidence and operator integrity static checks
+        run: |
+          python -m ruff check \
+            packages/ravage/src/ravage/report.py \
+            packages/ravage/src/ravage/report_artifact.py \
+            packages/ravage/src/ravage/report_io.py \
+            packages/ravage/src/ravage/memory_eval.py \
+            packages/ravage/src/ravage/proof_bundle_eval.py \
+            packages/ravage/src/ravage/live_dashboard_security.py \
+            scripts/eval/run_memory_eval.py \
+            scripts/eval/eval_proof_bundles.py
+          python -m mypy --follow-imports=silent \
+            packages/ravage/src/ravage/report.py \
+            packages/ravage/src/ravage/report_artifact.py \
+            packages/ravage/src/ravage/report_io.py \
+            packages/ravage/src/ravage/memory_eval.py \
+            packages/ravage/src/ravage/proof_bundle_eval.py \
+            packages/ravage/src/ravage/live_dashboard_security.py \
+            scripts/eval/run_memory_eval.py \
+            scripts/eval/eval_proof_bundles.py
+
       - name: Anti-overfit policy check
         run: python scripts/check_overfit.py
 
@@ -141,10 +164,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
 
@@ -162,25 +185,46 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
 
       - name: Smoke-test the base wheels in a clean environment
         run: python scripts/check_clean_install.py
 
+  cockpit_browser:
+    name: Cockpit Firefox and Chromium
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Install cockpit browser test dependencies
+        run: |
+          python -m pip install pytest==9.0.3 playwright==1.62.0
+          python -m pip install -e packages/schemas -e packages/ravage
+          python -m playwright install --with-deps --only-shell chromium firefox
+
+      - name: Verify private cockpit access in real browsers
+        run: python -m pytest packages/ravage-cockpit/tests/test_browser_login.py -q
+
   scope_integration:
     name: Docker scope enforcement
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
 
@@ -202,6 +246,7 @@ jobs:
       - static_checks
       - tests
       - clean_install
+      - cockpit_browser
       - scope_integration
     runs-on: ubuntu-latest
     steps:
@@ -210,9 +255,11 @@ jobs:
           STATIC_RESULT: ${{ needs.static_checks.result }}
           TEST_RESULT: ${{ needs.tests.result }}
           CLEAN_INSTALL_RESULT: ${{ needs.clean_install.result }}
+          COCKPIT_BROWSER_RESULT: ${{ needs.cockpit_browser.result }}
           SCOPE_INTEGRATION_RESULT: ${{ needs.scope_integration.result }}
         run: |
           test "${STATIC_RESULT}" = success
           test "${TEST_RESULT}" = success
           test "${CLEAN_INSTALL_RESULT}" = success
+          test "${COCKPIT_BROWSER_RESULT}" = success
           test "${SCOPE_INTEGRATION_RESULT}" = success
