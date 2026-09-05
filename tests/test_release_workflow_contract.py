@@ -158,6 +158,7 @@ def test_release_please_updates_the_ravage_version_and_schema_pin_together() -> 
     config = json.loads(config_path.read_text(encoding="utf-8"))
     assert re.fullmatch(r"[0-9a-f]{40}", config["bootstrap-sha"])
     extra_files = config["packages"]["."]["extra-files"]
+    assert "pyproject.toml" not in {item["path"] for item in extra_files}
     generic_paths = {
         item["path"] for item in extra_files if item.get("type") == "generic"
     }

@@ -96,6 +96,7 @@ def _run_smoke(work_dir: Path) -> int:
         clean_python,
         "-c",
         _BASE_INSTALL_ASSERTIONS,
+        cwd=work_dir,
         env=environment,
     )
     help_result = _run(clean_ravage, "--help", env=environment, capture=True)
@@ -354,7 +355,7 @@ class SmokeCheckError(RuntimeError):
 
 
 _BASE_INSTALL_ASSERTIONS = """
-from importlib.metadata import requires
+from importlib.metadata import distributions, requires
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -367,6 +368,18 @@ playwright_requirements = [
 assert playwright_requirements, "ravage wheel omitted its browser extra metadata"
 assert all("extra == 'browser'" in item for item in playwright_requirements)
 assert "site-packages" in str(Path(ravage.__file__).resolve())
+installed = {dist.metadata["Name"].lower().replace("_", "-"): dist for dist in distributions()}
+assert "pentest-agent" not in installed, "retired pentest-agent distribution was installed"
+assert not any(name.endswith("-mcp") for name in installed), (
+    "MCP scaffold distribution was installed"
+)
+entrypoints = [
+    (name, entrypoint.value)
+    for name, dist in installed.items()
+    for entrypoint in dist.entry_points
+    if entrypoint.group == "console_scripts" and entrypoint.name == "ravage"
+]
+assert entrypoints == [("ravage", "ravage.__main__:main")], entrypoints
 """
 
 
