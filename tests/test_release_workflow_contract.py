@@ -8,7 +8,9 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github/workflows"
 FULL_COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
 ACTION_USE = re.compile(r"^\s*uses:\s*([^\s#]+)", re.MULTILINE)
-RELEASE_WORKFLOWS = (
+PINNED_ACTION_WORKFLOWS = (
+    "ci.yml",
+    "docs-pages.yml",
     "publish-kali-image.yml",
     "publish-pypi.yml",
     "publish-testpypi.yml",
@@ -33,9 +35,9 @@ def _job(workflow: str, name: str, *, next_name: str | None = None) -> str:
     return section
 
 
-def test_release_workflow_actions_are_pinned_to_full_commit_shas() -> None:
+def test_workflow_actions_are_pinned_to_full_commit_shas() -> None:
     failures: list[str] = []
-    for name in RELEASE_WORKFLOWS:
+    for name in PINNED_ACTION_WORKFLOWS:
         for action in ACTION_USE.findall(_workflow(name)):
             if action.startswith("./"):
                 continue
@@ -158,6 +160,7 @@ def test_release_please_updates_the_ravage_version_and_schema_pin_together() -> 
     config = json.loads(config_path.read_text(encoding="utf-8"))
     assert re.fullmatch(r"[0-9a-f]{40}", config["bootstrap-sha"])
     extra_files = config["packages"]["."]["extra-files"]
+    assert "pyproject.toml" not in {item["path"] for item in extra_files}
     generic_paths = {
         item["path"] for item in extra_files if item.get("type") == "generic"
     }

@@ -18,8 +18,14 @@ INVALID_OPTION_EXIT_CODE = 2
 
 
 def test_checkout_metadata_keeps_browser_support_optional() -> None:
-    metadata = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    root_metadata = tomllib.loads(
+        (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    metadata = tomllib.loads(
+        (REPOSITORY_ROOT / "packages/ravage/pyproject.toml").read_text(encoding="utf-8")
+    )
 
+    assert "project" not in root_metadata
     assert not any(
         dependency.partition(">=")[0] == "playwright"
         for dependency in metadata["project"]["dependencies"]

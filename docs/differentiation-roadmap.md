@@ -74,15 +74,12 @@ Required capabilities fail closed unless degraded mode is explicitly allowed.
 
 ### Source-Guided Dynamic Proof
 
-Ravage can inspect source context when the selected mode permits it, extract
-routes/params/sinks, then run bounded dynamic workflows against the live target.
-
-Implemented workflow areas include SQLi, XSS, SSTI, command injection, LFI,
-IDOR/authz, SSRF, XXE, JWT/session issues, auth bypass, GraphQL IDOR, uploads,
-deserialization, encrypted cookies, and selected source-secret pivots.
-
-The important distinction is that source context guides candidates; it does not
-become proof by itself.
+Ravage's bounded Python analyzer maps supported Flask/FastAPI handlers and
+direct input flows to SQL, template, shell, file-read, and outbound-URL sinks.
+Automatic replay currently covers a subset of non-mutating GET/query SQL
+candidates. Other source candidates remain advisory; source context alone
+cannot become proof. The full deterministic probe catalog is broader than the
+shipped source analyzer.
 
 ### Benchmark Honesty
 
@@ -95,12 +92,6 @@ XBEN runs record the benchmark context mode:
 
 This prevents mixing description-only black-box and white-box results as if
 they were the same benchmark.
-
-### Local Reviewed Memory
-
-Memory is local SQLite, redacted, reviewable, and advisory. It can suggest
-lessons, but it cannot report findings, capture flags, override scope, or store
-raw secrets.
 
 ### Inspectable Run Artifacts
 
@@ -157,6 +148,13 @@ from `curl`, Docker tools, scanners, and other external processes.
 
 ## Current Limits
 
+### Reviewed Memory Is Inactive
+
+The [Memory Design](memory.md) describes local, redacted, advisory storage, but
+active memory is not wired into the public attack command. Only `--memory off`
+is supported. The retired memory evaluator exits explicitly as unavailable;
+it does not measure an improvement or generate an evaluation report.
+
 ### HTTP History And Replay UI
 
 The CLI foundation now covers automatic agent structured HTTP history and
@@ -196,9 +194,10 @@ finding class.
 
 ### Source-Guided Breadth
 
-Source-guided workflows are broad but uneven. Some vulnerability families have
-multiple tested patterns; others still need more frameworks, encodings, auth
-states, and negative tests.
+Source analysis is limited to the documented Python direct-flow contract.
+Other languages, whole-program analysis, and most request shapes have no
+automatic source-guided validation. Skipped inputs must remain visible in
+coverage claims.
 
 ### Terminal Robustness
 

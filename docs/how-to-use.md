@@ -463,9 +463,28 @@ ravage audit verify RUN_DIR
 The canonical JSON report is finalized even when a run is incomplete, fails
 after starting, or has no flag-based objective. Evidence-backed findings remain
 in the report independently of any captured flag. JSON-only finalization reads
-saved artifacts and sends no model or target requests. It uses an atomic replace
-and private file permissions so an interrupted write cannot leave a partially
-written report.
+saved artifacts and sends no model or target requests. Both canonical JSON and
+explicit Markdown/JSON exports use private file permissions and atomic replacement
+for each file, so an interrupted write preserves the previous complete file.
+
+Report evidence health is separate from run completion. Inspect
+`source_quality.status`, `audit_source`, `audit_log_source`, `event_sources`, and
+`rejected_confirmed_events`: an expected database that is missing, unreadable,
+or contains rejected records makes the report incomplete. Validated findings
+remain visible, while a report without findings and with unavailable evidence
+has `Unknown` risk. Source health does not replace `ravage audit verify` for
+cryptographic audit-chain verification.
+
+Event source health distinguishes an existing empty log from a missing or
+unreadable log. Persisted workspace state, transcripts, and scan/graph state
+identify expected event logs. An export with neither events nor a requested
+audit source is incomplete; legitimate audit-only exports and unused optional
+event streams remain supported.
+
+When a run directory moves, recorded audit paths inside that run or its
+workspace move with it. A custom relative audit path outside the run cannot be
+relocated because older manifests do not record the producing working directory;
+use an absolute path for external audit storage.
 
 If you did not pass `--report`, render the optional human-readable report later:
 
@@ -877,6 +896,16 @@ Follow an existing run from another terminal:
 ```bash
 ravage observe RUN_DIR
 ```
+
+Open the private link printed by `ravage observe`. Its temporary access token
+is specific to that running observer. The browser removes it from the address
+bar and keeps access in that tab's origin-scoped session storage. Run data and
+teardown actions require authenticated requests. Restarting the observer
+invalidates previous access credentials.
+
+The observer binds to loopback by default and serves HTTP. For remote review,
+use an SSH tunnel to loopback; an explicit external `--host` does not add TLS.
+Treat the printed link as a credential and keep it private.
 
 Resume the same attack workspace after an interrupted run:
 

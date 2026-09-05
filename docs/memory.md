@@ -12,6 +12,11 @@ point. There is no active memory review command in the current CLI.
 Use this page as implementation context for future memory work. For current
 runs and benchmark claims, keep memory off and rely on live target evidence.
 
+`scripts/run_memory_eval.py` and its compatibility API explicitly report that
+memory A/B evaluation is unavailable. The command exits 2 without calling a
+model, opening a memory database, or writing a report. Earlier hard-coded
+outputs from this entry point are not evaluation evidence.
+
 ## Design Goal
 
 Ravage Memory is intended to be a local-first learning loop for `ai-web`. It is
