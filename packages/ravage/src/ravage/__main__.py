@@ -6002,13 +6002,40 @@ def _report(args: list[str]) -> None:
             output_path=output_path,
             status=parsed.status,
             completed=parsed.status == "completed",
-            audit_db_path=run_dir / "audit.db",
+            audit_db_path=_report_audit_path(
+                run_dir=run_dir, workspace_dir=workspace_dir, manifest=manifest
+            ),
         )
     except (OSError, sqlite3.Error, TypeError, ValueError, yaml.YAMLError) as exc:
         parser.error(f"could not generate report: {_concise_cli_error(exc)}")
     raw_artifacts = report.get("artifacts")
     artifacts = raw_artifacts if isinstance(raw_artifacts, dict) else {}
     _write_line(f"report written {artifacts.get('markdown_report_path') or output_path}")
+
+
+def _report_audit_path(
+    *, run_dir: Path, workspace_dir: Path, manifest: RunManifest | None
+) -> Path | None:
+    """Honor the recorded audit location, including an expected source that is missing."""
+    if manifest is not None and manifest.db_path:
+        declared = Path(manifest.db_path)
+        if manifest.workspace_dir:
+            recorded_workspace = Path(manifest.workspace_dir)
+            for recorded_root, actual_root in (
+                (recorded_workspace, workspace_dir),
+                (recorded_workspace.parent, run_dir),
+            ):
+                if declared.is_relative_to(recorded_root):
+                    relative = declared.relative_to(recorded_root)
+                    if ".." not in relative.parts:
+                        return actual_root / relative
+        # External relative paths cannot be relocated without the producer's cwd.
+        # Preserve that declared location; never substitute a healthy default DB.
+        return declared
+    for candidate in (run_dir / "audit.db", workspace_dir / "audit.db"):
+        if candidate.exists() or candidate.is_symlink():
+            return candidate
+    return None
 
 
 def _validate_report_output(parser: argparse.ArgumentParser, output_path: Path) -> None:
@@ -6081,13 +6108,13 @@ def _valid_run_directory(parser: argparse.ArgumentParser, path: Path) -> bool:
     if (workspace / "terminal").is_dir() or (workspace / "traffic").is_dir():
         return True
 
-    audit_path = run_dir / "audit.db"
-    if not audit_path.is_file():
-        return False
-    error = _audit_db_schema_error(audit_path)
-    if error:
-        parser.error(f"invalid Ravage audit database {audit_path}: {error}")
-    return True
+    for audit_path in (run_dir / "audit.db", workspace / "audit.db"):
+        if audit_path.is_file():
+            error = _audit_db_schema_error(audit_path)
+            if error:
+                parser.error(f"invalid Ravage audit database {audit_path}: {error}")
+            return True
+    return False
 
 
 def _observe_settings(run_dir: Path, *, lab_manifest_path: Path | None) -> DashboardSettings:

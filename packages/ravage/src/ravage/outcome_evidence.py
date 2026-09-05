@@ -1259,8 +1259,10 @@ def _workspace_records(
     records: list[tuple[str, dict[str, object]]] = []
     for events_path in _workspace_event_paths(workspace_path):
         try:
+            if not events_path.is_file():
+                continue
             lines = events_path.read_text(encoding="utf-8").splitlines()
-        except OSError:
+        except (OSError, UnicodeError):
             continue
         for line in lines:
             value = _json_object(line)
@@ -1298,7 +1300,7 @@ def _audit_records(  # noqa: C901 - legacy schemas are read fail-closed per tabl
         return []
     records: list[tuple[str, dict[str, object]]] = []
     try:
-        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        connection = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
         try:
             parameters: tuple[str, ...] = ()
             query = "SELECT action, payload_json FROM audit_log"
@@ -1309,7 +1311,7 @@ def _audit_records(  # noqa: C901 - legacy schemas are read fail-closed per tabl
             try:
                 audit_rows = connection.execute(query, parameters).fetchall()
             except sqlite3.Error:
-                audit_rows = ()
+                audit_rows = []
             for action, raw_payload in audit_rows:
                 payload = _json_object(str(raw_payload or ""))
                 if payload:
@@ -1325,7 +1327,7 @@ def _audit_records(  # noqa: C901 - legacy schemas are read fail-closed per tabl
                     finding_parameters,
                 ).fetchall()
             except sqlite3.Error:
-                finding_rows = ()
+                finding_rows = []
             for (raw_payload,) in finding_rows:
                 payload = _json_object(str(raw_payload or ""))
                 if payload:
