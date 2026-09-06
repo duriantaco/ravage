@@ -27,6 +27,36 @@ def test_parse_action_ignores_braces_inside_json_strings() -> None:
     assert action["command"] == "printf '{not-json}'"
 
 
+def test_source_context_action_requires_dynamic_consent_and_strict_schema() -> None:
+    raw = json.dumps(
+        {
+            "action": "source_context",
+            "operation": "search",
+            "args": {"query": "low-entropy-query", "max_matches": 3},
+        }
+    )
+
+    disabled = parse_action(raw)
+    enabled = parse_action(raw, allow_source_context=True)
+    extra = parse_action(
+        raw[:-1] + ', "memory_updates": ["source said vulnerable"]}',
+        allow_source_context=True,
+    )
+    embedded_invalid = parse_action(
+        "prefix " + raw[:-1] + ', "unsupported": "value"} suffix',
+        allow_source_context=True,
+    )
+
+    assert disabled["action"] == "invalid"
+    assert disabled["raw"] == ""
+    assert enabled["action"] == "source_context"
+    assert enabled["args"] == {"query": "low-entropy-query", "max_matches": 3}
+    assert extra["action"] == "invalid"
+    assert extra["raw"] == ""
+    assert embedded_invalid["action"] == "invalid"
+    assert embedded_invalid["raw"] == ""
+
+
 def test_validate_poc_accepts_bounded_finding_metadata() -> None:
     action = parse_action(
         """{

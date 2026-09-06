@@ -4,6 +4,8 @@ import json
 import re
 from typing import Any
 
+from ravage.agent_core.source_context import SOURCE_CONTEXT_ACTION, source_context_action_error
+
 VALID_ACTIONS = {
     "http_request",
     "run_command",
@@ -32,14 +34,20 @@ _MAX_FINDING_FIELD_CHARS = 1_000
 _VULN_CLASS_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 
 
-def parse_action(text: str) -> dict[str, object]:
+def parse_action(text: str, *, allow_source_context: bool = False) -> dict[str, object]:
     cleaned = _strip_fence(text.strip())
     try:
         payload = json.loads(cleaned)
     except json.JSONDecodeError:
         candidates = _json_object_candidates(cleaned)
         if not candidates:
-            return invalid_action("model response was not JSON", raw=cleaned)
+            return invalid_action(
+                "model response was not JSON",
+                raw=_safe_source_context_raw(
+                    cleaned,
+                    allow_source_context=allow_source_context,
+                ),
+            )
         first_error = ""
         for candidate in candidates:
             try:
@@ -49,24 +57,37 @@ def parse_action(text: str) -> dict[str, object]:
                 continue
             if not isinstance(payload, dict):
                 continue
-            normalized = normalize_action(payload)
+            normalized = normalize_action(payload, allow_source_context=allow_source_context)
             if normalized.get("action") != "invalid":
                 return normalized
             first_error = first_error or str(normalized.get("error") or "")
         return invalid_action(
-            f"embedded JSON did not parse: {first_error or 'no valid action object'}", raw=cleaned
+            f"embedded JSON did not parse: {first_error or 'no valid action object'}",
+            raw=_safe_source_context_raw(
+                cleaned,
+                allow_source_context=allow_source_context,
+            ),
         )
     if not isinstance(payload, dict):
         return invalid_action("model response JSON was not an object")
-    return normalize_action(payload)
+    return normalize_action(payload, allow_source_context=allow_source_context)
 
 
-def normalize_action(payload: dict[str, Any]) -> dict[str, object]:
+def normalize_action(
+    payload: dict[str, Any], *, allow_source_context: bool = False
+) -> dict[str, object]:
     action = _action_name(payload)
     raw_payload = _raw_payload(payload)
-    validation_error = _validation_error(action, payload)
+    validation_error = _validation_error(
+        action,
+        payload,
+        allow_source_context=allow_source_context,
+    )
     if validation_error:
-        return invalid_action(validation_error, raw=raw_payload)
+        return invalid_action(
+            validation_error,
+            raw="" if action == SOURCE_CONTEXT_ACTION else raw_payload,
+        )
 
     normalized: dict[str, object] = dict(payload)
     normalized["action"] = action
@@ -87,6 +108,12 @@ def invalid_action(error: str, *, raw: str = "") -> dict[str, object]:
     return {"action": "invalid", "error": error, "raw": raw[:2000]}
 
 
+def _safe_source_context_raw(text: str, *, allow_source_context: bool) -> str:
+    if allow_source_context and SOURCE_CONTEXT_ACTION in text:
+        return ""
+    return text
+
+
 def _action_name(payload: dict[str, Any]) -> str:
     return str(payload.get("action") or "").strip()
 
@@ -95,7 +122,16 @@ def _canonical_http_method(value: object) -> str:
     return str(value or "GET").strip().upper()
 
 
-def _validation_error(action: str, payload: dict[str, Any]) -> str:
+def _validation_error(  # noqa: PLR0911 - action contracts fail fast by branch.
+    action: str,
+    payload: dict[str, Any],
+    *,
+    allow_source_context: bool = False,
+) -> str:
+    if action == SOURCE_CONTEXT_ACTION:
+        if not allow_source_context:
+            return f"invalid action: {action}"
+        return source_context_action_error(payload)
     if action not in VALID_ACTIONS:
         return f"invalid action: {action}"
     required_text_field = REQUIRED_TEXT_FIELDS.get(action)
