@@ -1,3 +1,3 @@
-# Elm catalog sample
+# Web service sample
 
-The catalog handler and output helper live under `src/catalog`.
+This directory contains a compact request-handling example.

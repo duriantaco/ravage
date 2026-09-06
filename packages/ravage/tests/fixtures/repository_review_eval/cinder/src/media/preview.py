@@ -16,7 +16,7 @@ def create_preview() -> object:
         abort(400)
     source_path = UPLOAD_ROOT / source_name
     output_path = PREVIEW_ROOT / f"{uuid4().hex}.png"
-    subprocess.run(  # noqa: S602
+    subprocess.run(
         f"/usr/bin/magick {source_path} {output_path}", shell=True, check=True
     )
     return send_file(output_path)

@@ -25,6 +25,12 @@ _EXPECTED_CLASSES = {
     "path_traversal",
     "sql_injection",
 }
+_PAIRS = (
+    ("aurora", "boreal"),
+    ("cinder", "delta"),
+    ("elm", "flint"),
+    ("grove", "harbor"),
+)
 _STATUS_LABELS = ("control", "insecure", "safe", "vulnerable")
 _ANCHORS = {
     "aurora": (
@@ -113,7 +119,8 @@ def test_repository_review_eval_manifest_binds_neutral_paired_fixtures() -> None
             assert expected[0]["vuln_class"] == class_name
             [location] = cast("list[dict[str, Any]]", expected[0]["locations"])
             assert location["path"] == anchor_path
-            assert location["start_line"] <= anchor_line <= location["end_line"]
+            assert location["start_line"] == anchor_line
+            assert location["end_line"] == anchor_line
 
         reviewed_text = "\n".join(
             path.read_text(encoding="utf-8")
@@ -122,12 +129,30 @@ def test_repository_review_eval_manifest_binds_neutral_paired_fixtures() -> None
         ).casefold()
         assert "ground_truth" not in reviewed_text
         assert "expected_class_finding" not in reviewed_text
+        assert "noqa" not in reviewed_text
         pairs[class_name].append(case)
 
     assert set(pairs) == _EXPECTED_CLASSES
     for members in pairs.values():
         assert len(members) == _EXPECTED_PAIR_SIZE
         assert sorted(bool(member["expected"]) for member in members) == [False, True]
+
+    for first, second in _PAIRS:
+        assert (_FIXTURE_COLLECTION / first / "README.md").read_bytes() == (
+            _FIXTURE_COLLECTION / second / "README.md"
+        ).read_bytes()
+
+
+def test_idor_pair_shares_explicit_data_access_semantics() -> None:
+    aurora_store = _FIXTURE_COLLECTION / "aurora" / "src" / "store.ts"
+    boreal_store = _FIXTURE_COLLECTION / "boreal" / "src" / "store.ts"
+
+    assert aurora_store.read_bytes() == boreal_store.read_bytes()
+    store_text = aurora_store.read_text(encoding="utf-8")
+    assert "order.id === orderId" in store_text
+    assert "order.id === orderId && order.accountId === accountId" in store_text
+    assert not (_FIXTURE_COLLECTION / "aurora" / "src" / "orders" / "labels.ts").exists()
+    assert not (_FIXTURE_COLLECTION / "boreal" / "src" / "orders" / "labels.ts").exists()
 
 
 def test_python_route_pairs_reach_the_structured_source_analyzer() -> None:

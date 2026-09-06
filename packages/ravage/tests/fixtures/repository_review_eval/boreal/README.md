@@ -1,3 +1,3 @@
-# Boreal service sample
+# Web service sample
 
-The request handler and supporting presentation helper live under `src/orders`.
+This directory contains a compact request-handling example.

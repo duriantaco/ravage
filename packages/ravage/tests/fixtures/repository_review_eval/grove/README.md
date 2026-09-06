@@ -1,3 +1,3 @@
-# Grove exports sample
+# Web service sample
 
-The download handler and naming helper live under `src/exports`.
+This directory contains a compact request-handling example.

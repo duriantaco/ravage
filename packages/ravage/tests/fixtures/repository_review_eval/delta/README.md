@@ -1,3 +1,3 @@
-# Delta media sample
+# Web service sample
 
-The preview handler and filename helper live under `src/media`.
+This directory contains a compact request-handling example.
