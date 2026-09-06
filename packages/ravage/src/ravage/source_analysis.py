@@ -10,6 +10,7 @@ import re
 import stat
 import tokenize
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
@@ -329,9 +330,11 @@ class _AnalysisBindings:
 
 
 @dataclass(frozen=True, slots=True)
-class _FileSnapshot:
+class SourceFileSnapshot:
+    """One immutable Python source document supplied by an existing capture."""
+
     relative_file: str
-    data: bytes
+    data: bytes = dataclass_field(repr=False)
 
 
 @dataclass(slots=True)
@@ -374,6 +377,72 @@ def analyze_source_root(
         max_file_bytes=limits[2],
     )
 
+    return _analyze_source_snapshots(
+        snapshots,
+        symlinks_skipped=walk.symlinks_skipped,
+        directories_scanned=walk.directories_scanned,
+        directory_entries_scanned=walk.directory_entries_scanned,
+        excluded_directories=walk.excluded_directories,
+    )
+
+
+def analyze_source_snapshots(
+    snapshots: Sequence[SourceFileSnapshot],
+    *,
+    max_files: int = DEFAULT_MAX_FILES,
+    max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
+    max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+) -> SourceMap:
+    """Analyze immutable Python documents without accessing the filesystem."""
+    validated_limits = _validated_limits(
+        max_files=max_files,
+        max_total_bytes=max_total_bytes,
+        max_file_bytes=max_file_bytes,
+        max_directories=DEFAULT_MAX_DIRECTORIES,
+        max_directory_entries=DEFAULT_MAX_DIRECTORY_ENTRIES,
+    )
+    ordered: list[SourceFileSnapshot] = []
+    paths: set[str] = set()
+    total_bytes = 0
+    for source in snapshots:
+        if not isinstance(source, SourceFileSnapshot):
+            raise TypeError("source snapshots must contain SourceFileSnapshot values")
+        relative = source.relative_file
+        if not _safe_source_snapshot_path(relative) or not relative.endswith(".py"):
+            raise SourceAnalysisError("source snapshot path must be a safe relative Python path")
+        if relative in paths:
+            raise SourceAnalysisError(f"duplicate source snapshot path: {relative}")
+        if not isinstance(source.data, bytes):
+            raise TypeError("source snapshot data must be bytes")
+        if len(source.data) > validated_limits[2]:
+            raise SourceLimitError(
+                f"Python source file exceeds {validated_limits[2]} bytes: {relative}"
+            )
+        paths.add(relative)
+        total_bytes += len(source.data)
+        if len(paths) > validated_limits[0]:
+            raise SourceLimitError(f"Python source file count exceeds {validated_limits[0]}")
+        if total_bytes > validated_limits[1]:
+            raise SourceLimitError(f"Python source tree exceeds {validated_limits[1]} bytes")
+        ordered.append(source)
+    ordered.sort(key=lambda source: source.relative_file)
+    return _analyze_source_snapshots(
+        tuple(ordered),
+        symlinks_skipped=0,
+        directories_scanned=0,
+        directory_entries_scanned=0,
+        excluded_directories=0,
+    )
+
+
+def _analyze_source_snapshots(
+    snapshots: Sequence[SourceFileSnapshot],
+    *,
+    symlinks_skipped: int,
+    directories_scanned: int,
+    directory_entries_scanned: int,
+    excluded_directories: int,
+) -> SourceMap:
     candidates: list[SourceCandidate] = []
     files_parsed = 0
     parse_failures = 0
@@ -417,10 +486,10 @@ def analyze_source_root(
         route_patterns_skipped=route_patterns_skipped,
         flow_patterns_skipped=flow_patterns_skipped,
         candidates=ordered,
-        symlinks_skipped=walk.symlinks_skipped,
-        directories_scanned=walk.directories_scanned,
-        directory_entries_scanned=walk.directory_entries_scanned,
-        excluded_directories=walk.excluded_directories,
+        symlinks_skipped=symlinks_skipped,
+        directories_scanned=directories_scanned,
+        directory_entries_scanned=directory_entries_scanned,
+        excluded_directories=excluded_directories,
     )
 
 
@@ -527,8 +596,8 @@ def _read_snapshots(
     *,
     max_total_bytes: int,
     max_file_bytes: int,
-) -> tuple[_FileSnapshot, ...]:
-    snapshots: list[_FileSnapshot] = []
+) -> tuple[SourceFileSnapshot, ...]:
+    snapshots: list[SourceFileSnapshot] = []
     total_bytes = 0
     for path in files:
         relative = path.relative_to(root).as_posix()
@@ -541,7 +610,7 @@ def _read_snapshots(
         total_bytes += len(data)
         if total_bytes > max_total_bytes:
             raise SourceLimitError(f"Python source tree exceeds {max_total_bytes} bytes")
-        snapshots.append(_FileSnapshot(relative_file=relative, data=data))
+        snapshots.append(SourceFileSnapshot(relative_file=relative, data=data))
     return tuple(snapshots)
 
 
@@ -607,7 +676,7 @@ def _parse_python(data: bytes, *, filename: str) -> ast.Module | None:
         return None
 
 
-def _source_digest(snapshots: Sequence[_FileSnapshot]) -> str:
+def _source_digest(snapshots: Sequence[SourceFileSnapshot]) -> str:
     digest = hashlib.sha256()
     for snapshot in snapshots:
         path_bytes = snapshot.relative_file.encode("utf-8")
@@ -2055,6 +2124,18 @@ def _candidate_safe_relative_file(value: str) -> bool:
     )
 
 
+def _safe_source_snapshot_path(value: str) -> bool:
+    if not value or len(value) > 4_096 or "\\" in value:
+        return False
+    path = PurePosixPath(value)
+    parts = value.split("/")
+    return (
+        not path.is_absolute()
+        and all(part not in {"", ".", ".."} for part in parts)
+        and all(character.isprintable() for character in value)
+    )
+
+
 def _constant_string(node: ast.AST) -> str:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
@@ -2093,8 +2174,10 @@ __all__ = [
     "SourceAnalysisError",
     "SourceCandidate",
     "SourceChangedError",
+    "SourceFileSnapshot",
     "SourceLimitError",
     "SourceMap",
     "SourceRootError",
     "analyze_source_root",
+    "analyze_source_snapshots",
 ]

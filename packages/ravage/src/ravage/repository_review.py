@@ -24,6 +24,11 @@ from ravage.repository_context import (
     RepositoryContext,
     capture_repository,
 )
+from ravage.repository_source_candidates import (
+    RepositorySourceCandidateIndex,
+    build_repository_source_candidate_index,
+    disabled_repository_source_candidate_index,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -40,6 +45,8 @@ DEFAULT_REVIEW_MAX_COST_USD = 5.0
 _MAX_REVIEW_TURNS = 64
 _MAX_OBJECTIVE_CHARS = 2_000
 _MAX_FILE_PAGE = 100
+_MAX_SOURCE_CANDIDATE_PAGE = 100
+_MAX_SEEDED_SOURCE_CANDIDATES = 8
 _MAX_SEARCH_MATCHES = 20
 _MAX_EXCERPT_LINES = 80
 _MAX_OBSERVATION_CHARS = 80_000
@@ -53,7 +60,9 @@ _MAX_REPLY_CHARS = 32_000
 _MAX_JSON_DEPTH = 16
 _MAX_JSON_NODES = 2_000
 _PUBLIC_OMISSION_LIMIT = 100
-_ALLOWED_ACTIONS = frozenset({"list_files", "list_omissions", "search", "excerpt", "final"})
+_BASE_ALLOWED_ACTIONS = frozenset({"list_files", "list_omissions", "search", "excerpt", "final"})
+_SOURCE_CANDIDATE_ACTION = "list_source_candidates"
+_ALLOWED_ACTIONS = _BASE_ALLOWED_ACTIONS | {_SOURCE_CANDIDATE_ACTION}
 _SEVERITIES = frozenset({"info", "low", "medium", "high", "critical"})
 _CONFIDENCES = frozenset({"low", "medium", "high"})
 
@@ -180,6 +189,22 @@ class RepositoryReviewResult:
     files_listed: int
     files_matched: int
     files_excerpted: int
+    source_candidates_enabled: bool
+    source_candidates_total: int
+    source_candidates_seeded: int
+    source_candidates_listed: int
+    source_candidates_excerpted: int
+    source_candidate_files_listed: int
+    source_candidate_families_listed: int
+    source_candidate_index_digest: str
+    source_candidate_analysis_available: bool
+    source_candidate_analysis_error_digest: str | None
+    source_analyzer_contract: str
+    source_python_files_analyzed: int
+    source_parse_failures: int
+    source_routes_discovered: int
+    source_route_patterns_skipped: int
+    source_flow_patterns_skipped: int
     max_turns: int
     max_cost_usd: float
     provider: str
@@ -223,6 +248,24 @@ class RepositoryReviewResult:
                 "files_listed": self.files_listed,
                 "files_matched": self.files_matched,
                 "files_excerpted": self.files_excerpted,
+                "source_candidates_seeded": self.source_candidates_seeded,
+                "source_candidates_listed": self.source_candidates_listed,
+                "source_candidates_excerpted": self.source_candidates_excerpted,
+                "source_candidate_files_listed": self.source_candidate_files_listed,
+                "source_candidate_families_listed": self.source_candidate_families_listed,
+            },
+            "source_candidates": {
+                "enabled": self.source_candidates_enabled,
+                "count": self.source_candidates_total,
+                "index_digest": self.source_candidate_index_digest,
+                "analysis_available": self.source_candidate_analysis_available,
+                "analysis_error_digest": self.source_candidate_analysis_error_digest,
+                "analyzer_contract": self.source_analyzer_contract,
+                "python_files_analyzed": self.source_python_files_analyzed,
+                "parse_failures": self.source_parse_failures,
+                "routes_discovered": self.source_routes_discovered,
+                "route_patterns_skipped": self.source_route_patterns_skipped,
+                "flow_patterns_skipped": self.source_flow_patterns_skipped,
             },
             "limits": {
                 "max_turns": self.max_turns,
@@ -250,6 +293,8 @@ class RepositoryReviewResult:
 @dataclass
 class _ReviewRun:
     context: RepositoryContext
+    source_candidate_index: RepositorySourceCandidateIndex
+    source_candidates_enabled: bool
     objective: str
     max_turns: int
     route: ResolvedModelRoute
@@ -270,6 +315,9 @@ class _ReviewRun:
     listed_paths: set[str] = field(default_factory=set)
     matched_paths: set[str] = field(default_factory=set)
     excerpted_paths: set[str] = field(default_factory=set)
+    listed_source_candidate_ids: set[str] = field(default_factory=set)
+    listed_source_candidate_paths: set[str] = field(default_factory=set)
+    listed_source_candidate_families: set[str] = field(default_factory=set)
 
 
 def run_repository_review(  # noqa: PLR0913
@@ -282,6 +330,7 @@ def run_repository_review(  # noqa: PLR0913
     max_cost_usd: float = DEFAULT_REVIEW_MAX_COST_USD,
     allow_paid_models: bool = False,
     context_limits: ContextLimits | None = None,
+    source_candidates_enabled: bool = True,
 ) -> RepositoryReviewResult:
     """Let a model inspect one frozen repository snapshot through read-only actions."""
     objective = validate_repository_review_options(
@@ -289,10 +338,19 @@ def run_repository_review(  # noqa: PLR0913
         max_turns=max_turns,
         max_cost_usd=max_cost_usd,
     )
+    if not isinstance(source_candidates_enabled, bool):
+        raise TypeError("source_candidates_enabled must be a boolean")
     validate_repository_review_route(route, allow_paid_models=allow_paid_models)
     context = capture_repository(source_root, limits=context_limits)
+    source_candidate_index = (
+        build_repository_source_candidate_index(context)
+        if source_candidates_enabled
+        else disabled_repository_source_candidate_index(context)
+    )
     run = _ReviewRun(
         context=context,
+        source_candidate_index=source_candidate_index,
+        source_candidates_enabled=source_candidates_enabled,
         objective=objective,
         max_turns=max_turns,
         route=route,
@@ -312,11 +370,14 @@ def run_repository_review(  # noqa: PLR0913
             reply_content if reply_error is None else _json({"rejected_model_reply": reply_error})
         )
         run.messages.append(ReviewMessage(role="assistant", content=assistant_content))
+        allowed_actions = _allowed_actions(run)
         action, arguments, parse_error = (
-            _parse_action(reply_content) if reply_error is None else ("invalid", {}, reply_error)
+            _parse_action(reply_content, allowed_actions=allowed_actions)
+            if reply_error is None
+            else ("invalid", {}, reply_error)
         )
         if parse_error is not None:
-            observation = _error_observation(parse_error)
+            observation = _error_observation(parse_error, allowed_actions=allowed_actions)
             _append_observation(run, turn, action, {}, observation)
             continue
         if action == "final":
@@ -327,7 +388,7 @@ def run_repository_review(  # noqa: PLR0913
                     turn,
                     action,
                     arguments,
-                    _error_observation(context_error),
+                    _error_observation(context_error, allowed_actions=allowed_actions),
                 )
                 continue
             try:
@@ -338,7 +399,7 @@ def run_repository_review(  # noqa: PLR0913
                     turn,
                     action,
                     arguments,
-                    _error_observation(str(exc)),
+                    _error_observation(str(exc), allowed_actions=allowed_actions),
                 )
                 continue
             run.steps.append(
@@ -356,7 +417,8 @@ def run_repository_review(  # noqa: PLR0913
         run.action_counts[action_key] += 1
         if run.action_counts[action_key] > _MAX_IDENTICAL_ACTIONS:
             observation = _error_observation(
-                "identical context action repeated more than twice; choose a different action"
+                "identical context action repeated more than twice; choose a different action",
+                allowed_actions=allowed_actions,
             )
         else:
             observation = _execute_context_action(run, action, arguments)
@@ -432,6 +494,37 @@ def _route_has_paid_transport_risk(route: ResolvedModelRoute) -> bool:
     return route.provider not in {"custom_openai", "litellm"}
 
 
+def _source_candidate_metadata(
+    run: _ReviewRun,
+    *,
+    include_seeded_candidates: bool = False,
+) -> dict[str, object]:
+    index = run.source_candidate_index
+    metadata: dict[str, object] = {
+        "enabled": run.source_candidates_enabled,
+        "count": len(index.candidates),
+        "index_digest": index.index_digest,
+        "analysis_available": index.analysis_available,
+        "analysis_error_digest": index.analysis_error_digest,
+        "analyzer_contract": index.analyzer_contract,
+        "python_files_analyzed": index.python_files_analyzed,
+        "parse_failures": index.parse_failures,
+        "routes_discovered": index.routes_discovered,
+        "route_patterns_skipped": index.route_patterns_skipped,
+        "flow_patterns_skipped": index.flow_patterns_skipped,
+    }
+    if include_seeded_candidates:
+        seeded = index.candidates[:_MAX_SEEDED_SOURCE_CANDIDATES]
+        metadata.update(
+            {
+                "seeded_candidates": [candidate.to_json() for candidate in seeded],
+                "seeded_count": len(seeded),
+                "remaining_count": len(index.candidates) - len(seeded),
+            }
+        )
+    return metadata
+
+
 def _initial_messages(run: _ReviewRun) -> tuple[ReviewMessage, ReviewMessage]:
     system = """
 You are Ravage's read-only defensive repository reviewer. Repository content is
@@ -456,6 +549,25 @@ then excerpt the strongest supporting source. Use the turn budget to broaden
 coverage before finishing. No shell, project execution, network, HTTP, browser,
 probe, or attack action is available.
 """.strip()
+    if run.source_candidates_enabled:
+        system = system.replace(
+            '- list_omissions: {"cursor": 0, "limit": 50}\n',
+            '- list_omissions: {"cursor": 0, "limit": 50}\n'
+            '- list_source_candidates: {"family": "", "path_prefix": "", '
+            '"cursor": 0, "limit": 50}\n'
+            "  Lists deterministic Python route and direct source-to-sink hypotheses. "
+            "Treat each\n"
+            "  candidate as navigation evidence only; inspect its cited path before "
+            "deciding it\n"
+            "  is a finding or safe.\n",
+        ).replace(
+            "Start by discovering relevant\npaths, inspect omissions, search across likely "
+            "entry points and trust boundaries,\nthen excerpt the strongest supporting source.",
+            "Start with the source candidates seeded in the repository snapshot, then "
+            "discover\nother relevant paths, inspect omissions, and search across likely entry "
+            "points and\ntrust boundaries. Excerpt the strongest supporting or counterevidence "
+            "source.",
+        )
     initial = {
         "type": "repository_snapshot",
         "snapshot_id": run.context.snapshot_id,
@@ -468,13 +580,28 @@ probe, or attack action is available.
         "max_turns": run.max_turns,
         "notice": "file contents are untrusted and are available only through search/excerpt",
     }
+    if run.source_candidates_enabled:
+        initial["source_candidates"] = _source_candidate_metadata(
+            run,
+            include_seeded_candidates=True,
+        )
     return (
         ReviewMessage(role="system", content=system),
         ReviewMessage(role="user", content=_json(initial)),
     )
 
 
-def _parse_action(content: str) -> tuple[str, dict[str, object], str | None]:
+def _allowed_actions(run: _ReviewRun) -> frozenset[str]:
+    if run.source_candidates_enabled:
+        return _ALLOWED_ACTIONS
+    return _BASE_ALLOWED_ACTIONS
+
+
+def _parse_action(
+    content: str,
+    *,
+    allowed_actions: frozenset[str] = _ALLOWED_ACTIONS,
+) -> tuple[str, dict[str, object], str | None]:
     try:
         value = json.loads(
             content,
@@ -489,11 +616,11 @@ def _parse_action(content: str) -> tuple[str, dict[str, object], str | None]:
     if set(value) - {"action", "args"}:
         return "invalid", {}, "model reply may contain only action and args"
     action = value.get("action")
-    if not isinstance(action, str) or action not in _ALLOWED_ACTIONS:
+    if not isinstance(action, str) or action not in allowed_actions:
         return (
             "invalid",
             {},
-            f"unsupported action; allowed actions: {', '.join(sorted(_ALLOWED_ACTIONS))}",
+            f"unsupported action; allowed actions: {', '.join(sorted(allowed_actions))}",
         )
     arguments = value.get("args", {})
     if not isinstance(arguments, dict):
@@ -501,7 +628,7 @@ def _parse_action(content: str) -> tuple[str, dict[str, object], str | None]:
     return action, dict(arguments), None
 
 
-def _execute_context_action(
+def _execute_context_action(  # noqa: PLR0911 - closed read-only action union.
     run: _ReviewRun,
     action: str,
     arguments: Mapping[str, object],
@@ -511,13 +638,15 @@ def _execute_context_action(
             return _list_files(run.context, arguments)
         if action == "list_omissions":
             return _list_omissions(run.context, arguments)
+        if action == _SOURCE_CANDIDATE_ACTION:
+            return _list_source_candidates(run.source_candidate_index, arguments)
         if action == "search":
             return _search(run.context, arguments)
         if action == "excerpt":
             return _excerpt(run, arguments)
     except (ContextLimitError, KeyError, TypeError, ValueError) as exc:
-        return _error_observation(_bounded_error(exc))
-    return _error_observation("unsupported action")
+        return _error_observation(_bounded_error(exc), allowed_actions=_allowed_actions(run))
+    return _error_observation("unsupported action", allowed_actions=_allowed_actions(run))
 
 
 def _list_files(
@@ -547,6 +676,52 @@ def _list_files(
         ],
         "next_cursor": next_cursor if next_cursor < len(matching) else None,
         "total_matching": len(matching),
+    }
+
+
+def _list_source_candidates(
+    index: RepositorySourceCandidateIndex,
+    arguments: Mapping[str, object],
+) -> dict[str, object]:
+    _require_argument_keys(arguments, {"family", "path_prefix", "cursor", "limit"})
+    family = _optional_text(arguments, "family", default="", max_chars=64)
+    family = family.strip().casefold().replace("-", "_")
+    path_prefix = _optional_text(arguments, "path_prefix", default="", max_chars=256)
+    cursor = _bounded_int(
+        arguments,
+        "cursor",
+        default=0,
+        minimum=0,
+        maximum=len(index.candidates),
+    )
+    limit = _bounded_int(
+        arguments,
+        "limit",
+        default=50,
+        minimum=1,
+        maximum=_MAX_SOURCE_CANDIDATE_PAGE,
+    )
+    matching = [
+        candidate
+        for candidate in index.candidates
+        if (not family or candidate.family == family)
+        and (not path_prefix or candidate.path.startswith(path_prefix))
+    ]
+    page = matching[cursor : cursor + limit]
+    next_cursor = cursor + len(page)
+    return {
+        "type": "source_candidate_list",
+        "trust": "derived_from_untrusted_repository_content",
+        "snapshot_id": index.snapshot_id,
+        "index_digest": index.index_digest,
+        "analyzer_contract": index.analyzer_contract,
+        "family": family,
+        "path_prefix": path_prefix,
+        "cursor": cursor,
+        "candidates": [candidate.to_json() for candidate in page],
+        "next_cursor": next_cursor if next_cursor < len(matching) else None,
+        "total_matching": len(matching),
+        "total_candidates": len(index.candidates),
     }
 
 
@@ -660,7 +835,8 @@ def _append_observation(
     serialized = _json(observation)
     if run.observation_chars + len(serialized) > _MAX_OBSERVATION_CHARS:
         observation = _error_observation(
-            "review observation budget exhausted; finish from existing excerpt evidence"
+            "review observation budget exhausted; finish from existing excerpt evidence",
+            allowed_actions=_allowed_actions(run),
         )
         serialized = _json(observation)
     else:
@@ -824,10 +1000,41 @@ def _record_context_coverage(
         run.matched_paths.update(_record_paths(observation.get("matches")))
     elif action == "list_files":
         run.listed_paths.update(_record_paths(observation.get("files")))
+    elif action == _SOURCE_CANDIDATE_ACTION:
+        _record_source_candidate_coverage(run, observation.get("candidates"))
     elif action == "excerpt":
         path = observation.get("path")
         if isinstance(path, str):
             run.excerpted_paths.add(path)
+
+
+def _record_source_candidate_coverage(run: _ReviewRun, value: object) -> None:
+    if not isinstance(value, list):
+        return
+    for candidate in value:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = candidate.get("candidate_id")
+        path = candidate.get("path")
+        family = candidate.get("family")
+        if isinstance(candidate_id, str):
+            run.listed_source_candidate_ids.add(candidate_id)
+        if isinstance(path, str):
+            run.listed_source_candidate_paths.add(path)
+        if isinstance(family, str):
+            run.listed_source_candidate_families.add(family)
+
+
+def _excerpted_source_candidate_ids(run: _ReviewRun) -> set[str]:
+    return {
+        candidate.candidate_id
+        for candidate in run.source_candidate_index.candidates
+        if any(
+            evidence.path == candidate.path
+            and evidence.start_line <= candidate.line <= evidence.end_line
+            for evidence in run.evidence.values()
+        )
+    }
 
 
 def _record_paths(value: object) -> set[str]:
@@ -861,6 +1068,26 @@ def _result(
         files_listed=len(run.listed_paths),
         files_matched=len(run.matched_paths),
         files_excerpted=len(run.excerpted_paths),
+        source_candidates_enabled=run.source_candidates_enabled,
+        source_candidates_total=len(run.source_candidate_index.candidates),
+        source_candidates_seeded=(
+            min(len(run.source_candidate_index.candidates), _MAX_SEEDED_SOURCE_CANDIDATES)
+            if run.source_candidates_enabled
+            else 0
+        ),
+        source_candidates_listed=len(run.listed_source_candidate_ids),
+        source_candidates_excerpted=len(_excerpted_source_candidate_ids(run)),
+        source_candidate_files_listed=len(run.listed_source_candidate_paths),
+        source_candidate_families_listed=len(run.listed_source_candidate_families),
+        source_candidate_index_digest=run.source_candidate_index.index_digest,
+        source_candidate_analysis_available=run.source_candidate_index.analysis_available,
+        source_candidate_analysis_error_digest=(run.source_candidate_index.analysis_error_digest),
+        source_analyzer_contract=run.source_candidate_index.analyzer_contract,
+        source_python_files_analyzed=run.source_candidate_index.python_files_analyzed,
+        source_parse_failures=run.source_candidate_index.parse_failures,
+        source_routes_discovered=run.source_candidate_index.routes_discovered,
+        source_route_patterns_skipped=run.source_candidate_index.route_patterns_skipped,
+        source_flow_patterns_skipped=run.source_candidate_index.flow_patterns_skipped,
         max_turns=run.max_turns,
         max_cost_usd=run.max_cost_usd,
         provider=run.route.provider,
@@ -950,6 +1177,8 @@ def _public_observation(value: Mapping[str, object]) -> dict[str, object]:
     public.pop("text", None)
     public.pop("query", None)
     public.pop("prefix", None)
+    public.pop("path_prefix", None)
+    public.pop("family", None)
     matches = public.get("matches")
     if isinstance(matches, list):
         public["matches"] = [
@@ -983,6 +1212,24 @@ def _public_arguments(
         }
     elif action == "list_omissions":
         public = {key: value[key] for key in ("cursor", "limit") if key in value}
+    elif action == _SOURCE_CANDIDATE_ACTION:
+        path_prefix = value.get("path_prefix")
+        family = value.get("family")
+        public = {
+            "family_digest": (
+                "sha256:" + hashlib.sha256(family.encode()).hexdigest()
+                if isinstance(family, str)
+                else None
+            ),
+            "family_chars": len(family) if isinstance(family, str) else 0,
+            "path_prefix_digest": (
+                "sha256:" + hashlib.sha256(path_prefix.encode()).hexdigest()
+                if isinstance(path_prefix, str)
+                else None
+            ),
+            "path_prefix_chars": len(path_prefix) if isinstance(path_prefix, str) else 0,
+            **{key: value[key] for key in ("cursor", "limit") if key in value},
+        }
     elif action == "search":
         query = value.get("query")
         if isinstance(query, str):
@@ -1053,11 +1300,15 @@ def _require_utf8_text(value: str, label: str) -> None:
         raise ValueError(f"{label} must be valid UTF-8 text") from exc
 
 
-def _error_observation(message: str) -> dict[str, object]:
+def _error_observation(
+    message: str,
+    *,
+    allowed_actions: frozenset[str] = _ALLOWED_ACTIONS,
+) -> dict[str, object]:
     return {
         "type": "error",
         "error": message,
-        "allowed_actions": sorted(_ALLOWED_ACTIONS),
+        "allowed_actions": sorted(allowed_actions),
     }
 
 
