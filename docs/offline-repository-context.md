@@ -77,7 +77,9 @@ The review agent applies narrower per-action limits, a total observation budget,
 a model-turn limit, duplicate-action blocking, and a model-cost ceiling. Paid
 routes use a conservative pre-request bound and stop before dispatch when the
 remaining configured budget cannot cover the next request. Routes that cannot
-enforce their configured output-token cap are rejected before a model call.
+enforce their configured output-token cap are rejected before a model call. A
+review excerpt whose requested end is past the file's last line is clamped to
+EOF and reports that adjustment; a request that starts past EOF still fails.
 
 ## Regression cases
 

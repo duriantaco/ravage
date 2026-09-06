@@ -614,7 +614,16 @@ def _excerpt(run: _ReviewRun, arguments: Mapping[str, object]) -> dict[str, obje
     _require_argument_keys(arguments, {"path", "start_line", "end_line"})
     path = _required_literal(arguments, "path", max_chars=1_000)
     start_line = _bounded_int(arguments, "start_line", minimum=1, maximum=2**31 - 1)
-    end_line = _bounded_int(arguments, "end_line", minimum=1, maximum=2**31 - 1)
+    requested_end_line = _bounded_int(
+        arguments,
+        "end_line",
+        minimum=1,
+        maximum=2**31 - 1,
+    )
+    source = next((item for item in run.context.files if item.path == path), None)
+    if source is None:
+        raise KeyError(path)
+    end_line = min(requested_end_line, _line_count(source.text))
     if end_line - start_line + 1 > _MAX_EXCERPT_LINES:
         raise ContextLimitError("review excerpts are limited to 80 lines")
     excerpt = run.context.excerpt(path, start_line=start_line, end_line=end_line)
@@ -633,6 +642,8 @@ def _excerpt(run: _ReviewRun, arguments: Mapping[str, object]) -> dict[str, obje
         "type": "excerpt",
         "trust": "untrusted_repository_content",
         **evidence.to_json(include_text=True),
+        "requested_end_line": requested_end_line,
+        "clamped_to_eof": requested_end_line != end_line,
     }
     if run.observation_chars + len(_json(observation)) <= _MAX_OBSERVATION_CHARS:
         run.evidence[evidence_id] = evidence

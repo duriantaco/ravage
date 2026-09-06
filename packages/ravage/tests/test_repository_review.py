@@ -184,6 +184,8 @@ def test_review_agent_searches_and_excerpts_the_frozen_context(
         ("search", "getInvoice", 10),
         ("excerpt", "handlers.ts", 1, 3),
     ]
+    assert result.steps[1].observation["requested_end_line"] == 3
+    assert result.steps[1].observation["clamped_to_eof"] is False
     assert "handlers.ts" in client.messages_seen[1][-1].content
     assert '"line":1' in client.messages_seen[1][-1].content
     assert "database.invoices.get(invoiceId)" in client.messages_seen[2][-1].content
@@ -397,6 +399,89 @@ def test_invalid_excerpt_is_observed_and_the_agent_can_recover(tmp_path: Path) -
     assert "../outside" in str(result.steps[0].observation["error"])
     assert result.steps[1].ok is True
     assert result.findings[0].evidence[0].path == "module.py"
+
+
+def test_review_excerpt_clamps_an_end_line_past_eof(tmp_path: Path) -> None:
+    (tmp_path / "module.py").write_text("first\nsecond\n", encoding="utf-8")
+    client = ScriptedReviewClient(
+        [
+            {
+                "action": "excerpt",
+                "args": {"path": "module.py", "start_line": 1, "end_line": 200},
+            },
+            _final(evidence_ids=["excerpt-1"]),
+        ]
+    )
+
+    result = run_repository_review(
+        source_root=tmp_path,
+        route=_local_route(),
+        client=client,
+    )
+
+    step = result.steps[0]
+    assert step.ok is True
+    assert step.observation["requested_end_line"] == 200
+    assert step.observation["clamped_to_eof"] is True
+    assert result.findings[0].evidence[0].end_line == 2
+    assert result.findings[0].evidence[0].text == "first\nsecond\n"
+
+
+def test_review_excerpt_still_rejects_a_start_line_past_eof(tmp_path: Path) -> None:
+    (tmp_path / "module.py").write_text("first\nsecond\n", encoding="utf-8")
+    client = ScriptedReviewClient(
+        [
+            {
+                "action": "excerpt",
+                "args": {"path": "module.py", "start_line": 3, "end_line": 200},
+            },
+            {
+                "action": "excerpt",
+                "args": {"path": "module.py", "start_line": 1, "end_line": 2},
+            },
+            _final(evidence_ids=["excerpt-1"]),
+        ]
+    )
+
+    result = run_repository_review(
+        source_root=tmp_path,
+        route=_local_route(),
+        client=client,
+    )
+
+    assert result.steps[0].ok is False
+    assert "outside the captured file" in str(result.steps[0].observation["error"])
+    assert result.steps[1].ok is True
+
+
+def test_review_excerpt_clamping_does_not_bypass_the_line_limit(tmp_path: Path) -> None:
+    (tmp_path / "module.py").write_text(
+        "".join(f"line {line}\n" for line in range(100)),
+        encoding="utf-8",
+    )
+    client = ScriptedReviewClient(
+        [
+            {
+                "action": "excerpt",
+                "args": {"path": "module.py", "start_line": 1, "end_line": 200},
+            },
+            {
+                "action": "excerpt",
+                "args": {"path": "module.py", "start_line": 1, "end_line": 80},
+            },
+            _final(evidence_ids=["excerpt-1"]),
+        ]
+    )
+
+    result = run_repository_review(
+        source_root=tmp_path,
+        route=_local_route(),
+        client=client,
+    )
+
+    assert result.steps[0].ok is False
+    assert "limited to 80 lines" in str(result.steps[0].observation["error"])
+    assert result.steps[1].ok is True
 
 
 def test_unknown_evidence_is_rejected_before_final_result(tmp_path: Path) -> None:
