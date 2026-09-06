@@ -5871,6 +5871,17 @@ def _string_list(value: object) -> list[str]:
     return []
 
 
+_DEFAULT_TEMPERATURE_MODEL_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+
+
+def _model_requires_default_temperature(model: str) -> bool:
+    name = str(model).rsplit("/", maxsplit=1)[-1].casefold()
+    return any(
+        name == prefix or name.startswith((f"{prefix}.", f"{prefix}-"))
+        for prefix in _DEFAULT_TEMPERATURE_MODEL_PREFIXES
+    )
+
+
 class ChatClient:
     def __init__(self, route: ResolvedModelRoute) -> None:
         self.route = route
@@ -5917,8 +5928,9 @@ class ChatClient:
             "model": self.route.model,
             "messages": messages,
             "response_format": {"type": "json_object"},
-            "temperature": 0,
         }
+        if not _model_requires_default_temperature(self.route.model):
+            body["temperature"] = 0
         if self.route.provider == "openai" and self.route.base_url is None:
             body["service_tier"] = "default"
         if self.route.output_token_limit_parameter != "none":
