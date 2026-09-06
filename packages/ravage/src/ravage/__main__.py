@@ -135,6 +135,7 @@ from ravage.report import (
     write_pentest_report,
 )
 from ravage.report_artifact import write_json_report_artifact
+from ravage.repository_review_cli import handle_repository_review_command
 from ravage.run_data.audit import AuditStore
 from ravage.run_data.brief import first_http_target, load_engagement_brief
 from ravage.run_data.run_manifest import (
@@ -262,6 +263,7 @@ _TOP_LEVEL_COMMANDS = (
     "lab",
     "observe",
     "report",
+    "review",
     "satcom",
     "scan",
     "setup",
@@ -384,6 +386,9 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
         return
     if args_list[:1] == ["report"]:
         _report(args_list[1:])
+        return
+    if args_list[:1] == ["review"]:
+        handle_repository_review_command(args_list[1:])
         return
 
     if args_list and not args_list[0].startswith("-"):
@@ -867,6 +872,7 @@ def _top_level_help() -> None:
                 "  ravage lab {list,show,up,down}",
                 "  ravage observe RUN_DIR",
                 "  ravage report RUN_DIR --brief BRIEF.yaml",
+                "  ravage review SOURCE_ROOT [--objective TEXT]",
                 "  ravage audit verify RUN_DIR",
                 "",
                 (
