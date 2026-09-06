@@ -20,8 +20,9 @@ from ravage.agent_core.source_guided import (
     prepare_source_guided_analysis,
 )
 from ravage.probe_suite import run_builtin_probe
+from ravage.repository_context import capture_repository
 from ravage.run_data.workspace import AgentWorkspace
-from ravage.source_analysis import SourceChangedError
+from ravage.source_analysis import SourceChangedError, SourceFileSnapshot
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -119,6 +120,59 @@ def test_source_guided_resume_rejects_drift_and_missing_source(tmp_path: Path) -
             state=state,
             workspace=workspace,
             resumed=True,
+        )
+
+
+def test_source_guided_analysis_uses_and_resumes_the_repository_snapshot(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "src"
+    _write_source(source_root)
+    source_root.joinpath("README.txt").write_text("first\n", encoding="utf-8")
+    context = capture_repository(source_root)
+    snapshots = tuple(
+        SourceFileSnapshot(relative_file=item.path, data=item.text.encode())
+        for item in context.files
+        if item.path.endswith(".py")
+    )
+    state = AgentState()
+    workspace = AgentWorkspace.open(tmp_path / "workspace")
+
+    prepared = prepare_source_guided_analysis(
+        source_root=source_root,
+        target_url="http://127.0.0.1:8765/",
+        state=state,
+        workspace=workspace,
+        resumed=False,
+        source_snapshots=snapshots,
+        repository_snapshot_id=context.snapshot_id,
+    )
+
+    assert prepared.repository_snapshot_id == context.snapshot_id
+    assert state.surface["source_analysis"]["repository_snapshot_id"] == context.snapshot_id
+    with pytest.raises(SourceChangedError, match="--allow-source-to-model"):
+        assert_source_resume_available(
+            state=state,
+            source_root=source_root,
+            allow_source_to_model=False,
+        )
+
+    source_root.joinpath("README.txt").write_text("second\n", encoding="utf-8")
+    changed_context = capture_repository(source_root)
+    changed_snapshots = tuple(
+        SourceFileSnapshot(relative_file=item.path, data=item.text.encode())
+        for item in changed_context.files
+        if item.path.endswith(".py")
+    )
+    with pytest.raises(SourceChangedError, match="repository snapshot changed"):
+        prepare_source_guided_analysis(
+            source_root=source_root,
+            target_url="http://127.0.0.1:8765/",
+            state=state,
+            workspace=workspace,
+            resumed=True,
+            source_snapshots=changed_snapshots,
+            repository_snapshot_id=changed_context.snapshot_id,
         )
 
 

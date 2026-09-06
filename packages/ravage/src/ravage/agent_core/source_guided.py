@@ -21,7 +21,9 @@ from ravage.source_analysis import (
     SOURCE_ANALYZER_CONTRACT,
     SOURCE_MAP_SCHEMA,
     SourceChangedError,
+    SourceFileSnapshot,
     analyze_source_root,
+    analyze_source_snapshots,
 )
 
 if TYPE_CHECKING:
@@ -120,13 +122,14 @@ class SourceGuidedPreparation:
     candidate_payloads: tuple[dict[str, object], ...]
     validation_actions: tuple[dict[str, object], ...]
     artifact_path: Path
+    repository_snapshot_id: str = ""
 
     def event_payload(self, *, workspace: AgentWorkspace) -> dict[str, object]:
         try:
             artifact = str(self.artifact_path.relative_to(workspace.root))
         except ValueError:
             artifact = self.artifact_path.name
-        return {
+        payload: dict[str, object] = {
             "schema": SOURCE_MAP_SCHEMA,
             "analyzer_contract": self.analyzer_contract,
             "source_digest": self.source_digest,
@@ -148,18 +151,27 @@ class SourceGuidedPreparation:
             ],
             "artifact": artifact,
         }
+        if self.repository_snapshot_id:
+            payload["repository_snapshot_id"] = self.repository_snapshot_id
+        return payload
 
 
-def prepare_source_guided_analysis(
+def prepare_source_guided_analysis(  # noqa: PLR0913 - explicit snapshot binding inputs.
     *,
     source_root: Path,
     target_url: str,
     state: AgentState,
     workspace: AgentWorkspace,
     resumed: bool,
+    source_snapshots: Sequence[SourceFileSnapshot] | None = None,
+    repository_snapshot_id: str = "",
 ) -> SourceGuidedPreparation:
     """Analyze local source without exposing its contents or treating it as proof."""
-    source_map = analyze_source_root(source_root)
+    source_map = (
+        analyze_source_snapshots(source_snapshots)
+        if source_snapshots is not None
+        else analyze_source_root(source_root)
+    )
     payload = source_map.to_json()
     candidates, counts, digest, analyzer_contract, candidate_digest = _validated_source_map(payload)
     _assert_resume_binding(
@@ -167,6 +179,7 @@ def prepare_source_guided_analysis(
         source_digest=digest,
         analyzer_contract=analyzer_contract,
         candidate_digest=candidate_digest,
+        repository_snapshot_id=repository_snapshot_id,
         resumed=resumed,
     )
 
@@ -210,7 +223,7 @@ def prepare_source_guided_analysis(
         and not counts["flow_patterns_skipped"]
     )
     state.surface["source_candidates"] = list(prompt_candidates)
-    state.surface["source_analysis"] = {
+    source_analysis: dict[str, object] = {
         "schema": SOURCE_MAP_SCHEMA,
         "analyzer_contract": analyzer_contract,
         "source_digest": digest,
@@ -230,6 +243,9 @@ def prepare_source_guided_analysis(
         "candidates_ingested": ingested,
         "artifact": f"artifacts/{SOURCE_MAP_ARTIFACT}",
     }
+    if repository_snapshot_id:
+        source_analysis["repository_snapshot_id"] = repository_snapshot_id
+    state.surface["source_analysis"] = source_analysis
     coverage_note = ""
     if not analysis_complete:
         coverage_note = (
@@ -276,6 +292,7 @@ def prepare_source_guided_analysis(
         candidate_payloads=prompt_candidates,
         validation_actions=actions,
         artifact_path=artifact_path,
+        repository_snapshot_id=repository_snapshot_id,
     )
 
 
@@ -400,12 +417,13 @@ def _validated_query_fields(value: object) -> tuple[tuple[str, str, bool], ...]:
     return tuple(fields)
 
 
-def _assert_resume_binding(
+def _assert_resume_binding(  # noqa: PLR0913 - each digest is independently bound.
     state: AgentState,
     *,
     source_digest: str,
     analyzer_contract: str,
     candidate_digest: str,
+    repository_snapshot_id: str,
     resumed: bool,
 ) -> None:
     previous = state.surface.get("source_analysis")
@@ -427,14 +445,32 @@ def _assert_resume_binding(
         raise SourceChangedError(
             "source candidate map changed since the saved run; start a fresh workspace"
         )
+    previous_repository_snapshot = str(previous.get("repository_snapshot_id") or "")
+    if repository_snapshot_id and previous_repository_snapshot != repository_snapshot_id:
+        raise SourceChangedError(
+            "repository snapshot changed since the saved run; start a fresh workspace"
+        )
 
 
-def assert_source_resume_available(*, state: AgentState, source_root: Path | None) -> None:
+def assert_source_resume_available(
+    *,
+    state: AgentState,
+    source_root: Path | None,
+    allow_source_to_model: bool = False,
+) -> None:
     """Fail closed when a source-bound run is resumed without its source tree."""
     previous = state.surface.get("source_analysis")
     if isinstance(previous, Mapping) and source_root is None:
         raise SourceChangedError(
             "saved run is bound to a source tree; resume with the same --source-root"
+        )
+    if (
+        isinstance(previous, Mapping)
+        and previous.get("repository_snapshot_id")
+        and not allow_source_to_model
+    ):
+        raise SourceChangedError(
+            "saved run exposed a repository snapshot; resume with --allow-source-to-model"
         )
 
 
