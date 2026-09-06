@@ -45,9 +45,9 @@ def _case(
     *,
     evaluated_classes: list[str] | None = None,
 ) -> dict[str, object]:
-    selected_classes = evaluated_classes or sorted(
-        {str(item["vuln_class"]) for item in expected}
-    ) or ["idor"]
+    selected_classes = (
+        evaluated_classes or sorted({str(item["vuln_class"]) for item in expected}) or ["idor"]
+    )
     return {
         "id": case_id,
         "source_root": f"eval/repository_review/{case_id}",
@@ -138,9 +138,7 @@ def test_manifest_parses_strict_ground_truth_and_clean_controls() -> None:
             "evaluated_classes must be unique",
         ),
         (
-            lambda payload: payload["cases"][0]["expected"][0].update(
-                {"vuln_class": "ssrf"}
-            ),
+            lambda payload: payload["cases"][0]["expected"][0].update({"vuln_class": "ssrf"}),
             "must appear in case evaluated_classes",
         ),
         (
@@ -239,9 +237,7 @@ def test_wrong_class_is_unscored_while_wrong_path_and_duplicates_are_false_posit
 
 
 def test_clean_control_scores_any_report_as_a_false_positive() -> None:
-    case = RepositoryReviewEvalManifest.from_mapping(
-        _manifest(_case("clean-control", []))
-    ).cases[0]
+    case = RepositoryReviewEvalManifest.from_mapping(_manifest(_case("clean-control", []))).cases[0]
 
     clean_score = score_repository_review(case, _review())
     noisy_score = score_repository_review(case, _review(_finding("idor")))

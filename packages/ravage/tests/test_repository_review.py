@@ -108,11 +108,16 @@ def _paid_route() -> ResolvedModelRoute:
     )
 
 
-def _final(*, evidence_ids: list[str] | None = None) -> dict[str, object]:
+def _final(
+    *,
+    evidence_ids: list[str] | None = None,
+    vuln_class: str = "idor",
+) -> dict[str, object]:
     findings: list[dict[str, object]] = []
     if evidence_ids is not None:
         findings.append(
             {
+                "vuln_class": vuln_class,
                 "title": "Authorization decision is missing",
                 "severity": "high",
                 "confidence": "high",
@@ -195,6 +200,7 @@ def test_review_agent_searches_and_excerpts_the_frozen_context(
     assert result.output_tokens == 9
     assert len(result.findings) == 1
     evidence = result.findings[0].evidence[0]
+    assert result.findings[0].vuln_class == "idor"
     assert evidence.path == "handlers.ts"
     assert evidence.snapshot_id == result.snapshot_id
     assert evidence.file_digest.startswith("sha256:")
@@ -509,6 +515,30 @@ def test_unknown_evidence_is_rejected_before_final_result(tmp_path: Path) -> Non
     assert result.steps[-1].ok is True
 
 
+def test_noncanonical_finding_class_is_rejected_before_final_result(tmp_path: Path) -> None:
+    (tmp_path / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    client = ScriptedReviewClient(
+        [
+            {
+                "action": "excerpt",
+                "args": {"path": "module.py", "start_line": 1, "end_line": 1},
+            },
+            _final(evidence_ids=["excerpt-1"], vuln_class="Broken Access Control"),
+            _final(evidence_ids=["excerpt-1"]),
+        ]
+    )
+
+    result = run_repository_review(
+        source_root=tmp_path,
+        route=_local_route(),
+        client=client,
+    )
+
+    assert result.steps[1].ok is False
+    assert "canonical lowercase snake_case" in str(result.steps[1].observation["error"])
+    assert result.findings[0].vuln_class == "idor"
+
+
 @pytest.mark.parametrize(
     "invalid_reply",
     [
@@ -794,7 +824,7 @@ def test_cli_runs_review_without_source_text_in_json(
     rendered_text = output.getvalue()
     rendered = json.loads(rendered_text)
     assert rendered == payload
-    assert rendered["schema"] == "ravage.repository-review.v1"
+    assert rendered["schema"] == "ravage.repository-review.v2"
     assert rendered["mode"] == "read_only_repository_review"
     assert rendered["objective"] == {
         "chars": len(DEFAULT_REVIEW_OBJECTIVE),

@@ -12,8 +12,10 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Final
 
+from ravage.repository_review import REPOSITORY_REVIEW_SCHEMA
+
 MANIFEST_SCHEMA_VERSION: Final = "ravage.repository-review-eval-manifest.v1"
-REVIEW_SCHEMA_VERSION: Final = "ravage.repository-review.v1"
+REVIEW_SCHEMA_VERSION: Final = REPOSITORY_REVIEW_SCHEMA
 
 _MAX_CASES = 1_024
 _MAX_EXPECTED_PER_CASE = 100
@@ -440,8 +442,7 @@ def _parse_review_findings(review: Mapping[str, object]) -> tuple[_ObservedFindi
     if len(raw_findings) > _MAX_FINDINGS:
         raise RepositoryReviewEvalInputError("repository-review result exceeds the finding limit")
     return tuple(
-        _parse_review_finding(_mapping(item, "repository-review finding"))
-        for item in raw_findings
+        _parse_review_finding(_mapping(item, "repository-review finding")) for item in raw_findings
     )
 
 

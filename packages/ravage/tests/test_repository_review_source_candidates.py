@@ -68,6 +68,7 @@ def _final(*, evidence_ids: list[str] | None = None) -> dict[str, object]:
     if evidence_ids is not None:
         findings.append(
             {
+                "vuln_class": "sql_injection",
                 "title": "Request input reaches SQL text",
                 "severity": "high",
                 "confidence": "high",
@@ -210,7 +211,7 @@ def test_source_candidate_exposure_can_be_disabled_for_literal_only_ab(
     assert "list_source_candidates" not in first_messages[0].content
     assert "source candidate" not in first_messages[0].content.casefold()
     assert hashlib.sha256(first_messages[0].content.encode()).hexdigest() == (
-        "35e5675b7ee22fb3fc1b9a6a9a22622a665eddbf690d59aaba93ed6c3212a90d"
+        "16682c84ed64935aa0be9dc9c3488a5929108cff9b3902697508e40e87324354"
     )
     assert "source_candidates" not in json.loads(first_messages[1].content)
     assert result.source_candidates_enabled is False

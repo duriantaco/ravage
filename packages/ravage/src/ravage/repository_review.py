@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, Protocol
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
 
 ReviewSeverity = Literal["info", "low", "medium", "high", "critical"]
 ReviewConfidence = Literal["low", "medium", "high"]
+REPOSITORY_REVIEW_SCHEMA = "ravage.repository-review.v2"
 
 DEFAULT_REVIEW_OBJECTIVE = (
     "Review the repository for concrete security weaknesses and recommend defensive fixes."
@@ -65,6 +67,7 @@ _SOURCE_CANDIDATE_ACTION = "list_source_candidates"
 _ALLOWED_ACTIONS = _BASE_ALLOWED_ACTIONS | {_SOURCE_CANDIDATE_ACTION}
 _SEVERITIES = frozenset({"info", "low", "medium", "high", "critical"})
 _CONFIDENCES = frozenset({"low", "medium", "high"})
+_VULNERABILITY_CLASS_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 
 
 class RepositoryReviewError(RuntimeError):
@@ -136,6 +139,7 @@ class ReviewEvidence:
 
 @dataclass(frozen=True)
 class RepositoryReviewFinding:
+    vuln_class: str
     title: str
     severity: ReviewSeverity
     confidence: ReviewConfidence
@@ -146,6 +150,7 @@ class RepositoryReviewFinding:
     def to_json(self) -> dict[str, object]:
         return {
             "verification": "source_review_candidate",
+            "vuln_class": self.vuln_class,
             "title": self.title,
             "severity": self.severity,
             "confidence": self.confidence,
@@ -222,7 +227,7 @@ class RepositoryReviewResult:
 
     def to_json(self) -> dict[str, object]:
         return {
-            "schema": "ravage.repository-review.v1",
+            "schema": REPOSITORY_REVIEW_SCHEMA,
             "mode": "read_only_repository_review",
             "snapshot_id": self.snapshot_id,
             "objective": {
@@ -537,10 +542,14 @@ actions are:
 - list_omissions: {"cursor": 0, "limit": 50}
 - search: {"query": "literal text", "max_matches": 10}
 - excerpt: {"path": "relative/path", "start_line": 1, "end_line": 40}
-- final: {"summary": "...", "findings": [{"title": "...", "severity":
-  "info|low|medium|high|critical", "confidence": "low|medium|high",
+- final: {"summary": "...", "findings": [{"vuln_class": "canonical_snake_case",
+  "title": "...", "severity": "info|low|medium|high|critical",
+  "confidence": "low|medium|high",
   "description": "...", "recommendation": "...", "evidence_ids": ["excerpt-1"]}]}
 
+Use a specific conventional vulnerability class such as idor, sql_injection,
+command_injection, path_traversal, ssrf, xss, ssti, xxe, deserialization, or
+hardcoded_secret. Use idor for a missing per-object ownership check.
 Every finding must cite at least one evidence ID returned by excerpt. Search matches
 help navigation but are not finding evidence. If the source does not support a
 finding, return final with an empty findings list. Start by discovering relevant
@@ -880,6 +889,7 @@ def _parse_finding(
     _require_argument_keys(
         value,
         {
+            "vuln_class",
             "title",
             "severity",
             "confidence",
@@ -888,6 +898,7 @@ def _parse_finding(
             "evidence_ids",
         },
     )
+    vuln_class = _canonical_vulnerability_class(value.get("vuln_class"))
     title = _required_text(value, "title", max_chars=_MAX_TITLE_CHARS)
     severity = _required_text(value, "severity", max_chars=16)
     if severity not in _SEVERITIES:
@@ -909,6 +920,7 @@ def _parse_finding(
         if raw_id not in evidence_ids:
             evidence_ids.append(raw_id)
     return RepositoryReviewFinding(
+        vuln_class=vuln_class,
         title=title,
         severity=severity,  # type: ignore[arg-type]
         confidence=confidence,  # type: ignore[arg-type]
@@ -1113,6 +1125,12 @@ def _required_text(value: Mapping[str, object], key: str, *, max_chars: int) -> 
     if len(item) > max_chars or "\x00" in item:
         raise ValueError(f"{key} must be at most {max_chars} characters and contain no NUL")
     return item
+
+
+def _canonical_vulnerability_class(value: object) -> str:
+    if not isinstance(value, str) or _VULNERABILITY_CLASS_RE.fullmatch(value) is None:
+        raise ValueError("finding vuln_class must be a canonical lowercase snake_case identifier")
+    return value
 
 
 def _required_literal(value: Mapping[str, object], key: str, *, max_chars: int) -> str:
@@ -1331,6 +1349,7 @@ __all__ = [
     "DEFAULT_REVIEW_MAX_COST_USD",
     "DEFAULT_REVIEW_MAX_TURNS",
     "DEFAULT_REVIEW_OBJECTIVE",
+    "REPOSITORY_REVIEW_SCHEMA",
     "RepositoryReviewError",
     "RepositoryReviewFinding",
     "RepositoryReviewResult",
