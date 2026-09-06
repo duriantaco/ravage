@@ -13,6 +13,10 @@ from ravage.agent_core.agent_strategy import (
 )
 from ravage.agent_core.recovery_action_contract import RECOVERY_OBJECTIVE_ACTION_STRATEGY
 from ravage.agent_core.semantic_routes import semantic_action_fingerprint, semantic_action_route
+from ravage.agent_core.source_context import (
+    SOURCE_CONTEXT_ACTION,
+    sanitize_source_context_action,
+)
 from ravage.traffic.redaction import redact_headers, redact_text, sanitize_url
 
 if TYPE_CHECKING:
@@ -245,6 +249,8 @@ def turn_trace_payload(  # noqa: PLR0913 - flat fields define the trace schema.
 
 def sanitize_action(action: Mapping[str, object]) -> dict[str, object]:
     kind = str(action.get("action") or "")
+    if kind == SOURCE_CONTEXT_ACTION:
+        return sanitize_source_context_action(action)
     if kind == "http_request":
         return _sanitize_http_step(action)
     sanitized: dict[str, object] = {}

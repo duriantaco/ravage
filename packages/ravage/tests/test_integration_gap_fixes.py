@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING
 
 import pytest
 from ravage.agent_core.action_executor import _command_timeout
-from ravage.agent_core.agent_state import AgentState
+from ravage.agent_core.agent_state import AgentState, save_agent_state
 from ravage.agent_core.agent_strategy import ActionLedger, action_fingerprint
 from ravage.agent_core.ai_agent import (
     _model_action,
@@ -13,6 +14,9 @@ from ravage.agent_core.ai_agent import (
 )
 from ravage.agent_core.primitive_state import promote_primitives
 from ravage.agent_core.surface_graph import SurfaceGraphState
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def test_command_timeout_floors_at_ten_seconds() -> None:
@@ -199,6 +203,33 @@ def test_http_payload_fingerprints_are_not_serialized(kind: str) -> None:
     assert ledger.remember(action) == 1
     assert ledger.count(action) == 1
     assert ledger.to_json() == {}
+
+
+def test_source_context_fingerprint_is_not_serialized_to_working_state(tmp_path: Path) -> None:
+    action = {
+        "action": "source_context",
+        "operation": "search",
+        "args": {"query": "source-only-low-entropy-literal", "max_matches": 2},
+    }
+    fingerprint = action_fingerprint(action)
+    material_digest = fingerprint.removeprefix("source_context:sha256:")
+    ledger = ActionLedger()
+
+    assert ledger.remember(action) == 1
+    assert ledger.count(action) == 1
+    assert ledger.to_json() == {}
+    assert fingerprint not in json.dumps(ledger.to_json(), sort_keys=True)
+
+    state_path = tmp_path / "working_state.json"
+    save_agent_state(
+        state_path,
+        target_url="http://127.0.0.1:8080",
+        state=AgentState(ledger=ledger),
+    )
+    durable_state = state_path.read_text(encoding="utf-8")
+
+    assert fingerprint not in durable_state
+    assert material_digest not in durable_state
 
 
 def test_repeat_guard_honors_a_legacy_fingerprint_after_state_round_trip() -> None:

@@ -4,10 +4,12 @@ import json
 from typing import TYPE_CHECKING
 
 import pytest
+from ravage.agent_core.agent_strategy import action_fingerprint
 from ravage.agent_core.source_context import (
     SOURCE_CONTEXT_OBSERVATION_SCHEMA,
     SOURCE_CONTEXT_RECEIPT_SCHEMA,
     SourceContextExecutor,
+    sanitize_source_context_action,
     source_context_action_error,
     source_context_action_schema,
 )
@@ -15,6 +17,8 @@ from ravage.repository_context import capture_repository
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+_RESUMED_OBSERVATION_CHARS = 123
 
 
 def _action(operation: str, arguments: dict[str, object]) -> dict[str, object]:
@@ -172,12 +176,14 @@ def test_source_context_receipts_exclude_source_query_and_error_text(tmp_path: P
     assert invalid_path in json.dumps(failed.observation)
     assert invalid_path not in json.dumps(failed.receipt)
     assert search.receipt["schema"] == SOURCE_CONTEXT_RECEIPT_SCHEMA
-    assert excerpt.receipt["result"]["text_digest"].startswith("sha256:")
     for receipt in (search.receipt, excerpt.receipt, failed.receipt):
         serialized = json.dumps(receipt)
         assert '"text"' not in serialized
         assert '"query"' not in serialized
         assert '"error"' not in serialized
+        assert '"file_digest"' not in serialized
+        assert '"text_digest"' not in serialized
+        assert '"observation_digest"' not in serialized
 
 
 def test_source_context_contract_accepts_only_the_isolated_schema() -> None:
@@ -189,3 +195,54 @@ def test_source_context_contract_accepts_only_the_isolated_schema() -> None:
     assert source_context_action_error(payload) == ""
     assert source_context_action_schema() == source_context_action_schema()
     assert source_context_action_schema() is not source_context_action_schema()
+
+
+def test_source_context_resume_budget_and_action_receipt_exclude_lookup_literals(
+    tmp_path: Path,
+) -> None:
+    _write(tmp_path, "app.py", "NEEDLE = 'source-only-literal'\n")
+    context = capture_repository(tmp_path)
+    executor = SourceContextExecutor(
+        context,
+        observation_chars_used=_RESUMED_OBSERVATION_CHARS,
+    )
+    action = _action("search", {"query": "source-only-literal", "max_matches": 2})
+
+    result = executor.execute(action)
+    durable_action = sanitize_source_context_action(action)
+
+    assert result.receipt["cumulative_observation_chars"] > _RESUMED_OBSERVATION_CHARS
+    assert durable_action == {
+        "action": "source_context",
+        "operation": "search",
+        "args": {"query_chars": 19, "max_matches": 2},
+    }
+    serialized = json.dumps(durable_action)
+    assert "source-only-literal" not in serialized
+    assert "query_digest" not in serialized
+
+
+def test_excerpt_action_receipt_excludes_model_lookup_path() -> None:
+    copied_source = "SOURCE_LINE_COPIED_AS_PATH_8a21"
+    action = _action(
+        "excerpt",
+        {"path": copied_source, "start_line": 1, "end_line": 2},
+    )
+
+    durable_action = sanitize_source_context_action(action)
+
+    assert durable_action == {
+        "action": "source_context",
+        "operation": "excerpt",
+        "args": {"path_chars": len(copied_source), "start_line": 1, "end_line": 2},
+    }
+    assert copied_source not in json.dumps(durable_action)
+
+
+def test_source_context_repeat_identity_ignores_task_lifecycle() -> None:
+    first = _action("search", {"query": "two  spaces", "max_matches": 2})
+    second = {**first, "task_id": "another-task"}
+    different = _action("search", {"query": "two spaces", "max_matches": 2})
+
+    assert action_fingerprint(first) == action_fingerprint(second)
+    assert action_fingerprint(first) != action_fingerprint(different)

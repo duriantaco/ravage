@@ -10,6 +10,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 _NON_PERSISTED_FINGERPRINT_PREFIXES = (
     "http_request:",
+    "source_context:",
     "validate_poc:",
 )
 
@@ -217,6 +218,18 @@ def action_fingerprint(action: Mapping[str, object], *, context: str = "") -> st
             separators=(",", ":"),
             default=str,
         )
+    elif kind == "source_context":
+        # Source lookups are repeat-accounted only in memory. Task lifecycle
+        # changes must not let an identical bounded lookup evade its cap.
+        body = json.dumps(
+            {
+                "operation": action.get("operation"),
+                "args": action.get("args"),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
     elif kind == "http_request":
         body = json.dumps(
             {
@@ -238,7 +251,7 @@ def action_fingerprint(action: Mapping[str, object], *, context: str = "") -> st
         body = str(action)
     normalized = (
         body
-        if kind in {"http_request", "validate_poc"}
+        if kind in {"http_request", "source_context", "validate_poc"}
         else re.sub(r"\s+", " ", body.strip())
     )
     normalized = re.sub(r"ravage-[a-z0-9_:-]+", "ravage-*", normalized, flags=re.I)
@@ -378,6 +391,16 @@ def _legacy_action_fingerprint(action: Mapping[str, object], *, context: str = "
                 "steps": action.get("steps") or [],
                 "finding": action.get("finding") or {},
             }
+        )
+    elif kind == "source_context":
+        body = json.dumps(
+            {
+                "operation": action.get("operation"),
+                "args": action.get("args"),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
         )
     else:
         body = str(action)

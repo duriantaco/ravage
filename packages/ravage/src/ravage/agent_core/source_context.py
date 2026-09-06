@@ -3,7 +3,9 @@ Bounded, read-only source navigation over one immutable repository snapshot.
 
 This module never opens repository paths, executes project code, calls a model,
 or writes observations to disk. Callers own the short-lived raw observation;
-the accompanying receipt deliberately excludes repository and query text.
+the accompanying receipt excludes file contents, lookup literals, and
+content-derived digests. Repository paths and coordinates remain as structural
+navigation metadata.
 """
 
 # Model-facing validation errors are deliberately concise and specific.
@@ -41,7 +43,7 @@ _ARGUMENT_KEYS: dict[str, frozenset[str]] = {
     "search": frozenset({"query", "max_matches"}),
     "excerpt": frozenset({"path", "start_line", "end_line"}),
 }
-_RAW_RECEIPT_KEYS = frozenset({"error", "text"})
+_RAW_RECEIPT_KEYS = frozenset({"error", "file_digest", "text", "text_digest"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +65,7 @@ class SourceContextExecutor:
         context: RepositoryContext,
         *,
         max_observation_chars: int = MAX_SOURCE_CONTEXT_OBSERVATION_CHARS,
+        observation_chars_used: int = 0,
     ) -> None:
         if not isinstance(context, RepositoryContext):
             raise TypeError("context must be a RepositoryContext")
@@ -72,9 +75,15 @@ class SourceContextExecutor:
             minimum=1,
             maximum=MAX_SOURCE_CONTEXT_OBSERVATION_CHARS,
         )
+        _require_int(
+            observation_chars_used,
+            "observation_chars_used",
+            minimum=0,
+            maximum=max_observation_chars,
+        )
         self._context = context
         self._max_observation_chars = max_observation_chars
-        self._observation_chars_used = 0
+        self._observation_chars_used = observation_chars_used
 
     @property
     def snapshot_id(self) -> str:
@@ -120,6 +129,20 @@ class SourceContextExecutor:
                 observation_chars=observation_chars,
                 cumulative_chars=self._observation_chars_used,
             ),
+        )
+
+    def reject_repeated(
+        self,
+        action: Mapping[str, object],
+        *,
+        repeat_count: int,
+    ) -> SourceContextExecution:
+        """Reject an identical lookup without consuming the source text budget."""
+        _require_int(repeat_count, "repeat_count", minimum=1)
+        return self._error(
+            operation=_safe_operation(action.get("operation")),
+            message=f"identical source context action blocked at repeat {repeat_count}",
+            error_code="identical_action_limit",
         )
 
     def _error(
@@ -170,6 +193,47 @@ def source_context_action_error(action: Mapping[str, object]) -> str:
     except (TypeError, ValueError) as exc:
         return _bounded_error(exc)
     return ""
+
+
+def sanitize_source_context_action(action: Mapping[str, object]) -> dict[str, object]:
+    """Return a durable action shape without repository lookup literals."""
+    operation = _safe_operation(action.get("operation"))
+    sanitized: dict[str, object] = {
+        "action": SOURCE_CONTEXT_ACTION,
+        "operation": operation,
+    }
+    arguments = action.get("args")
+    if not isinstance(arguments, Mapping):
+        return sanitized
+    safe_arguments: dict[str, object] = {}
+    if operation == "list_files":
+        prefix = arguments.get("prefix")
+        if isinstance(prefix, str):
+            safe_arguments["prefix_chars"] = len(prefix)
+        _copy_int_arguments(arguments, safe_arguments, "cursor", "limit")
+    elif operation == "list_omissions":
+        _copy_int_arguments(arguments, safe_arguments, "cursor", "limit")
+    elif operation == "search":
+        query = arguments.get("query")
+        if isinstance(query, str):
+            safe_arguments["query_chars"] = len(query)
+        _copy_int_arguments(arguments, safe_arguments, "max_matches")
+    elif operation == "excerpt":
+        path = arguments.get("path")
+        if isinstance(path, str):
+            safe_arguments["path_chars"] = len(path)
+        _copy_int_arguments(arguments, safe_arguments, "start_line", "end_line")
+    sanitized["args"] = safe_arguments
+    return sanitized
+
+
+def _copy_int_arguments(
+    source: Mapping[str, object], destination: dict[str, object], *keys: str
+) -> None:
+    for key in keys:
+        value = source.get(key)
+        if type(value) is int:
+            destination[key] = value
 
 
 def _validated_action(
@@ -403,13 +467,11 @@ def _receipt(  # noqa: PLR0913
         "proof_eligible": False,
         "provenance": {"kind": SOURCE_CONTEXT_PROVENANCE, "snapshot_id": snapshot_id},
         "snapshot_id": snapshot_id,
-        "observation_digest": _digest(_canonical_json(observation)),
         "observation_chars": observation_chars,
         "cumulative_observation_chars": cumulative_chars,
     }
     if not ok:
         receipt["error_code"] = error_code
-        receipt["error_digest"] = _digest(str(observation.get("error") or ""))
         return receipt
     receipt["result"] = _text_free_result(observation)
     return receipt
@@ -425,16 +487,23 @@ def _text_free_result(observation: Mapping[str, object]) -> dict[str, object]:
         "operation",
         *_RAW_RECEIPT_KEYS,
     }
-    result = {str(key): item for key, item in observation.items() if key not in excluded}
-    matches = result.get("matches")
-    if isinstance(matches, list):
-        result["matches"] = [
-            {str(key): item for key, item in match.items() if key not in _RAW_RECEIPT_KEYS}
-            if isinstance(match, Mapping)
-            else match
-            for match in matches
-        ]
-    return result
+    return {
+        str(key): _text_free_receipt_value(item)
+        for key, item in observation.items()
+        if key not in excluded
+    }
+
+
+def _text_free_receipt_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _text_free_receipt_value(item)
+            for key, item in value.items()
+            if str(key) not in _RAW_RECEIPT_KEYS
+        }
+    if isinstance(value, (list, tuple)):
+        return [_text_free_receipt_value(item) for item in value]
+    return value
 
 
 def _reject_keys(
@@ -526,6 +595,7 @@ __all__ = [
     "SOURCE_CONTEXT_TRUST",
     "SourceContextExecution",
     "SourceContextExecutor",
+    "sanitize_source_context_action",
     "source_context_action_error",
     "source_context_action_schema",
 ]
