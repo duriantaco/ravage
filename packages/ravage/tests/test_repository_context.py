@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import pytest
 from ravage import repository_context
 from ravage.repository_context import (
+    ContextIgnorePolicy,
     ContextLimitError,
     ContextLimits,
     ContextReadError,
@@ -151,6 +152,302 @@ def test_project_dotfiles_and_unfamiliar_text_extensions_remain_available(tmp_pa
     }
 
 
+def test_gitignore_rules_prune_files_and_directories_by_default(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_text("*.log\ngenerated/\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("print('kept')\n", encoding="utf-8")
+    (tmp_path / "debug.log").write_text("ignored\n", encoding="utf-8")
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    (generated / "artifact.txt").write_text("ignored\n", encoding="utf-8")
+
+    context = capture_repository(tmp_path)
+
+    assert [source.path for source in context.files] == [".gitignore", "app.py"]
+    assert {(item.path, item.reason) for item in context.omissions} == {
+        ("debug.log", "gitignored_file"),
+        ("generated", "gitignored_directory"),
+    }
+
+
+def test_ignored_directories_are_pruned_before_descendant_limits(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_text("generated/\n", encoding="utf-8")
+    (tmp_path / "kept.txt").write_text("kept\n", encoding="utf-8")
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    for index in range(100):
+        (generated / f"artifact-{index}.txt").write_text("ignored\n", encoding="utf-8")
+    nested = generated / "far" / "beyond" / "the" / "depth" / "limit"
+    nested.mkdir(parents=True)
+    (nested / "artifact.txt").write_text("ignored\n", encoding="utf-8")
+
+    context = capture_repository(
+        tmp_path,
+        limits=ContextLimits(max_files=2, max_total_bytes=64, max_entries=3, max_depth=2),
+    )
+
+    assert [source.path for source in context.files] == [".gitignore", "kept.txt"]
+    assert context.omissions == (
+        repository_context.ContextOmission("generated", "gitignored_directory"),
+    )
+
+
+def test_none_ignore_policy_captures_gitignored_content(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_text("generated/\n*.log\n", encoding="utf-8")
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    (generated / "artifact.txt").write_text("captured\n", encoding="utf-8")
+    (tmp_path / "debug.log").write_text("captured\n", encoding="utf-8")
+
+    context = capture_repository(tmp_path, ignore_policy=ContextIgnorePolicy.NONE)
+
+    assert {source.path for source in context.files} == {
+        ".gitignore",
+        "debug.log",
+        "generated/artifact.txt",
+    }
+    assert context.omissions == ()
+
+
+def test_nested_gitignore_rules_override_parents_only_in_their_subtree(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_text("*.tmp\n", encoding="utf-8")
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / ".gitignore").write_text("!keep.tmp\nprivate.tmp\n", encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    for relative in (
+        "root.tmp",
+        "package/drop.tmp",
+        "package/keep.tmp",
+        "package/private.tmp",
+        "elsewhere/keep.tmp",
+    ):
+        (tmp_path / relative).write_text(relative, encoding="utf-8")
+
+    context = capture_repository(tmp_path)
+
+    assert {source.path for source in context.files} == {
+        ".gitignore",
+        "package/.gitignore",
+        "package/keep.tmp",
+    }
+    assert {(item.path, item.reason) for item in context.omissions} == {
+        ("root.tmp", "gitignored_file"),
+        ("package/drop.tmp", "gitignored_file"),
+        ("package/private.tmp", "gitignored_file"),
+        ("elsewhere/keep.tmp", "gitignored_file"),
+    }
+
+
+def test_negation_reincludes_entries_when_parent_directory_is_visible(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_text("generated/*\n!generated/keep.txt\n", encoding="utf-8")
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    (generated / "drop.txt").write_text("drop\n", encoding="utf-8")
+    (generated / "keep.txt").write_text("keep\n", encoding="utf-8")
+
+    context = capture_repository(tmp_path)
+
+    assert {source.path for source in context.files} == {".gitignore", "generated/keep.txt"}
+    assert context.omissions == (
+        repository_context.ContextOmission("generated/drop.txt", "gitignored_file"),
+    )
+
+
+def test_recursive_wildcard_does_not_prune_its_parent_directory(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_text(
+        "generated/**\n!generated/keep.txt\n", encoding="utf-8"
+    )
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    (generated / "drop.txt").write_text("drop\n", encoding="utf-8")
+    (generated / "keep.txt").write_text("keep\n", encoding="utf-8")
+
+    context = capture_repository(tmp_path)
+
+    assert {source.path for source in context.files} == {".gitignore", "generated/keep.txt"}
+    assert context.omissions == (
+        repository_context.ContextOmission("generated/drop.txt", "gitignored_file"),
+    )
+
+
+def test_directory_negation_overrides_an_earlier_wildcard_for_traversal(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_text(
+        "*\n!generated/\n!generated/keep.txt\n", encoding="utf-8"
+    )
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    (generated / "drop.txt").write_text("drop\n", encoding="utf-8")
+    (generated / "keep.txt").write_text("keep\n", encoding="utf-8")
+
+    context = capture_repository(tmp_path)
+
+    assert {source.path for source in context.files} == {".gitignore", "generated/keep.txt"}
+    assert context.omissions == (
+        repository_context.ContextOmission("generated/drop.txt", "gitignored_file"),
+    )
+
+
+def test_recursive_directory_wildcard_only_prunes_descendant_directories(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".gitignore").write_text(
+        "foo/**/\n!foo/keep.txt\n", encoding="utf-8"
+    )
+    foo = tmp_path / "foo"
+    deep = foo / "deep"
+    deep.mkdir(parents=True)
+    (foo / "drop.txt").write_text("direct file remains visible\n", encoding="utf-8")
+    (foo / "keep.txt").write_text("explicitly visible\n", encoding="utf-8")
+    (deep / "drop.txt").write_text("pruned with its directory\n", encoding="utf-8")
+
+    context = capture_repository(tmp_path)
+
+    assert {source.path for source in context.files} == {
+        ".gitignore",
+        "foo/drop.txt",
+        "foo/keep.txt",
+    }
+    assert context.omissions == (
+        repository_context.ContextOmission("foo/deep", "gitignored_directory"),
+    )
+
+
+def test_directory_negation_does_not_reinclude_deeper_descendant_directories(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".gitignore").write_text(
+        "foo/**/\n!foo/deep/\n", encoding="utf-8"
+    )
+    deep = tmp_path / "foo" / "deep"
+    nested = deep / "nested"
+    nested.mkdir(parents=True)
+    (deep / "visible.txt").write_text("visible\n", encoding="utf-8")
+    (nested / "hidden.txt").write_text("hidden\n", encoding="utf-8")
+
+    context = capture_repository(tmp_path)
+
+    assert {source.path for source in context.files} == {
+        ".gitignore",
+        "foo/deep/visible.txt",
+    }
+    assert context.omissions == (
+        repository_context.ContextOmission("foo/deep/nested", "gitignored_directory"),
+    )
+
+
+def test_slashless_directory_pattern_applies_again_below_a_reincluded_parent(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".gitignore").write_text("*/\n!foo/\n", encoding="utf-8")
+    foo = tmp_path / "foo"
+    nested = foo / "nested"
+    nested.mkdir(parents=True)
+    (foo / "visible.txt").write_text("visible\n", encoding="utf-8")
+    (nested / "hidden.txt").write_text("hidden\n", encoding="utf-8")
+
+    context = capture_repository(tmp_path)
+
+    assert {source.path for source in context.files} == {
+        ".gitignore",
+        "foo/visible.txt",
+    }
+    assert context.omissions == (
+        repository_context.ContextOmission("foo/nested", "gitignored_directory"),
+    )
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    ["**/*/", "**/**/", "/**/", "/**/*/", "/**/**/"],
+)
+def test_recursive_directory_pattern_applies_below_a_reincluded_parent(
+    tmp_path: Path,
+    pattern: str,
+) -> None:
+    (tmp_path / ".gitignore").write_text(
+        f"{pattern}\n!foo/\n",
+        encoding="utf-8",
+    )
+    nested = tmp_path / "foo" / "nested"
+    nested.mkdir(parents=True)
+    (tmp_path / "foo" / "visible.txt").write_text("visible\n", encoding="utf-8")
+    (nested / "hidden.txt").write_text("hidden\n", encoding="utf-8")
+
+    context = capture_repository(tmp_path)
+
+    assert {source.path for source in context.files} == {
+        ".gitignore",
+        "foo/visible.txt",
+    }
+    assert context.omissions == (
+        repository_context.ContextOmission("foo/nested", "gitignored_directory"),
+    )
+
+
+def test_anchored_directory_pattern_does_not_repeat_below_a_reincluded_parent(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".gitignore").write_text("/*/\n!foo/\n", encoding="utf-8")
+    nested = tmp_path / "foo" / "nested"
+    nested.mkdir(parents=True)
+    (nested / "visible.txt").write_text("visible\n", encoding="utf-8")
+
+    context = capture_repository(tmp_path)
+
+    assert {source.path for source in context.files} == {
+        ".gitignore",
+        "foo/nested/visible.txt",
+    }
+    assert context.omissions == ()
+
+
+def test_hard_exclusions_take_precedence_over_gitignore_negation(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_text("!.env\n!node_modules/\n*.pem\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("fixture=value\n", encoding="utf-8")
+    (tmp_path / "private.pem").write_text("fixture\n", encoding="utf-8")
+    dependency = tmp_path / "node_modules"
+    dependency.mkdir()
+    (dependency / "index.js").write_text("fixture\n", encoding="utf-8")
+
+    context = capture_repository(tmp_path)
+
+    assert [source.path for source in context.files] == [".gitignore"]
+    assert {(item.path, item.reason) for item in context.omissions} == {
+        (".env", "sensitive_file"),
+        ("private.pem", "sensitive_file"),
+        ("node_modules", "excluded_directory"),
+    }
+
+
+def test_gitignore_content_participates_in_snapshot_identity(tmp_path: Path) -> None:
+    ignore = tmp_path / ".gitignore"
+    ignore.write_text("ignored.txt\n# alpha\n", encoding="utf-8")
+    (tmp_path / "ignored.txt").write_text("ignored\n", encoding="utf-8")
+    first = capture_repository(tmp_path)
+
+    ignore.write_text("ignored.txt\n# bravo\n", encoding="utf-8")
+    second = capture_repository(tmp_path)
+
+    assert [source.path for source in first.files] == [".gitignore"]
+    assert first.omissions == second.omissions
+    assert first.snapshot_id != second.snapshot_id
+
+
+def test_ignored_subtree_mutation_does_not_change_snapshot_identity(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_text("generated/\n", encoding="utf-8")
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    artifact = generated / "artifact.txt"
+    artifact.write_text("first version\n", encoding="utf-8")
+    first = capture_repository(tmp_path)
+
+    artifact.write_text("second version\n", encoding="utf-8")
+    second = capture_repository(tmp_path)
+
+    assert first == second
+
+
 def test_oversized_files_are_explicit_omissions(tmp_path: Path) -> None:
     (tmp_path / "large.txt").write_text("a" * 20)
     result = capture_repository(tmp_path, limits=ContextLimits(max_file_bytes=10))
@@ -158,6 +455,46 @@ def test_oversized_files_are_explicit_omissions(tmp_path: Path) -> None:
     assert [(item.path, item.reason) for item in result.omissions] == [
         ("large.txt", "file_too_large")
     ]
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        (b"ignored.txt\x00\n", "invalid NUL bytes"),
+        (b"\xff\n", "not valid UTF-8"),
+    ],
+)
+def test_invalid_gitignore_files_fail_closed(tmp_path: Path, content: bytes, message: str) -> None:
+    (tmp_path / ".gitignore").write_bytes(content)
+    (tmp_path / "app.py").write_text("print('fixture')\n", encoding="utf-8")
+
+    with pytest.raises(ContextReadError, match=message):
+        capture_repository(tmp_path)
+
+
+def test_git_permissive_noop_patterns_do_not_abort_capture(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_text("!\ntrailing\\\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("print('fixture')\n", encoding="utf-8")
+
+    context = capture_repository(tmp_path)
+
+    assert [source.path for source in context.files] == [".gitignore", "app.py"]
+
+
+def test_oversized_gitignore_fails_closed(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+
+    with pytest.raises(ContextLimitError, match=r"\.gitignore.*per-file byte limit"):
+        capture_repository(tmp_path, limits=ContextLimits(max_file_bytes=8))
+
+
+def test_symlink_gitignore_fails_closed(tmp_path: Path) -> None:
+    rules = tmp_path / "rules"
+    rules.write_text("ignored.txt\n", encoding="utf-8")
+    (tmp_path / ".gitignore").symlink_to(rules)
+
+    with pytest.raises(ContextReadError, match="not a regular ignore file"):
+        capture_repository(tmp_path)
 
 
 @pytest.mark.parametrize("limit", ["max_files", "max_entries", "max_total_bytes", "max_depth"])
@@ -258,6 +595,25 @@ def test_file_replacement_during_capture_rejects_mixed_versions(
         capture_repository(tmp_path)
 
 
+def test_gitignore_replacement_during_capture_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / ".gitignore"
+    path.write_text("ignored.txt\n", encoding="utf-8")
+    read_file = repository_context._read_file  # noqa: SLF001 - deterministic replacement.
+
+    def replace_before_read(parent: int, name: str, expected: os.stat_result, limit: int) -> bytes:
+        if name == ".gitignore":
+            replacement = tmp_path / "replacement-ignore"
+            replacement.write_text("other.txt\n", encoding="utf-8")
+            replacement.replace(path)
+        return read_file(parent, name, expected, limit)
+
+    monkeypatch.setattr(repository_context, "_read_file", replace_before_read)
+    with pytest.raises(ContextReadError, match="changed while opening"):
+        capture_repository(tmp_path)
+
+
 def test_nonexistent_file_and_symlink_roots_are_rejected(tmp_path: Path) -> None:
     regular = tmp_path / "file"
     regular.write_text("fixture")
@@ -274,6 +630,48 @@ def test_invalid_limits_are_rejected(context: RepositoryContext, value: int) -> 
         ContextLimits(max_files=value)
     with pytest.raises(ValueError, match="positive integer"):
         context.search("greet_user", max_matches=value)
+
+
+def test_default_capture_limits_support_medium_repositories() -> None:
+    assert ContextLimits() == ContextLimits(
+        max_files=10_000,
+        max_file_bytes=512 * 1024,
+        max_total_bytes=64 * 1024 * 1024,
+        max_entries=100_000,
+        max_depth=32,
+    )
+
+
+def test_default_total_byte_limit_accepts_25_mib_of_text(tmp_path: Path) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    source = tmp_path / "half-mib-source"
+    source.write_bytes(b"x" * (512 * 1024))
+    file_count = 50
+    for index in range(file_count):
+        (root / f"source-{index:03}.txt").hardlink_to(source)
+
+    context = capture_repository(root)
+
+    assert len(context.files) == file_count
+    assert sum(item.size_bytes for item in context.files) == 25 * 1024 * 1024
+
+
+def test_default_total_byte_limit_rejects_more_than_64_mib(tmp_path: Path) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    source = tmp_path / "half-mib-source"
+    source.write_bytes(b"x" * (512 * 1024))
+    for index in range(129):
+        (root / f"source-{index:03}.txt").hardlink_to(source)
+
+    with pytest.raises(ContextLimitError, match="total byte limit"):
+        capture_repository(root)
+
+
+def test_ignore_policy_must_be_explicit_enum(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="ContextIgnorePolicy"):
+        capture_repository(tmp_path, ignore_policy="none")  # type: ignore[arg-type]
 
 
 def test_query_and_result_bounds_cannot_be_bypassed(context: RepositoryContext) -> None:

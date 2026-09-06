@@ -16,7 +16,15 @@ import json
 import os
 import stat
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+from pathspec import GitIgnoreSpec
+from pathspec.patterns.gitignore import GitIgnorePatternError
+
+if TYPE_CHECKING:
+    from pathspec.patterns.gitignore.spec import GitIgnoreSpecPattern
 
 _EXCLUDED_DIRECTORIES = frozenset(
     {
@@ -59,12 +67,19 @@ class ContextReadError(OSError):
     """A repository cannot be read consistently within the supplied root."""
 
 
+class ContextIgnorePolicy(StrEnum):
+    """Select whether project-local Git ignore files constrain capture."""
+
+    GITIGNORE = "gitignore"
+    NONE = "none"
+
+
 @dataclass(frozen=True)
 class ContextLimits:
-    max_files: int = 2_000
+    max_files: int = 10_000
     max_file_bytes: int = 512 * 1024
-    max_total_bytes: int = 8 * 1024 * 1024
-    max_entries: int = 50_000
+    max_total_bytes: int = 64 * 1024 * 1024
+    max_entries: int = 100_000
     max_depth: int = 32
 
     def __post_init__(self) -> None:
@@ -171,6 +186,7 @@ class RepositoryContext:
 @dataclass
 class _Capture:
     limits: ContextLimits
+    ignore_policy: ContextIgnorePolicy
     files: list[ContextFile] = field(default_factory=list)
     omissions: list[ContextOmission] = field(default_factory=list)
     entries_seen: int = 0
@@ -178,7 +194,24 @@ class _Capture:
     bytes_read: int = 0
 
 
-def capture_repository(root: Path, *, limits: ContextLimits | None = None) -> RepositoryContext:
+@dataclass(frozen=True)
+class _IgnoreScope:
+    prefix: str
+    spec: GitIgnoreSpec
+
+
+@dataclass(frozen=True)
+class _WalkPosition:
+    depth: int
+    ignore_scopes: tuple[_IgnoreScope, ...]
+
+
+def capture_repository(
+    root: Path,
+    *,
+    limits: ContextLimits | None = None,
+    ignore_policy: ContextIgnorePolicy = ContextIgnorePolicy.GITIGNORE,
+) -> RepositoryContext:
     """
     Capture bounded UTF-8 text files from a local directory on POSIX.
 
@@ -186,13 +219,15 @@ def capture_repository(root: Path, *, limits: ContextLimits | None = None) -> Re
     tree. Files are checked for changes while read. This freezes captured text;
     it does not claim an atomic Git revision or a secret-free export.
     """
-    state = _Capture(limits or ContextLimits())
+    if not isinstance(ignore_policy, ContextIgnorePolicy):
+        raise TypeError("ignore_policy must be a ContextIgnorePolicy")
+    state = _Capture(limits or ContextLimits(), ignore_policy)
     try:
         descriptor = os.open(Path(root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError as exc:
         raise ContextReadError("cannot open repository root as a non-symlink directory") from exc
     try:
-        _walk(descriptor, "", depth=1, state=state)
+        _walk(descriptor, "", position=_WalkPosition(1, ()), state=state)
     except ContextReadError:
         raise
     except OSError as exc:
@@ -213,9 +248,29 @@ def capture_repository(root: Path, *, limits: ContextLimits | None = None) -> Re
     return RepositoryContext(files, omissions, _digest(identity))
 
 
-def _walk(descriptor: int, prefix: str, *, depth: int, state: _Capture) -> None:
-    if depth > state.limits.max_depth:
+def _walk(
+    descriptor: int,
+    prefix: str,
+    *,
+    position: _WalkPosition,
+    state: _Capture,
+) -> None:
+    if position.depth > state.limits.max_depth:
         raise ContextLimitError("repository exceeds directory depth limit (root counts as one)")
+    names = _read_directory_names(descriptor, state=state)
+    local_scopes = _load_local_ignore_scope(
+        descriptor,
+        prefix,
+        names,
+        inherited=position.ignore_scopes,
+        state=state,
+    )
+    local_position = _WalkPosition(position.depth, local_scopes)
+    for name in sorted(names):
+        _capture_entry(descriptor, name, prefix, position=local_position, state=state)
+
+
+def _read_directory_names(descriptor: int, *, state: _Capture) -> list[str]:
     names: list[str] = []
     with os.scandir(descriptor) as entries:
         for entry in entries:
@@ -223,19 +278,52 @@ def _walk(descriptor: int, prefix: str, *, depth: int, state: _Capture) -> None:
             if state.entries_seen > state.limits.max_entries:
                 raise ContextLimitError("repository exceeds directory entry limit")
             names.append(entry.name)
-    for name in sorted(names):
-        relative = f"{prefix}/{name}" if prefix else name
-        if not all(character.isprintable() for character in name):
-            state.omissions.append(ContextOmission(relative, "unsupported_path"))
-            continue
-        metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-        reason = _omission_reason(name, metadata, state.limits)
-        if reason is not None:
-            state.omissions.append(ContextOmission(relative, reason))
-        elif stat.S_ISDIR(metadata.st_mode):
-            _walk_child(descriptor, relative, metadata, depth=depth, state=state)
-        else:
-            _capture_file(descriptor, name, relative, metadata, state=state)
+    return names
+
+
+def _load_local_ignore_scope(
+    descriptor: int,
+    prefix: str,
+    names: list[str],
+    *,
+    inherited: tuple[_IgnoreScope, ...],
+    state: _Capture,
+) -> tuple[_IgnoreScope, ...]:
+    ignore_name = ".gitignore"
+    if state.ignore_policy is not ContextIgnorePolicy.GITIGNORE or ignore_name not in names:
+        return inherited
+    metadata = os.stat(ignore_name, dir_fd=descriptor, follow_symlinks=False)
+    return (
+        *inherited,
+        _capture_gitignore(descriptor, ignore_name, prefix, metadata, state=state),
+    )
+
+
+def _capture_entry(
+    descriptor: int,
+    name: str,
+    prefix: str,
+    *,
+    position: _WalkPosition,
+    state: _Capture,
+) -> None:
+    relative = f"{prefix}/{name}" if prefix else name
+    if not all(character.isprintable() for character in name):
+        state.omissions.append(ContextOmission(relative, "unsupported_path"))
+        return
+    if state.ignore_policy is ContextIgnorePolicy.GITIGNORE and name == ".gitignore":
+        return
+    metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+    reason = _omission_reason(name, metadata, state.limits)
+    if reason is None and _is_gitignored(relative, metadata, position.ignore_scopes):
+        reason = "gitignored_directory" if stat.S_ISDIR(metadata.st_mode) else "gitignored_file"
+    if reason is not None:
+        state.omissions.append(ContextOmission(relative, reason))
+        return
+    if stat.S_ISDIR(metadata.st_mode):
+        _walk_child(descriptor, relative, metadata, position=position, state=state)
+        return
+    _capture_file(descriptor, name, relative, metadata, state=state)
 
 
 def _walk_child(
@@ -243,7 +331,7 @@ def _walk_child(
     relative: str,
     expected: os.stat_result,
     *,
-    depth: int,
+    position: _WalkPosition,
     state: _Capture,
 ) -> None:
     name = relative.rsplit("/", 1)[-1]
@@ -252,7 +340,12 @@ def _walk_child(
         opened = os.fstat(child)
         if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
             raise ContextReadError("repository directory changed while opening it")
-        _walk(child, relative, depth=depth + 1, state=state)
+        _walk(
+            child,
+            relative,
+            position=_WalkPosition(position.depth + 1, position.ignore_scopes),
+            state=state,
+        )
         after = os.stat(name, dir_fd=parent, follow_symlinks=False)
         if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
             raise ContextReadError("repository directory changed during traversal")
@@ -277,6 +370,145 @@ def _omission_reason(name: str, metadata: os.stat_result, limits: ContextLimits)
     return "file_too_large" if metadata.st_size > limits.max_file_bytes else None
 
 
+def _capture_gitignore(
+    descriptor: int,
+    name: str,
+    prefix: str,
+    expected: os.stat_result,
+    *,
+    state: _Capture,
+) -> _IgnoreScope:
+    relative = f"{prefix}/{name}" if prefix else name
+    if not stat.S_ISREG(expected.st_mode):
+        raise ContextReadError(f"{relative} is not a regular ignore file")
+    if expected.st_size > state.limits.max_file_bytes:
+        raise ContextLimitError(f"{relative} exceeds the per-file byte limit")
+    data = _read_captured_file(descriptor, name, expected, state=state)
+    if b"\x00" in data:
+        raise ContextReadError(f"{relative} contains invalid NUL bytes")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ContextReadError(f"{relative} is not valid UTF-8") from exc
+    try:
+        spec = _compile_gitignore(text)
+    except (TypeError, ValueError) as exc:
+        raise ContextReadError(f"{relative} contains an invalid Git ignore pattern") from exc
+    state.files.append(ContextFile(relative, _digest(data), len(data), text))
+    return _IgnoreScope(prefix, spec)
+
+
+def _compile_gitignore(text: str) -> GitIgnoreSpec:
+    patterns: list[GitIgnoreSpecPattern] = []
+    for line in text.splitlines():
+        try:
+            patterns.extend(
+                GitIgnoreSpec.from_lines([_normalize_recursive_ignore_pattern(line)]).patterns
+            )
+        except GitIgnorePatternError:
+            # Git treats malformed individual patterns as no-ops rather than
+            # rejecting the entire ignore file.
+            continue
+    return GitIgnoreSpec(patterns)
+
+
+def _normalize_recursive_ignore_pattern(pattern: str) -> str:
+    """Preserve Git's descendant-only meaning for trailing recursive wildcards."""
+    normalized = pattern if pattern.endswith("\\ ") else pattern.rstrip()
+    if normalized.endswith("/**/"):
+        return normalized[:-1] + "/*/"
+    if normalized.endswith("/**"):
+        return normalized + "/*"
+    return normalized
+
+
+def _is_gitignored(
+    relative: str,
+    metadata: os.stat_result,
+    scopes: tuple[_IgnoreScope, ...],
+) -> bool:
+    ignored: bool | None = None
+    for scope in scopes:
+        if scope.prefix:
+            scope_prefix = scope.prefix + "/"
+            if not relative.startswith(scope_prefix):
+                continue
+            candidate = relative[len(scope_prefix) :]
+        else:
+            candidate = relative
+        result = _entry_ignore_result(
+            candidate,
+            is_directory=stat.S_ISDIR(metadata.st_mode),
+            spec=scope.spec,
+        )
+        if result is not None:
+            ignored = result
+    return ignored is True
+
+
+def _entry_ignore_result(
+    candidate: str,
+    *,
+    is_directory: bool,
+    spec: GitIgnoreSpec,
+) -> bool | None:
+    """Match this entry; traversal already accounted for every visible parent."""
+    path = candidate + "/" if is_directory else candidate
+    ignored: bool | None = None
+    for pattern in spec.patterns:
+        if pattern.include is None:
+            continue
+        if not _pattern_matches_current_entry(
+            pattern,
+            path=path,
+            basename=candidate.rsplit("/", 1)[-1],
+            is_directory=is_directory,
+        ):
+            continue
+        ignored = pattern.include
+    return ignored
+
+
+def _pattern_matches_current_entry(
+    pattern: GitIgnoreSpecPattern,
+    *,
+    path: str,
+    basename: str,
+    is_directory: bool,
+) -> bool:
+    match = pattern.match_file(path)
+    if match is not None:
+        directory_mark = match.match.groupdict().get("ps_d")
+        if not directory_mark:
+            return True
+        if is_directory and match.match.end("ps_d") == len(path):
+            return True
+
+    raw_pattern = pattern.pattern
+    if not (
+        is_directory
+        and isinstance(raw_pattern, str)
+        and _needs_basename_directory_retry(raw_pattern)
+    ):
+        # Traversal already accounted for any directory-ancestor match.
+        return False
+    basename_path = basename + "/"
+    basename_match = pattern.match_file(basename_path)
+    return bool(
+        basename_match is not None
+        and basename_match.match.groupdict().get("ps_d")
+        and basename_match.match.end("ps_d") == len(basename_path)
+    )
+
+
+def _needs_basename_directory_retry(pattern: str) -> bool:
+    normalized = pattern.removeprefix("!")
+    return normalized.endswith("/") and (
+        "/" not in normalized[:-1]
+        or normalized.startswith(("**/", "/**/"))
+    )
+
+
 def _capture_file(
     descriptor: int,
     name: str,
@@ -285,13 +517,7 @@ def _capture_file(
     *,
     state: _Capture,
 ) -> None:
-    state.files_seen += 1
-    if state.files_seen > state.limits.max_files:
-        raise ContextLimitError("repository exceeds file limit")
-    if state.bytes_read + expected.st_size > state.limits.max_total_bytes:
-        raise ContextLimitError("repository exceeds total byte limit")
-    data = _read_file(descriptor, name, expected, state.limits.max_file_bytes)
-    state.bytes_read += len(data)
+    data = _read_captured_file(descriptor, name, expected, state=state)
     if b"\x00" in data:
         state.omissions.append(ContextOmission(relative, "binary"))
         return
@@ -301,6 +527,23 @@ def _capture_file(
         state.omissions.append(ContextOmission(relative, "non_utf8"))
         return
     state.files.append(ContextFile(relative, _digest(data), len(data), text))
+
+
+def _read_captured_file(
+    descriptor: int,
+    name: str,
+    expected: os.stat_result,
+    *,
+    state: _Capture,
+) -> bytes:
+    state.files_seen += 1
+    if state.files_seen > state.limits.max_files:
+        raise ContextLimitError("repository exceeds file limit")
+    if state.bytes_read + expected.st_size > state.limits.max_total_bytes:
+        raise ContextLimitError("repository exceeds total byte limit")
+    data = _read_file(descriptor, name, expected, state.limits.max_file_bytes)
+    state.bytes_read += len(data)
+    return data
 
 
 def _read_file(parent: int, name: str, expected: os.stat_result, limit: int) -> bytes:

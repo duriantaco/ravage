@@ -398,6 +398,7 @@ version = "0.5.0"
 source = { editable = "packages/ravage" }
 dependencies = [
     { name = "cryptography" },
+    { name = "pathspec" },
     { name = "pyyaml" },
     { name = "ravage-schemas" },
     { name = "rich" },
@@ -411,6 +412,7 @@ browser = [
 [package.metadata]
 requires-dist = [
     { name = "cryptography", specifier = ">=42.0" },
+    { name = "pathspec", specifier = ">=1.1.1" },
     { name = "playwright", marker = "extra == 'browser'", specifier = ">=1.48" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "ravage-schemas", editable = "packages/schemas" },
