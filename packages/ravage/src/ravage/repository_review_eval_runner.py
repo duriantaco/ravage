@@ -57,6 +57,17 @@ _MAX_ERROR_CHARS = 2_000
 _COST_ABS_TOLERANCE = 1e-12
 _CANDIDATE_BEARING_STRATUM = "candidate_bearing"
 _CANDIDATE_EMPTY_STRATUM = "candidate_empty"
+_PAIR_METRICS: Final = (
+    "completion",
+    "true_positives",
+    "false_positives",
+    "false_negatives",
+    "model_calls",
+    "cost_usd",
+    "context_actions",
+    "files_excerpted",
+)
+_PAIR_HIGHER_IS_PREFERRED: Final = frozenset({"completion", "true_positives"})
 
 
 class RepositoryReviewEvalRunnerError(RuntimeError):
@@ -498,6 +509,11 @@ def run_repository_review_ab_evaluation(  # noqa: PLR0913
         "completion": _completion_json(records, planned_runs),
         "failures": _failures_json(records),
         "detection": _detection_json(records, planned_runs),
+        "paired_comparison": _paired_comparison_json(
+            records,
+            prepared_cases=prepared_cases,
+            repeats=repeats,
+        ),
         "tools": _aggregate_tools(records).to_json(),
         "model": accounting_client.telemetry.to_json(),
         "arms": [
@@ -714,7 +730,136 @@ def _detection_json(records: Sequence[_RunRecord], planned_runs: int) -> dict[st
     return {
         "scored_runs": len(scores),
         "unscored_runs": planned_runs - len(scores),
+        "score_scope": "manifest_evaluated_classes_only",
         "score": aggregate,
+        "off_class_unscored_findings": sum(len(score.unscored_finding_indexes) for score in scores),
+    }
+
+
+def _paired_comparison_json(
+    records: Sequence[_RunRecord],
+    *,
+    prepared_cases: Sequence[_PreparedCase],
+    repeats: int,
+) -> dict[str, object]:
+    grouped: dict[tuple[str, int], dict[str, _RunRecord]] = {}
+    for record in records:
+        grouped.setdefault((record.case_id, record.repeat), {})[record.arm] = record
+    paired: list[dict[str, object]] = []
+    deltas_by_metric: dict[str, list[float]] = {metric: [] for metric in _PAIR_METRICS}
+    completed_pairs = 0
+    comparable_pairs = 0
+    for repeat in range(1, repeats + 1):
+        for prepared in prepared_cases:
+            arms = grouped.get((prepared.case.case_id, repeat), {})
+            literal = arms.get(LITERAL_ONLY_ARM)
+            assisted = arms.get(CANDIDATE_ASSISTED_ARM)
+            literal_completed = literal is not None and literal.completed
+            assisted_completed = assisted is not None and assisted.completed
+            completion_delta = int(assisted_completed) - int(literal_completed)
+            deltas: dict[str, int | float] = {"completion": completion_delta}
+            deltas_by_metric["completion"].append(float(completion_delta))
+            both_completed = literal_completed and assisted_completed
+            comparable = (
+                both_completed
+                and literal is not None
+                and assisted is not None
+                and literal.score is not None
+                and assisted.score is not None
+            )
+            if both_completed:
+                completed_pairs += 1
+            if comparable:
+                assert literal is not None
+                assert assisted is not None
+                comparable_pairs += 1
+                completed_deltas = _paired_completed_deltas(
+                    literal=literal,
+                    assisted=assisted,
+                )
+                deltas.update(completed_deltas)
+                for metric, value in completed_deltas.items():
+                    deltas_by_metric[metric].append(float(value))
+            paired.append(
+                {
+                    "case_id": prepared.case.case_id,
+                    "repeat": repeat,
+                    "stratum": prepared.stratum,
+                    "arm_status": {
+                        LITERAL_ONLY_ARM: _run_status(literal),
+                        CANDIDATE_ASSISTED_ARM: _run_status(assisted),
+                    },
+                    "comparable": comparable,
+                    "deltas": deltas,
+                }
+            )
+    planned_pairs = len(prepared_cases) * repeats
+    return {
+        "direction": "candidate_assisted_minus_literal_only",
+        "inference": "descriptive_only_no_significance_test",
+        "planned_pairs": planned_pairs,
+        "completed_pairs": completed_pairs,
+        "comparable_pairs": comparable_pairs,
+        "incomplete_pairs": planned_pairs - completed_pairs,
+        "metric_pair_counts": {metric: len(values) for metric, values in deltas_by_metric.items()},
+        "mean_deltas": {metric: _mean_delta(values) for metric, values in deltas_by_metric.items()},
+        "win_tie_loss": {
+            metric: _win_tie_loss(metric, values) for metric, values in deltas_by_metric.items()
+        },
+        "pairs": paired,
+    }
+
+
+def _paired_completed_deltas(
+    *,
+    literal: _RunRecord,
+    assisted: _RunRecord,
+) -> dict[str, int | float]:
+    assert literal.score is not None
+    assert assisted.score is not None
+    return {
+        "true_positives": (
+            assisted.score.metrics.true_positives - literal.score.metrics.true_positives
+        ),
+        "false_positives": (
+            assisted.score.metrics.false_positives - literal.score.metrics.false_positives
+        ),
+        "false_negatives": (
+            assisted.score.metrics.false_negatives - literal.score.metrics.false_negatives
+        ),
+        "model_calls": assisted.model.replies - literal.model.replies,
+        "cost_usd": round(assisted.model.cost_usd - literal.model.cost_usd, 8),
+        "context_actions": assisted.tools.context_actions - literal.tools.context_actions,
+        "files_excerpted": assisted.tools.files_excerpted - literal.tools.files_excerpted,
+    }
+
+
+def _run_status(record: _RunRecord | None) -> str:
+    if record is None:
+        return "skipped"
+    return "completed" if record.completed else "failed"
+
+
+def _mean_delta(values: Sequence[float]) -> float | None:
+    if not values:
+        return None
+    return round(math.fsum(values) / len(values), 8)
+
+
+def _win_tie_loss(metric: str, values: Sequence[float]) -> dict[str, object]:
+    higher_is_preferred = metric in _PAIR_HIGHER_IS_PREFERRED
+    wins = 0
+    ties = 0
+    for value in values:
+        if math.isclose(value, 0.0, rel_tol=0.0, abs_tol=_COST_ABS_TOLERANCE):
+            ties += 1
+        elif (higher_is_preferred and value > 0) or (not higher_is_preferred and value < 0):
+            wins += 1
+    return {
+        "candidate_preference": "higher" if higher_is_preferred else "lower",
+        "candidate_wins": wins,
+        "ties": ties,
+        "candidate_losses": len(values) - wins - ties,
     }
 
 
