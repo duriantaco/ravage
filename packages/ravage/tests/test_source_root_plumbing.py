@@ -7,6 +7,7 @@ import pytest
 from ravage import __main__ as cli
 from ravage.agent_core import ai_agent
 from ravage.agent_core.ai_agent import AIWebAgentSettings, resolve_source_root
+from ravage.memory import MemoryRunSettings
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -42,6 +43,7 @@ def _write_brief(path: Path, *, context: dict[str, object] | None = None) -> Non
 
 def test_source_root_is_opt_in_and_black_box_context_stays_none() -> None:
     assert AIWebAgentSettings().source_root is None
+    assert AIWebAgentSettings().allow_source_to_model is False
     assert resolve_source_root(explicit=None) is None
 
 
@@ -135,6 +137,84 @@ def test_attack_cli_forwards_explicit_source_root(
 
     command = calls[0]
     assert command[command.index("--source-root") + 1] == str(source_root.resolve())
+    assert "--allow-source-to-model" not in command
+
+
+def test_attack_cli_requires_source_root_for_model_consent_and_forwards_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    brief_path = tmp_path / "brief.yaml"
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    _write_brief(brief_path)
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], _stdout_path: Path) -> int:
+        calls.append(argv)
+        return 0
+
+    monkeypatch.setattr(cli, "_run_subprocess_tee_stdout", fake_run)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["attack", str(brief_path), "--allow-source-to-model"])
+
+    assert exc_info.value.code == ARGPARSE_ERROR
+    assert calls == []
+    assert "--allow-source-to-model requires --source-root" in capsys.readouterr().err
+
+    cli.main(
+        [
+            "attack",
+            str(brief_path),
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--source-root",
+            str(source_root),
+            "--allow-source-to-model",
+            "--no-tool-recon",
+        ]
+    )
+
+    assert "--allow-source-to-model" in calls[0]
+
+
+def test_attack_cli_rejects_run_directory_inside_model_visible_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    brief_path = tmp_path / "brief.yaml"
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    _write_brief(brief_path)
+    run_dir = source_root / "runs" / "attack"
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        cli,
+        "_run_subprocess_tee_stdout",
+        lambda argv, _stdout_path: calls.append(argv) or 0,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "attack",
+                str(brief_path),
+                "--run-dir",
+                str(run_dir),
+                "--source-root",
+                str(source_root),
+                "--allow-source-to-model",
+                "--no-tool-recon",
+            ]
+        )
+
+    assert exc_info.value.code == ARGPARSE_ERROR
+    assert calls == []
+    assert not run_dir.exists()
+    assert "outside --source-root" in capsys.readouterr().err
 
 
 def test_legacy_cli_does_not_trust_source_access_claimed_by_brief(
@@ -180,6 +260,90 @@ def test_legacy_cli_does_not_trust_source_access_claimed_by_brief(
     )
 
     assert captured["settings"].source_root is None
+
+
+def test_legacy_cli_requires_and_forwards_model_source_consent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    brief_path = tmp_path / "brief.yaml"
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    _write_brief(brief_path)
+    captured: list[AIWebAgentSettings] = []
+
+    def fake_run_ai_web_agent(
+        *,
+        brief_path: Path,
+        target_url: str,
+        settings: AIWebAgentSettings,
+    ) -> None:
+        _ = brief_path, target_url
+        captured.append(settings)
+
+    monkeypatch.setattr(cli, "run_ai_web_agent", fake_run_ai_web_agent)
+    base = ["--brief", str(brief_path), "--target-url", TARGET_URL]
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main([*base, "--allow-source-to-model"])
+
+    assert exc_info.value.code == ARGPARSE_ERROR
+    assert captured == []
+    assert "--allow-source-to-model requires --source-root" in capsys.readouterr().err
+
+    cli.main(
+        [
+            *base,
+            "--workspace-dir",
+            str(tmp_path / "workspace"),
+            "--source-root",
+            str(source_root),
+            "--allow-source-to-model",
+        ]
+    )
+
+    assert captured[0].source_root == source_root.resolve()
+    assert captured[0].allow_source_to_model is True
+
+
+def test_legacy_cli_rejects_workspace_inside_model_visible_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    brief_path = tmp_path / "brief.yaml"
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    workspace = source_root / "runs" / "workspace"
+    _write_brief(brief_path)
+    called = False
+
+    def unexpected_agent(**_kwargs: object) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(cli, "run_ai_web_agent", unexpected_agent)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "--brief",
+                str(brief_path),
+                "--target-url",
+                TARGET_URL,
+                "--workspace-dir",
+                str(workspace),
+                "--source-root",
+                str(source_root),
+                "--allow-source-to-model",
+            ]
+        )
+
+    assert exc_info.value.code == ARGPARSE_ERROR
+    assert called is False
+    assert not workspace.exists()
+    assert "outside --source-root" in capsys.readouterr().err
 
 
 def test_attack_cli_rejects_missing_source_before_starting_child(
@@ -235,3 +399,107 @@ def test_agent_rejects_missing_source_before_opening_workspace(
         )
 
     assert workspace_opened is False
+
+
+def test_agent_rejects_workspace_inside_model_visible_source_before_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    brief_path = tmp_path / "brief.yaml"
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source_root.joinpath("app.py").write_text("APP = True\n", encoding="utf-8")
+    workspace = source_root / "runs" / "workspace"
+    _write_brief(brief_path)
+    captured = False
+
+    def unexpected_capture(_root: Path) -> None:
+        nonlocal captured
+        captured = True
+
+    monkeypatch.setattr(ai_agent, "capture_repository", unexpected_capture)
+
+    with pytest.raises(ValueError, match="workspace outside --source-root"):
+        ai_agent.run_ai_web_agent(
+            brief_path=brief_path,
+            target_url=TARGET_URL,
+            settings=AIWebAgentSettings(
+                source_root=source_root,
+                allow_source_to_model=True,
+                workspace_dir=workspace,
+            ),
+        )
+
+    assert captured is False
+    assert not workspace.exists()
+
+
+def test_agent_rejects_memory_database_inside_model_visible_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    brief_path = tmp_path / "brief.yaml"
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source_root.joinpath("app.py").write_text("APP = True\n", encoding="utf-8")
+    _write_brief(brief_path)
+    captured = False
+
+    def unexpected_capture(_root: Path) -> None:
+        nonlocal captured
+        captured = True
+
+    monkeypatch.setattr(ai_agent, "capture_repository", unexpected_capture)
+
+    with pytest.raises(ValueError, match="memory database outside --source-root"):
+        ai_agent.run_ai_web_agent(
+            brief_path=brief_path,
+            target_url=TARGET_URL,
+            settings=AIWebAgentSettings(
+                source_root=source_root,
+                allow_source_to_model=True,
+                workspace_dir=tmp_path / "workspace",
+                memory=MemoryRunSettings(
+                    mode="read",
+                    db_path=source_root / "memory.db",
+                    min_confidence=0.0,
+                ),
+            ),
+        )
+
+    assert captured is False
+    assert not source_root.joinpath("memory.db").exists()
+
+
+def test_agent_rejects_tool_network_evidence_inside_model_visible_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    brief_path = tmp_path / "brief.yaml"
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source_root.joinpath("app.py").write_text("APP = True\n", encoding="utf-8")
+    _write_brief(brief_path)
+    evidence_path = source_root / "network-evidence.json"
+    monkeypatch.setenv("RAVAGE_TOOL_NETWORK_EVIDENCE_PATH", str(evidence_path))
+    captured = False
+
+    def unexpected_capture(_root: Path) -> None:
+        nonlocal captured
+        captured = True
+
+    monkeypatch.setattr(ai_agent, "capture_repository", unexpected_capture)
+
+    with pytest.raises(ValueError, match="tool network evidence outside --source-root"):
+        ai_agent.run_ai_web_agent(
+            brief_path=brief_path,
+            target_url=TARGET_URL,
+            settings=AIWebAgentSettings(
+                source_root=source_root,
+                allow_source_to_model=True,
+                workspace_dir=tmp_path / "workspace",
+            ),
+        )
+
+    assert captured is False
+    assert not evidence_path.exists()

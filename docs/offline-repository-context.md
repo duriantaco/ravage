@@ -8,16 +8,23 @@ title: Offline Repository Context
 review. It includes UTF-8 source, configuration, and documentation across file
 extensions. It does not execute repository code or contact a model or network.
 The dedicated `ravage review` agent uses this snapshot through a closed set of
-read-only context actions. The target-facing attack agent remains separate.
+read-only context actions. The attack agent can use the same bounded reader only
+when the operator explicitly enables model source access.
 
 ```python
 from pathlib import Path
 
-from ravage.repository_context import capture_repository
+from ravage.repository_context import ContextIgnorePolicy, capture_repository
 
 context = capture_repository(Path("/path/to/repository"))
 matches = context.search("formatGreeting")
 excerpt = context.excerpt("frontend/greetings.ts", start_line=1, end_line=3)
+
+# Explicitly include files matched by project-local .gitignore rules.
+unfiltered = capture_repository(
+    Path("/path/to/repository"),
+    ignore_policy=ContextIgnorePolicy.NONE,
+)
 ```
 
 Run a bounded review with the default local model profile:
@@ -52,23 +59,78 @@ usage, and context-coverage counters for comparing recorded run settings without
 copying the objective text into the artifact. Retain the model configuration,
 Ravage revision, repository revision, and objective separately for reproduction.
 
+## Attack source navigation
+
+`ravage attack` keeps source text away from the model unless both
+`--source-root` and `--allow-source-to-model` are supplied. A hosted route sends
+the file lists, search results, and excerpts the model requests to that provider.
+The repository is captured before run artifacts are created, and the run,
+workspace, audit database, report, traffic ledger, and memory database must be
+outside the source root. The configured tool-network evidence file is checked as
+well. Programmatic callers remain responsible for keeping any custom runtime or
+event-sink writes outside the source tree.
+
+```bash
+ravage attack brief.yaml \
+  --run-dir /tmp/ravage-run \
+  --source-root /path/to/repository \
+  --allow-source-to-model
+```
+
+The model can list files and omissions, search literal text, and request bounded
+excerpts. File contents and model lookup literals exist only in the next model
+request. Durable receipts retain the snapshot identity, usage counts, and
+structural paths and coordinates; they omit file contents, per-file and excerpt
+digests, errors, and search terms. A resume must use the same snapshot, consent
+flag, and cumulative observation budget.
+
+Source is hypothesis material and never target evidence or proof. Immediately
+after a source observation, the model may issue another source action, a
+catalogued native probe, or a bodyless `GET`, `HEAD`, or `OPTIONS` request. A
+exact static route path whose structural lines appeared in that observation may
+be used so the agent can test hidden application routes. Empty-valued query-field
+names are allowed only when they are structurally tied to the same handler and
+visible in that observation. Query values, URL fragments, headers, bodies,
+commands, findings, and narrative fields are blocked on that turn. Any security
+conclusion still requires evidence returned by the live target or a trusted typed
+validator.
+
 Search is case-sensitive literal text lookup. It returns matching lines with
 one-based line/column positions, repository-relative paths, and file content
 digests. Matching text is not proof that two symbols refer to the same
 implementation. Excerpts preserve captured text and line endings.
 
 All reads after capture use the immutable snapshot. A later capture produces a
-different identity when included content or omission records change. Files are
-checked for changes while being read; this is not an atomic Git checkout.
+different identity when included content or omission records change. Captured
+root and nested `.gitignore` files are included in that identity, so changing an
+ignore rule or comment changes the snapshot even when the resulting inventory is
+otherwise the same. Files are checked for changes while being read; this is not
+an atomic Git checkout.
 
-`ContextLimits` bounds file count, total bytes, directory entries, and depth
-(the root counts as depth one). Exceeding those limits raises `ContextLimitError`
-without returning a partial snapshot. Oversized individual files, symlinks,
-binary/non-UTF-8 files, build/dependency directories, and common credential-file
-names appear in `context.omissions`. These exclusions are not a general secret
-redactor, and capture does not implement `.gitignore` semantics. Review omissions
-when deciding whether enough context is available. Descriptor-based traversal
-currently requires POSIX, including Linux and macOS.
+By default, root and nested project-local `.gitignore` files are applied with Git
+wildmatch ordering and negation semantics. Ignored files and directories appear
+in `context.omissions` as `gitignored_file` and `gitignored_directory`.
+Directories are pruned before descendant entries consume capture limits. Ravage
+does not read global Git configuration or excludes, invoke Git, or use ignore
+files outside the supplied root. `ContextIgnorePolicy.NONE` disables project
+ignore matching. Built-in VCS/dependency-directory and credential-file exclusions
+always take precedence over project rules.
+
+Ignore files are opened relative to the traversed directory descriptor without
+following symlinks, checked for replacement while read, and required to be valid,
+bounded UTF-8 text. Pattern lines that Git treats as malformed no-ops remain
+no-ops. A file with invalid encoding or NUL bytes, or an oversized, non-regular,
+or changing ignore file, aborts capture rather than returning a context based on
+incomplete rules.
+
+`ContextLimits` defaults to 10,000 files, 64 MiB total file content, 100,000
+directory entries, 512 KiB per file, and depth 32 (the root counts as depth one).
+Exceeding a hard limit raises `ContextLimitError` without returning a partial
+snapshot. Oversized individual files, symlinks, binary/non-UTF-8 files,
+build/dependency directories, and common credential-file names appear in
+`context.omissions`. These exclusions are not a general secret redactor. Review
+omissions when deciding whether enough context is available. Descriptor-based
+traversal currently requires POSIX, including Linux and macOS.
 
 Search results mark additional matches with `truncated=True`. Long matching
 lines return a bounded window around the match with its starting column and a
@@ -95,14 +157,16 @@ The fixed fixture contains eight harmless Python, TypeScript/TSX, JSON, YAML,
 and Markdown files. Four lookup cases assert exact references for Python
 definitions/imports/checks, TypeScript definitions/imports/components,
 configuration/documentation, and absent text. Additional cases cover content
-identity, Unicode and line endings, omissions, changing files, and resource
-bounds. The fixtures and expected references are separate from the reader.
+identity, Unicode and line endings, project-ignore ordering and negation,
+omissions, changing files, and resource bounds. The fixtures and expected
+references are separate from the reader.
 
-The existing Python source analyzer reads three of these eight files, as its
+The Python source analyzer reads three of these eight files, as its
 documented contract requires. This reader exposes all eight. That difference
 measures file-context breadth; it is not a vulnerability-detection score, a
 semantic retrieval evaluation, or a Strix comparison. The review regressions
 prove that model-selected searches and excerpts reach the model and that final
 candidates bind to captured evidence. They do not establish improved vulnerability
-detection. The existing source-guided attack analyzer and its live-evidence rules
-are unchanged.
+detection. Attack regressions separately verify consent, transient source
+observations, snapshot-bound resume, and source-guided live requests; they do not
+establish a recall gain.

@@ -39,6 +39,7 @@ from ravage.agent_core.agent_state import (
 )
 from ravage.agent_core.ai_agent import (
     AIWebAgentSettings,
+    assert_source_output_paths_outside_root,
     resolve_source_root,
     route_has_paid_transport_risk,
     run_ai_web_agent,
@@ -405,6 +406,14 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
         type=Path,
         help="local source directory for source-assisted analysis",
     )
+    parser.add_argument(
+        "--allow-source-to-model",
+        action="store_true",
+        help=(
+            "allow the selected model to inspect bounded text from --source-root; "
+            "hosted model routes transmit requested source excerpts"
+        ),
+    )
     parser.add_argument("--resume-from", type=Path)
     parser.add_argument("--agent", choices=["ai-web"], default="ai-web")
     parser.add_argument(
@@ -535,6 +544,8 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
         args.source_root = resolve_source_root(explicit=args.source_root)
     except ValueError as exc:
         parser.error(str(exc))
+    if args.allow_source_to_model and args.source_root is None:
+        parser.error("--allow-source-to-model requires --source-root")
     args.identity = _selected_attack_identity(
         parser,
         brief=brief,
@@ -568,6 +579,18 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
         if args.resume_from is not None
         else Path("runs/ravage-agent/workspace")
     )
+    try:
+        assert_source_output_paths_outside_root(
+            source_root=args.source_root,
+            allow_source_to_model=args.allow_source_to_model,
+            paths={
+                "workspace": traffic_workspace,
+                "audit database": args.db_path or traffic_workspace / "audit.db",
+                "report": args.report_path,
+            },
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.resume_from is not None or (traffic_workspace / "working_state.json").is_file():
         _inherit_resume_traffic_policy_args(
             parser,
@@ -668,6 +691,7 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
             resume_from=args.resume_from,
             workspace_dir=args.workspace_dir,
             source_root=args.source_root,
+            allow_source_to_model=args.allow_source_to_model,
             model_config=args.model_config,
             model_profile=args.model_profile,
             model_tier=args.model_tier,
@@ -2015,6 +2039,14 @@ def _attack(  # noqa: C901, PLR0912, PLR0915 - CLI options are intentionally exp
         help="local source directory for source-assisted analysis",
     )
     parser.add_argument(
+        "--allow-source-to-model",
+        action="store_true",
+        help=(
+            "allow the selected model to inspect bounded text from --source-root; "
+            "hosted model routes transmit requested source excerpts"
+        ),
+    )
+    parser.add_argument(
         "--resume-from",
         type=Path,
         help=("existing run directory, workspace, working_state.json, or report to resume"),
@@ -2184,6 +2216,8 @@ def _attack(  # noqa: C901, PLR0912, PLR0915 - CLI options are intentionally exp
         parsed.source_root = resolve_source_root(explicit=parsed.source_root)
     except ValueError as exc:
         parser.error(str(exc))
+    if parsed.allow_source_to_model and parsed.source_root is None:
+        parser.error("--allow-source-to-model requires --source-root")
     parsed.identity = _selected_attack_identity(
         parser,
         brief=brief,
@@ -2302,6 +2336,19 @@ def _attack(  # noqa: C901, PLR0912, PLR0915 - CLI options are intentionally exp
         report_path = run_dir / "report.json"
     if report_path is not None:
         _validate_report_output(parser, report_path)
+    try:
+        assert_source_output_paths_outside_root(
+            source_root=parsed.source_root,
+            allow_source_to_model=parsed.allow_source_to_model,
+            paths={
+                "run directory": run_dir,
+                "workspace": workspace_dir,
+                "audit database": db_path,
+                "report": report_path,
+            },
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     _assert_fresh_attack_workspace(
         run_dir=run_dir,
         workspace_dir=workspace_dir,
@@ -2774,6 +2821,8 @@ def _local_attack_command(  # noqa: C901, PLR0912, PLR0913
         command.extend(["--model-config", str(parsed.model_config)])
     if parsed.source_root is not None:
         command.extend(["--source-root", str(parsed.source_root)])
+    if getattr(parsed, "allow_source_to_model", False):
+        command.append("--allow-source-to-model")
     if parsed.identity:
         command.extend(["--identity", str(parsed.identity)])
     if parsed.identity and auth_env_file is not None:
