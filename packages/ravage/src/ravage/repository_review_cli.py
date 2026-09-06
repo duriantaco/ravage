@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from ravage.repository_review import ReviewModelClient
 
 
-class _ProviderReviewClient:
+class ProviderReviewClient:
     """Narrow adapter around Ravage's existing model transport."""
 
     def complete(
@@ -127,7 +127,7 @@ def handle_repository_review_command(
             max_turns=parsed.max_turns,
             max_cost_usd=parsed.max_cost_usd,
         )
-        route = _ready_route(
+        route = ready_repository_review_route(
             model_config=parsed.model_config,
             model_profile=parsed.model_profile,
             model_tier=parsed.model_tier,
@@ -143,7 +143,7 @@ def handle_repository_review_command(
         result = run_repository_review(
             source_root=parsed.source_root,
             route=route,
-            client=model_client or _ProviderReviewClient(),
+            client=model_client or ProviderReviewClient(),
             objective=objective,
             max_turns=parsed.max_turns,
             max_cost_usd=parsed.max_cost_usd,
@@ -162,7 +162,7 @@ def handle_repository_review_command(
     return payload
 
 
-def _ready_route(
+def ready_repository_review_route(
     *,
     model_config: Path | None,
     model_profile: str,
@@ -194,4 +194,8 @@ def _ready_route(
     raise RepositoryReviewError(message)
 
 
-__all__ = ["handle_repository_review_command"]
+__all__ = [
+    "ProviderReviewClient",
+    "handle_repository_review_command",
+    "ready_repository_review_route",
+]
