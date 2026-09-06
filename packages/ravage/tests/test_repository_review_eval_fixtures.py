@@ -17,9 +17,13 @@ _REPOSITORY_ROOT = Path(__file__).parents[3]
 _TESTS_ROOT = Path(__file__).parent
 _FIXTURE_COLLECTION = _TESTS_ROOT / "fixtures" / "repository_review_eval"
 _MANIFEST_PATH = _TESTS_ROOT / "repository_review_eval_manifest.json"
-_EXPECTED_CASE_COUNT = 8
-_EXPECTED_FILES_PER_CASE = 3
-_EXPECTED_PAIR_SIZE = 2
+_EXPECTED_CASE_COUNT = 10
+_EXPECTED_SMALL_CASE_FILES = 3
+_HARD_PAIR = ("juniper", "keystone")
+_HARD_CASE_FILES = 39
+_MIN_HARD_DECOYS = 30
+_MAX_HARD_DECOYS = 60
+_SEEDED_SOURCE_CANDIDATE_LIMIT = 8
 _EXPECTED_CLASSES = {
     "command_injection",
     "idor",
@@ -31,6 +35,7 @@ _PAIRS = (
     ("cinder", "delta"),
     ("elm", "flint"),
     ("grove", "harbor"),
+    _HARD_PAIR,
 )
 _STATUS_LABELS = ("control", "insecure", "safe", "vulnerable")
 _ANCHORS = {
@@ -74,6 +79,16 @@ _ANCHORS = {
         13,
         "sha256:b8ed173e9c329a06800b1d9b9efc8b0e200f80aae767e9584bfbf07141372eca",
     ),
+    "juniper": (
+        "src/reports/paths.py",
+        7,
+        "sha256:8be483c0c569e500fddf73e09a73cfaa8cdd3f8b1c520883c4f6b9e28fdc5f8b",
+    ),
+    "keystone": (
+        "src/reports/paths.py",
+        9,
+        "sha256:b8ed173e9c329a06800b1d9b9efc8b0e200f80aae767e9584bfbf07141372eca",
+    ),
 }
 
 
@@ -99,10 +114,10 @@ def test_repository_review_eval_manifest_binds_neutral_paired_fixtures() -> None
         assert not any(label in case_id.casefold() for label in _STATUS_LABELS)
         assert not _MANIFEST_PATH.resolve().is_relative_to(case_root)
         assert case_root.is_dir()
-        assert (
-            len([path for path in case_root.rglob("*") if path.is_file()])
-            == _EXPECTED_FILES_PER_CASE
+        expected_file_count = (
+            _HARD_CASE_FILES if case_id in _HARD_PAIR else _EXPECTED_SMALL_CASE_FILES
         )
+        assert len([path for path in case_root.rglob("*") if path.is_file()]) == expected_file_count
         assert not any(path.is_symlink() for path in case_root.rglob("*"))
         assert case["snapshot_id"] == capture_repository(case_root).snapshot_id
 
@@ -132,14 +147,21 @@ def test_repository_review_eval_manifest_binds_neutral_paired_fixtures() -> None
         assert "ground_truth" not in reviewed_text
         assert "expected_class_finding" not in reviewed_text
         assert "noqa" not in reviewed_text
+        assert case_id.casefold() not in reviewed_text
+        assert not any(label in reviewed_text for label in _STATUS_LABELS)
         pairs[class_name].append(case)
 
     assert set(pairs) == _EXPECTED_CLASSES
-    for members in pairs.values():
-        assert len(members) == _EXPECTED_PAIR_SIZE
-        assert sorted(bool(member["expected"]) for member in members) == [False, True]
-
+    case_by_id = {str(case["id"]): case for case in cases}
+    assert {case_id for pair in _PAIRS for case_id in pair} == set(case_by_id)
     for first, second in _PAIRS:
+        first_case = case_by_id[first]
+        second_case = case_by_id[second]
+        assert first_case["evaluated_classes"] == second_case["evaluated_classes"]
+        assert sorted((bool(first_case["expected"]), bool(second_case["expected"]))) == [
+            False,
+            True,
+        ]
         assert (_FIXTURE_COLLECTION / first / "README.md").read_bytes() == (
             _FIXTURE_COLLECTION / second / "README.md"
         ).read_bytes()
@@ -157,16 +179,73 @@ def test_idor_pair_shares_explicit_data_access_semantics() -> None:
     assert not (_FIXTURE_COLLECTION / "boreal" / "src" / "orders" / "labels.ts").exists()
 
 
+def test_hard_pair_differs_only_at_cross_file_path_resolution() -> None:
+    first_root = _FIXTURE_COLLECTION / _HARD_PAIR[0]
+    second_root = _FIXTURE_COLLECTION / _HARD_PAIR[1]
+    first_files = {
+        path.relative_to(first_root).as_posix(): path
+        for path in first_root.rglob("*")
+        if path.is_file()
+    }
+    second_files = {
+        path.relative_to(second_root).as_posix(): path
+        for path in second_root.rglob("*")
+        if path.is_file()
+    }
+
+    assert set(first_files) == set(second_files)
+    differing = {
+        relative
+        for relative in first_files
+        if first_files[relative].read_bytes() != second_files[relative].read_bytes()
+    }
+    assert differing == {"src/reports/paths.py"}
+    decoys = sorted(path for path in first_files if path.startswith("src/modules/"))
+    assert _MIN_HARD_DECOYS <= len(decoys) <= _MAX_HARD_DECOYS
+    assert all(
+        first_files[relative].read_bytes() == second_files[relative].read_bytes()
+        for relative in decoys
+    )
+
+    handler = first_files["src/reports/download.py"].read_text(encoding="utf-8")
+    assert "resolve_report_path(requested_name)" in handler
+    assert "send_file(candidate)" in handler
+    first_resolver = first_files["src/reports/paths.py"].read_text(encoding="utf-8")
+    second_resolver = second_files["src/reports/paths.py"].read_text(encoding="utf-8")
+    assert "return REPORT_ROOT / requested_name" in first_resolver
+    assert "candidate = (root / requested_name).resolve()" in second_resolver
+    assert "if not candidate.is_relative_to(root)" in second_resolver
+
+
 def test_python_route_pairs_reach_the_structured_source_analyzer() -> None:
+    analyses = {
+        case_id: analyze_source_root(_FIXTURE_COLLECTION / case_id)
+        for case_id in ("cinder", "delta", "grove", "harbor", *_HARD_PAIR)
+    }
     candidates = {
-        case_id: {
-            (candidate.family, candidate.route)
-            for candidate in analyze_source_root(_FIXTURE_COLLECTION / case_id).candidates
-        }
-        for case_id in ("cinder", "delta", "grove", "harbor")
+        case_id: {(candidate.family, candidate.route) for candidate in analysis.candidates}
+        for case_id, analysis in analyses.items()
     }
 
     assert ("command_injection", "/media/preview") in candidates["cinder"]
     assert ("command_injection", "/media/preview") not in candidates["delta"]
     assert ("path_traversal", "/exports/download") in candidates["grove"]
     assert ("path_traversal", "/exports/download") in candidates["harbor"]
+    assert ("path_traversal", "/reports/download") in candidates["juniper"]
+    assert ("path_traversal", "/reports/download") in candidates["keystone"]
+
+    hard_candidates = {
+        case_id: tuple(
+            (candidate.family, candidate.relative_file, candidate.line, candidate.route)
+            for candidate in analyses[case_id].candidates
+        )
+        for case_id in _HARD_PAIR
+    }
+    assert hard_candidates["juniper"] == hard_candidates["keystone"]
+    target_index = next(
+        index
+        for index, candidate in enumerate(analyses["juniper"].candidates)
+        if candidate.route == "/reports/download"
+    )
+    assert len(analyses["juniper"].candidates) == _SEEDED_SOURCE_CANDIDATE_LIMIT + 1
+    assert target_index == _SEEDED_SOURCE_CANDIDATE_LIMIT
