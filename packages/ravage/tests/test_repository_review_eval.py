@@ -5,17 +5,38 @@
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
+from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import pytest
+from ravage.model_core.providers import ResolvedModelRoute
+from ravage.repository_context import RepositoryContext, capture_repository
+from ravage.repository_review import (
+    RepositoryReviewResult,
+    ReviewEvidence,
+    ReviewMessage,
+    ReviewReply,
+    run_repository_review,
+)
 from ravage.repository_review_eval import (
     MANIFEST_SCHEMA_VERSION,
     REVIEW_SCHEMA_VERSION,
+    RepositoryReviewEvalCase,
     RepositoryReviewEvalInputError,
     RepositoryReviewEvalManifest,
     aggregate_repository_review_scores,
     score_repository_review,
+    score_repository_review_result,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from pathlib import Path
+
+
+_TEST_SNAPSHOT_ID = "sha256:" + "a" * 64
 
 
 def _expected(
@@ -44,6 +65,7 @@ def _case(
     expected: list[dict[str, object]],
     *,
     evaluated_classes: list[str] | None = None,
+    snapshot_id: str = _TEST_SNAPSHOT_ID,
 ) -> dict[str, object]:
     selected_classes = (
         evaluated_classes or sorted({str(item["vuln_class"]) for item in expected}) or ["idor"]
@@ -51,6 +73,7 @@ def _case(
     return {
         "id": case_id,
         "source_root": f"eval/repository_review/{case_id}",
+        "snapshot_id": snapshot_id,
         "evaluated_classes": selected_classes,
         "expected": expected,
     }
@@ -97,6 +120,108 @@ def _review(*findings: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _route() -> ResolvedModelRoute:
+    return ResolvedModelRoute(
+        requested_tier="low",
+        selected_tier="low",
+        ordinal=1,
+        provider="ollama",
+        model="scripted-eval-model",
+        base_url="http://127.0.0.1:11434/v1",
+        api_key_env=None,
+        missing_env=(),
+        reasoning_effort=None,
+        max_output_tokens=256,
+        output_token_limit_parameter="max_tokens",  # noqa: S106 - API parameter name.
+        input_cost_per_1m_tokens=None,
+        output_cost_per_1m_tokens=None,
+        timeout_seconds=5.0,
+        max_retries=0,
+    )
+
+
+class _TrustedReviewClient:
+    def __init__(self) -> None:
+        self._replies = [
+            {
+                "action": "excerpt",
+                "args": {"path": "src/handler.py", "start_line": 4, "end_line": 8},
+            },
+            {
+                "action": "final",
+                "args": {
+                    "summary": "Review complete.",
+                    "findings": [
+                        {
+                            "vuln_class": "idor",
+                            "title": "Object lookup is not scoped",
+                            "severity": "high",
+                            "confidence": "high",
+                            "description": "The lookup uses only a request object identifier.",
+                            "recommendation": "Constrain the lookup to the authenticated account.",
+                            "evidence_ids": ["excerpt-1"],
+                        }
+                    ],
+                },
+            },
+        ]
+
+    def complete(
+        self,
+        *,
+        messages: Sequence[ReviewMessage],
+        route: ResolvedModelRoute,
+    ) -> ReviewReply:
+        del messages, route
+        return ReviewReply(content=json.dumps(self._replies.pop(0)))
+
+
+def _trusted_review(
+    tmp_path: Path,
+) -> tuple[RepositoryReviewEvalCase, RepositoryReviewResult, RepositoryContext]:
+    source = tmp_path / "src" / "handler.py"
+    source.parent.mkdir()
+    source.write_text(
+        """from datastore import records
+
+
+def get_record(request):
+    record_id = request.path_params["record_id"]
+    record = records.find_by_id(record_id)
+    if record is None:
+        return None
+    return record
+""",
+        encoding="utf-8",
+    )
+    context = capture_repository(tmp_path)
+    case = RepositoryReviewEvalManifest.from_mapping(
+        _manifest(
+            _case(
+                "trusted-review",
+                [_expected("record-owner", "idor", start_line=6, end_line=6)],
+                snapshot_id=context.snapshot_id,
+            )
+        )
+    ).cases[0]
+    result = run_repository_review(
+        source_root=tmp_path,
+        route=_route(),
+        client=_TrustedReviewClient(),
+        max_turns=2,
+        source_candidates_enabled=False,
+    )
+    return case, result, context
+
+
+def _replace_first_evidence(
+    result: RepositoryReviewResult,
+    evidence: ReviewEvidence,
+) -> RepositoryReviewResult:
+    finding = replace(result.findings[0], evidence=(evidence,))
+    return replace(result, findings=(finding,))
+
+
 def test_manifest_parses_strict_ground_truth_and_clean_controls() -> None:
     payload = _manifest(
         _case("idor-vulnerable", [_expected("invoice-owner", "idor")]),
@@ -106,6 +231,7 @@ def test_manifest_parses_strict_ground_truth_and_clean_controls() -> None:
     manifest = RepositoryReviewEvalManifest.from_mapping(payload)
 
     assert manifest.to_json() == payload
+    assert manifest.cases[0].snapshot_id == _TEST_SNAPSHOT_ID
     assert manifest.cases[0].expected[0].locations[0].path == "src/handler.py"
     assert manifest.cases[1].expected == ()
 
@@ -124,6 +250,10 @@ def test_manifest_parses_strict_ground_truth_and_clean_controls() -> None:
         (
             lambda payload: payload["cases"][0].update({"source_root": "../escape"}),
             "relative POSIX path",
+        ),
+        (
+            lambda payload: payload["cases"][0].update({"snapshot_id": "sha256:not-a-digest"}),
+            "case snapshot_id",
         ),
         (
             lambda payload: payload["cases"][0]["expected"][0].update(
@@ -178,6 +308,78 @@ def test_manifest_rejects_duplicate_case_and_vulnerability_ids() -> None:
     )
     with pytest.raises(RepositoryReviewEvalInputError, match="vulnerability IDs must be unique"):
         RepositoryReviewEvalManifest.from_mapping(duplicate_findings)
+
+
+def test_trusted_result_scoring_binds_valid_evidence_to_captured_bytes(tmp_path: Path) -> None:
+    case, result, context = _trusted_review(tmp_path)
+
+    score = score_repository_review_result(case, result, context)
+
+    assert score.metrics.true_positives == 1
+    assert score.metrics.false_positives == 0
+    assert score.metrics.false_negatives == 0
+
+
+def test_trusted_result_scoring_rejects_mixed_snapshots(tmp_path: Path) -> None:
+    case, result, context = _trusted_review(tmp_path)
+    other_snapshot = "sha256:" + "f" * 64
+
+    with pytest.raises(RepositoryReviewEvalInputError, match="case snapshot_id"):
+        score_repository_review_result(
+            replace(case, snapshot_id=other_snapshot),
+            result,
+            context,
+        )
+    with pytest.raises(RepositoryReviewEvalInputError, match="result snapshot_id"):
+        score_repository_review_result(
+            case,
+            replace(result, snapshot_id=other_snapshot),
+            context,
+        )
+
+    original = result.findings[0].evidence[0]
+    forged = _replace_first_evidence(
+        result,
+        replace(original, snapshot_id=other_snapshot),
+    )
+    with pytest.raises(RepositoryReviewEvalInputError, match="mixed snapshot_id"):
+        score_repository_review_result(case, forged, context)
+
+
+def test_trusted_result_scoring_rejects_forged_evidence_digests(tmp_path: Path) -> None:
+    case, result, context = _trusted_review(tmp_path)
+    original = result.findings[0].evidence[0]
+    forged_file = _replace_first_evidence(
+        result,
+        replace(original, file_digest="sha256:" + "f" * 64),
+    )
+    forged_text = _replace_first_evidence(
+        result,
+        replace(original, text_digest="sha256:" + "f" * 64),
+    )
+
+    with pytest.raises(RepositoryReviewEvalInputError, match="file digest"):
+        score_repository_review_result(case, forged_file, context)
+    with pytest.raises(RepositoryReviewEvalInputError, match="text digest"):
+        score_repository_review_result(case, forged_text, context)
+
+
+def test_trusted_result_scoring_rejects_forged_range_and_text(tmp_path: Path) -> None:
+    case, result, context = _trusted_review(tmp_path)
+    original = result.findings[0].evidence[0]
+    forged_range = _replace_first_evidence(
+        result,
+        replace(original, end_line=2**31 - 1),
+    )
+    forged_text = _replace_first_evidence(
+        result,
+        replace(original, text=original.text + "forged\n"),
+    )
+
+    with pytest.raises(RepositoryReviewEvalInputError, match="range"):
+        score_repository_review_result(case, forged_range, context)
+    with pytest.raises(RepositoryReviewEvalInputError, match="text does not match"):
+        score_repository_review_result(case, forged_text, context)
 
 
 def test_scoring_uses_maximum_one_to_one_class_and_line_overlap() -> None:

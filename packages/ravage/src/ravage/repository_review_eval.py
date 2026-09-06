@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
@@ -12,9 +13,14 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Final
 
-from ravage.repository_review import REPOSITORY_REVIEW_SCHEMA
+from ravage.repository_context import ContextLimitError, RepositoryContext
+from ravage.repository_review import (
+    REPOSITORY_REVIEW_SCHEMA,
+    RepositoryReviewResult,
+    ReviewEvidence,
+)
 
-MANIFEST_SCHEMA_VERSION: Final = "ravage.repository-review-eval-manifest.v1"
+MANIFEST_SCHEMA_VERSION: Final = "ravage.repository-review-eval-manifest.v2"
 REVIEW_SCHEMA_VERSION: Final = REPOSITORY_REVIEW_SCHEMA
 
 _MAX_CASES = 1_024
@@ -27,6 +33,7 @@ _MAX_PATH_CHARS = 1_000
 _MAX_LINE = 2**31 - 1
 _OPAQUE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _VULN_CLASS_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
+_SHA256_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class RepositoryReviewEvalInputError(ValueError):
@@ -112,6 +119,7 @@ class RepositoryReviewEvalCase:
 
     case_id: str
     source_root: str
+    snapshot_id: str
     evaluated_classes: tuple[str, ...]
     expected: tuple[ExpectedVulnerability, ...]
 
@@ -119,7 +127,7 @@ class RepositoryReviewEvalCase:
     def from_mapping(cls, payload: Mapping[str, object]) -> RepositoryReviewEvalCase:
         _require_exact_keys(
             payload,
-            {"id", "source_root", "evaluated_classes", "expected"},
+            {"id", "source_root", "snapshot_id", "evaluated_classes", "expected"},
             "evaluation case",
         )
         raw_evaluated_classes = payload.get("evaluated_classes")
@@ -151,6 +159,7 @@ class RepositoryReviewEvalCase:
         return cls(
             case_id=_opaque_id(payload.get("id"), "case id"),
             source_root=_relative_path(payload.get("source_root"), "case source_root"),
+            snapshot_id=_sha256_digest(payload.get("snapshot_id"), "case snapshot_id"),
             evaluated_classes=evaluated_classes,
             expected=expected,
         )
@@ -159,6 +168,7 @@ class RepositoryReviewEvalCase:
         return {
             "id": self.case_id,
             "source_root": self.source_root,
+            "snapshot_id": self.snapshot_id,
             "evaluated_classes": list(self.evaluated_classes),
             "expected": [item.to_json() for item in self.expected],
         }
@@ -317,7 +327,11 @@ def score_repository_review(
     case: RepositoryReviewEvalCase,
     review: Mapping[str, object],
 ) -> RepositoryReviewCaseScore:
-    """Score a public repository-review result for a case's evaluated classes."""
+    """
+    Structurally score imported JSON without authenticating its provenance.
+
+    Call ``score_repository_review_result`` for trusted in-process evaluation.
+    """
     findings = _parse_review_findings(review)
     evaluated_classes = frozenset(case.evaluated_classes)
     evaluated_finding_indexes = tuple(
@@ -396,6 +410,70 @@ def score_repository_review(
             matches,
         ),
     )
+
+
+def score_repository_review_result(
+    case: RepositoryReviewEvalCase,
+    result: RepositoryReviewResult,
+    context: RepositoryContext,
+) -> RepositoryReviewCaseScore:
+    """Score an in-process result after binding every excerpt to captured bytes."""
+    if not isinstance(case, RepositoryReviewEvalCase):
+        raise TypeError("case must be a RepositoryReviewEvalCase")
+    if not isinstance(result, RepositoryReviewResult):
+        raise TypeError("result must be a RepositoryReviewResult")
+    if not isinstance(context, RepositoryContext):
+        raise TypeError("context must be a RepositoryContext")
+    if case.snapshot_id != context.snapshot_id:
+        raise RepositoryReviewEvalInputError(
+            "evaluation case snapshot_id does not match the captured repository context"
+        )
+    if result.snapshot_id != context.snapshot_id:
+        raise RepositoryReviewEvalInputError(
+            "repository-review result snapshot_id does not match the captured repository context"
+        )
+    for finding in result.findings:
+        for evidence in finding.evidence:
+            _validate_trusted_evidence(evidence, context)
+    return score_repository_review(case, result.to_json())
+
+
+def _validate_trusted_evidence(
+    evidence: ReviewEvidence,
+    context: RepositoryContext,
+) -> None:
+    if evidence.snapshot_id != context.snapshot_id:
+        raise RepositoryReviewEvalInputError(
+            f"review evidence {evidence.evidence_id!r} has a mixed snapshot_id"
+        )
+    source = next((item for item in context.files if item.path == evidence.path), None)
+    if source is None:
+        raise RepositoryReviewEvalInputError(
+            f"review evidence {evidence.evidence_id!r} path is absent from the captured context"
+        )
+    if evidence.file_digest != source.digest:
+        raise RepositoryReviewEvalInputError(
+            f"review evidence {evidence.evidence_id!r} file digest does not match captured bytes"
+        )
+    try:
+        captured = context.excerpt(
+            evidence.path,
+            start_line=evidence.start_line,
+            end_line=evidence.end_line,
+        )
+    except (ContextLimitError, KeyError, TypeError, ValueError) as exc:
+        raise RepositoryReviewEvalInputError(
+            f"review evidence {evidence.evidence_id!r} range is outside the captured context"
+        ) from exc
+    if evidence.text != captured.text:
+        raise RepositoryReviewEvalInputError(
+            f"review evidence {evidence.evidence_id!r} text does not match captured bytes"
+        )
+    expected_text_digest = "sha256:" + hashlib.sha256(captured.text.encode()).hexdigest()
+    if evidence.text_digest != expected_text_digest:
+        raise RepositoryReviewEvalInputError(
+            f"review evidence {evidence.evidence_id!r} text digest does not match captured bytes"
+        )
 
 
 def aggregate_repository_review_scores(
@@ -554,6 +632,12 @@ def _vuln_class(value: object) -> str:
     return value
 
 
+def _sha256_digest(value: object, label: str) -> str:
+    if not isinstance(value, str) or _SHA256_DIGEST_RE.fullmatch(value) is None:
+        raise RepositoryReviewEvalInputError(f"{label} must be a canonical sha256 digest")
+    return value
+
+
 def _relative_path(value: object, label: str) -> str:
     if (
         not isinstance(value, str)
@@ -594,4 +678,5 @@ __all__ = [
     "VulnerabilityClassScore",
     "aggregate_repository_review_scores",
     "score_repository_review",
+    "score_repository_review_result",
 ]

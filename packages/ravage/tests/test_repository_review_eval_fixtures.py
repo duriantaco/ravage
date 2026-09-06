@@ -6,6 +6,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, cast
 
+from ravage.repository_context import capture_repository
 from ravage.repository_review_eval import (
     MANIFEST_SCHEMA_VERSION,
     RepositoryReviewEvalManifest,
@@ -103,6 +104,7 @@ def test_repository_review_eval_manifest_binds_neutral_paired_fixtures() -> None
             == _EXPECTED_FILES_PER_CASE
         )
         assert not any(path.is_symlink() for path in case_root.rglob("*"))
+        assert case["snapshot_id"] == capture_repository(case_root).snapshot_id
 
         anchor_path, anchor_line, expected_digest = _ANCHORS[case_id]
         source_path = case_root / anchor_path
