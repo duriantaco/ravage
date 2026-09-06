@@ -193,8 +193,17 @@ def test_source_context_contract_accepts_only_the_isolated_schema() -> None:
     )
 
     assert source_context_action_error(payload) == ""
-    assert source_context_action_schema() == source_context_action_schema()
-    assert source_context_action_schema() is not source_context_action_schema()
+    schema = source_context_action_schema()
+    assert schema == source_context_action_schema()
+    assert schema is not source_context_action_schema()
+    examples = schema["valid_examples"]
+    assert isinstance(examples, list)
+    assert all(
+        isinstance(example, dict)
+        and isinstance(example.get("args"), dict)
+        and example.get("operation") not in example["args"]
+        for example in examples
+    )
 
 
 def test_source_context_resume_budget_and_action_receipt_exclude_lookup_literals(

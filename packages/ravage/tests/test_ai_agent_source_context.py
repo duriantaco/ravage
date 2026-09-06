@@ -213,6 +213,16 @@ def test_source_navigation_is_transient_and_can_drive_a_live_route(
     )
 
     assert "source_context_observation" not in _prompt(model, 0)
+    assert any(
+        "Before generic vulnerability probes, inspect the repository now" in instruction
+        for instruction in _prompt(model, 0)["tool_guidance"]
+    )
+    source_schema = _prompt(model, 0)["action_schema"]["source_context"]
+    assert source_schema["valid_examples"][0]["args"] == {
+        "prefix": "",
+        "cursor": 0,
+        "limit": 50,
+    }
     assert _prompt(model, 1)["source_context_observation"]["operation"] == "search"
     assert SEARCH_SENTINEL in json.dumps(_prompt(model, 1))
     assert _prompt(model, 2)["source_context_observation"]["operation"] == "excerpt"

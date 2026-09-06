@@ -176,14 +176,53 @@ def source_context_action_schema() -> dict[str, object]:
     return {
         "action": SOURCE_CONTEXT_ACTION,
         "task_id": "one active task id",
-        "operation": "list_files, list_omissions, search, or excerpt",
-        "args": {
-            "list_files": {"prefix": "", "cursor": 0, "limit": 50},
-            "list_omissions": {"cursor": 0, "limit": 50},
-            "search": {"query": "case-sensitive literal", "max_matches": 10},
-            "excerpt": {"path": "relative/path", "start_line": 1, "end_line": 40},
-        },
+        "operation": "choose exactly one: list_files, list_omissions, search, excerpt",
+        "args": "copy the flat args object from the matching valid example",
+        "valid_examples": [
+            {
+                "action": SOURCE_CONTEXT_ACTION,
+                "task_id": "surface-map",
+                "operation": "list_files",
+                "args": {"prefix": "", "cursor": 0, "limit": 50},
+            },
+            {
+                "action": SOURCE_CONTEXT_ACTION,
+                "task_id": "surface-map",
+                "operation": "list_omissions",
+                "args": {"cursor": 0, "limit": 50},
+            },
+            {
+                "action": SOURCE_CONTEXT_ACTION,
+                "task_id": "surface-map",
+                "operation": "search",
+                "args": {"query": "case-sensitive literal", "max_matches": 10},
+            },
+            {
+                "action": SOURCE_CONTEXT_ACTION,
+                "task_id": "surface-map",
+                "operation": "excerpt",
+                "args": {"path": "relative/path", "start_line": 1, "end_line": 40},
+            },
+        ],
+        "constraint": "args is flat; never place the operation name inside args",
     }
+
+
+def normalize_source_context_action(action: Mapping[str, object]) -> dict[str, object]:
+    """Canonicalize the one harmless operation wrapper models commonly emit."""
+    normalized = {str(key): value for key, value in action.items()}
+    operation = normalized.get("operation")
+    arguments = normalized.get("args")
+    if (
+        isinstance(operation, str)
+        and isinstance(arguments, Mapping)
+        and set(arguments) == {operation}
+        and isinstance(arguments.get(operation), Mapping)
+    ):
+        nested = arguments[operation]
+        assert isinstance(nested, Mapping)
+        normalized["args"] = {str(key): value for key, value in nested.items()}
+    return normalized
 
 
 def source_context_action_error(action: Mapping[str, object]) -> str:
@@ -595,6 +634,7 @@ __all__ = [
     "SOURCE_CONTEXT_TRUST",
     "SourceContextExecution",
     "SourceContextExecutor",
+    "normalize_source_context_action",
     "sanitize_source_context_action",
     "source_context_action_error",
     "source_context_action_schema",

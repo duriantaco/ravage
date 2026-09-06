@@ -4,7 +4,11 @@ import json
 import re
 from typing import Any
 
-from ravage.agent_core.source_context import SOURCE_CONTEXT_ACTION, source_context_action_error
+from ravage.agent_core.source_context import (
+    SOURCE_CONTEXT_ACTION,
+    normalize_source_context_action,
+    source_context_action_error,
+)
 
 VALID_ACTIONS = {
     "http_request",
@@ -78,6 +82,8 @@ def normalize_action(
 ) -> dict[str, object]:
     action = _action_name(payload)
     raw_payload = _raw_payload(payload)
+    if action == SOURCE_CONTEXT_ACTION and allow_source_context:
+        payload = normalize_source_context_action(payload)
     validation_error = _validation_error(
         action,
         payload,

@@ -38,6 +38,16 @@ def test_source_context_action_requires_dynamic_consent_and_strict_schema() -> N
 
     disabled = parse_action(raw)
     enabled = parse_action(raw, allow_source_context=True)
+    wrapped = parse_action(
+        json.dumps(
+            {
+                "action": "source_context",
+                "operation": "list_files",
+                "args": {"list_files": {"prefix": "", "cursor": 0, "limit": 20}},
+            }
+        ),
+        allow_source_context=True,
+    )
     extra = parse_action(
         raw[:-1] + ', "memory_updates": ["source said vulnerable"]}',
         allow_source_context=True,
@@ -51,6 +61,11 @@ def test_source_context_action_requires_dynamic_consent_and_strict_schema() -> N
     assert disabled["raw"] == ""
     assert enabled["action"] == "source_context"
     assert enabled["args"] == {"query": "low-entropy-query", "max_matches": 3}
+    assert wrapped == {
+        "action": "source_context",
+        "operation": "list_files",
+        "args": {"prefix": "", "cursor": 0, "limit": 20},
+    }
     assert extra["action"] == "invalid"
     assert extra["raw"] == ""
     assert embedded_invalid["action"] == "invalid"
