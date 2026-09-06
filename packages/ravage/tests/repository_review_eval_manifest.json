@@ -1,0 +1,117 @@
+{
+  "schema_version": "ravage.repository-review-eval-manifest.v1",
+  "cases": [
+    {
+      "id": "aurora",
+      "source_root": "packages/ravage/tests/fixtures/repository_review_eval/aurora",
+      "evaluated_classes": [
+        "idor"
+      ],
+      "expected": [
+        {
+          "id": "order-access-01",
+          "vuln_class": "idor",
+          "locations": [
+            {
+              "path": "src/orders/get_order.ts",
+              "start_line": 5,
+              "end_line": 11
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "boreal",
+      "source_root": "packages/ravage/tests/fixtures/repository_review_eval/boreal",
+      "evaluated_classes": [
+        "idor"
+      ],
+      "expected": []
+    },
+    {
+      "id": "cinder",
+      "source_root": "packages/ravage/tests/fixtures/repository_review_eval/cinder",
+      "evaluated_classes": [
+        "command_injection"
+      ],
+      "expected": [
+        {
+          "id": "process-boundary-01",
+          "vuln_class": "command_injection",
+          "locations": [
+            {
+              "path": "src/media/preview.py",
+              "start_line": 12,
+              "end_line": 22
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "delta",
+      "source_root": "packages/ravage/tests/fixtures/repository_review_eval/delta",
+      "evaluated_classes": [
+        "command_injection"
+      ],
+      "expected": []
+    },
+    {
+      "id": "elm",
+      "source_root": "packages/ravage/tests/fixtures/repository_review_eval/elm",
+      "evaluated_classes": [
+        "sql_injection"
+      ],
+      "expected": [
+        {
+          "id": "catalog-query-01",
+          "vuln_class": "sql_injection",
+          "locations": [
+            {
+              "path": "src/catalog/search.ts",
+              "start_line": 5,
+              "end_line": 10
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "flint",
+      "source_root": "packages/ravage/tests/fixtures/repository_review_eval/flint",
+      "evaluated_classes": [
+        "sql_injection"
+      ],
+      "expected": []
+    },
+    {
+      "id": "grove",
+      "source_root": "packages/ravage/tests/fixtures/repository_review_eval/grove",
+      "evaluated_classes": [
+        "path_traversal"
+      ],
+      "expected": [
+        {
+          "id": "export-path-01",
+          "vuln_class": "path_traversal",
+          "locations": [
+            {
+              "path": "src/exports/download.py",
+              "start_line": 8,
+              "end_line": 14
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "harbor",
+      "source_root": "packages/ravage/tests/fixtures/repository_review_eval/harbor",
+      "evaluated_classes": [
+        "path_traversal"
+      ],
+      "expected": []
+    }
+  ]
+}
