@@ -126,6 +126,8 @@ Primary operator commands:
   bounded graph route. Any remote target additionally requires
   `--authorized-remote-target`.
 - `ravage scan`: deterministic DAST without model calls.
+- `ravage review`: model-guided, read-only review over a frozen local source
+  snapshot with excerpt-bound candidate evidence.
 - `ravage traffic`: automatic base and agent-graph structured HTTP history,
   optional scoped Playwright capture, redacted inspection, single-request
   replay, and offline comparison.

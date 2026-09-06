@@ -26,6 +26,12 @@ Core runtime:
 
 - `packages/ravage/src/ravage/__main__.py`: CLI parser and command dispatch.
 - `packages/ravage/src/ravage/agent_core/ai_agent.py`: base `ai-web` runtime loop.
+- `packages/ravage/src/ravage/repository_context.py`: bounded, immutable local
+  text capture, literal search, and exact excerpts.
+- `packages/ravage/src/ravage/repository_review.py`: closed read-only model loop
+  for repository review candidates.
+- `packages/ravage/src/ravage/repository_review_cli.py`: `ravage review` command
+  and model-transport adapter.
 - `packages/ravage/src/ravage/agent_core/autonomous_graph/`: bounded graph
   coordinator, workers, budgets, scoped HTTP, evidence, and durable state.
 - `packages/ravage/src/ravage/dast_scan.py`: deterministic scan runtime.

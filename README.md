@@ -124,6 +124,23 @@ recognized bounded pattern was handled. It is not a claim of whole-program
 coverage. Resume requires the same source snapshot, analyzer contract, and
 candidate map.
 
+For read-only review across UTF-8 source, configuration, and documentation files,
+use the separate repository-review agent:
+
+~~~bash
+ravage review /path/to/application
+~~~
+
+It can autonomously list files and omissions, search text, and request bounded
+excerpts from one frozen snapshot. It has no target, shell, browser, probe, or
+project-execution tools. Results are model-authored source-review candidates with
+references generated from exact captured excerpts. The JSON keeps paths, lines,
+excerpt and file digests, and the snapshot identity; it does not persist the raw
+snapshot. The default model profile is local; selecting a hosted profile requires
+<code>--allow-paid-models</code> and sends requested source context to that
+provider. See
+[Offline Repository Context](docs/offline-repository-context.md).
+
 <code>--allow-paid-models</code> is an explicit acknowledgement that the run
 can incur provider charges. Model selection, local providers, and reproducible
 profiles are documented in [Model providers](docs/model-providers.md).
@@ -312,6 +329,7 @@ authenticated requests for run data and actions and binds to loopback by default
 | Deterministic recon and probes | <code>ravage scan</code> | No model required |
 | Model-driven assessment | <code>ravage attack</code> | Evidence-gated and scoped |
 | Source-guided validation | <code>ravage attack --source-root</code> | Local Flask/FastAPI mapping; live proof required |
+| Read-only repository review | <code>ravage review</code> | Frozen multi-language text context; source-backed candidates |
 | Managed authentication | <code>ravage auth</code> | Sessions, role-aware map, authorization matrix |
 | Traffic inspection and replay | <code>ravage traffic</code> | Scoped artifacts |
 | Knowledge skills | <code>ravage skills</code>, <code>ravage code-bug</code> | Advisory |

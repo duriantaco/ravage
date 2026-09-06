@@ -39,6 +39,20 @@ ravage doctor --workflow attack --brief brief.yaml
 ravage attack brief.yaml --allow-paid-models --report
 ```
 
+Review a local source tree through the separate read-only repository agent:
+
+```bash
+ravage review /path/to/application
+```
+
+The default profile uses loopback Ollama. The agent can list files and omissions,
+search text, and request bounded excerpts from one frozen snapshot; it cannot run
+the project or use target, shell, browser, probe, or attack tools. A hosted model
+requires `--allow-paid-models` and receives requested source context, including
+file and omission metadata, search-result lines, and excerpts. Results are
+model-authored review candidates with captured paths, lines, and content digests
+rather than validated exploit findings.
+
 Every attack writes the canonical private `RUN_DIR/report.json`, including
 incomplete or failed runs and runs without `--report`. This JSON-only
 finalization is atomic and sends no model or target requests. `--report` adds

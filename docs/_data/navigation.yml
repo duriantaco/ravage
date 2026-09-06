@@ -44,6 +44,9 @@ groups:
       - title: Knowledge Skills
         url: /skills.html
         description: Use and evaluate opt-in advisory workflow cards.
+      - title: Repository Review
+        url: /offline-repository-context.html
+        description: Run bounded model-guided review over a frozen local source snapshot.
       - title: Passive SATCOM Analysis
         url: /satcom.html
         description: Inspect offline TLE and CCSDS artifacts without transmitting.
