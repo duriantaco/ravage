@@ -1749,7 +1749,17 @@ def _without_source_narrative(  # noqa: PLR0911 - each safe action lane fails cl
         safe.pop("headers", None)
         if any(name in safe for name in ("body", "form", "json")):
             return _blocked_source_informed_action()
-        if "url" in safe or not isinstance(safe.get("path"), str) or not safe["path"]:
+        path = safe.get("path")
+        url = safe.get("url")
+        if path in (None, "") and isinstance(url, str):
+            # The general action schema calls this field `url`. Convert only a
+            # relative value; the structural policy below rejects origins and
+            # every other non-path shape.
+            safe["path"] = url
+            safe.pop("url", None)
+        elif "url" in safe:
+            return _blocked_source_informed_action()
+        if not isinstance(safe.get("path"), str) or not safe["path"]:
             return _blocked_source_informed_action()
         safe = {
             key: value

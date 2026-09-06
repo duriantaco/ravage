@@ -465,6 +465,17 @@ def test_post_source_gate_requires_visible_structural_path_and_query_names(
         navigation_policy=policy,
         source_observation=observation,
     )
+    allowed_general_schema = _without_source_narrative(
+        {
+            "action": "http_request",
+            "task_id": "surface-map",
+            "method": "GET",
+            "url": "/hidden?mode=",
+        },
+        state=state,
+        navigation_policy=policy,
+        source_observation=observation,
+    )
     blocked = _without_source_narrative(
         {
             "action": "http_request",
@@ -483,6 +494,7 @@ def test_post_source_gate_requires_visible_structural_path_and_query_names(
         "method": "GET",
         "path": "/hidden?mode=",
     }
+    assert allowed_general_schema == allowed
     assert blocked["action"] == "invalid"
     assert SOURCE_SENTINEL not in json.dumps(blocked)
 
