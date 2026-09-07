@@ -56,7 +56,7 @@ def test_python_route_and_query_require_their_exact_visible_lines(tmp_path: Path
         tmp_path,
         {
             "app.py": (
-                "from flask import Flask\n"
+                "from flask import Flask, request\n"
                 "app = Flask(__name__)\n"
                 "@app.get(\n"
                 '    "/hidden/admin",\n'
@@ -1222,7 +1222,7 @@ def test_safe_javascript_constructor_forms_authorize(
     ("constructor", "prefix_keyword"),
     [("APIRouter", "prefix"), ("Blueprint", "url_prefix")],
 )
-def test_python_router_prefix_is_composed(
+def test_unmounted_python_router_prefix_does_not_grant_live_route_authority(
     tmp_path: Path,
     constructor: str,
     prefix_keyword: str,
@@ -1246,13 +1246,13 @@ def test_python_router_prefix_is_composed(
         {"action": "http_request", "method": "GET", "path": "/health"},
         observation=observation,
     )
-    assert policy.permits_http_action(
+    assert not policy.permits_http_action(
         {"action": "http_request", "method": "GET", "path": "/api/health"},
         observation=observation,
     )
 
 
-def test_fastapi_mounted_router_does_not_authorize_an_unprefixed_child_route(
+def test_fastapi_mounted_router_authorizes_only_the_composed_route(
     tmp_path: Path,
 ) -> None:
     source = (
@@ -1270,7 +1270,7 @@ def test_fastapi_mounted_router_does_not_authorize_an_unprefixed_child_route(
         {"action": "http_request", "method": "GET", "path": "/health"},
         observation=observation,
     )
-    assert not policy.permits_http_action(
+    assert policy.permits_http_action(
         {"action": "http_request", "method": "GET", "path": "/api/health"},
         observation=observation,
     )
@@ -1366,6 +1366,50 @@ def test_javascript_invalid_throw_fails_file_closed(
             "action": "http_request",
             "method": "GET",
             "path": "/after-invalid-throw",
+        },
+        observation=observation,
+    )
+
+
+def test_javascript_top_level_throw_fails_file_closed(tmp_path: Path) -> None:
+    source = (
+        'const express=require("express");\n'
+        "const app=express();\n"
+        'throw new Error("stop");\n'
+        'app.get("/after-throw",handler);\n'
+    )
+    _captured, policy, executor = _context(tmp_path, {"server.js": source})
+    observation = _excerpt(executor, "server.js", 1, len(source.splitlines()))
+
+    assert policy.route_count == 0
+    assert not policy.permits_http_action(
+        {"action": "http_request", "method": "GET", "path": "/after-throw"},
+        observation=observation,
+    )
+
+
+@pytest.mark.parametrize(
+    "constructor",
+    ["express(unknown)", 'require("express")(unknown)'],
+)
+def test_javascript_constructor_arguments_fail_closed(
+    tmp_path: Path,
+    constructor: str,
+) -> None:
+    source = (
+        'const express=require("express");\n'
+        f"const app={constructor};\n"
+        'app.get("/constructor-argument",handler);\n'
+    )
+    _captured, policy, executor = _context(tmp_path, {"server.js": source})
+    observation = _excerpt(executor, "server.js", 1, len(source.splitlines()))
+
+    assert policy.route_count == 0
+    assert not policy.permits_http_action(
+        {
+            "action": "http_request",
+            "method": "GET",
+            "path": "/constructor-argument",
         },
         observation=observation,
     )

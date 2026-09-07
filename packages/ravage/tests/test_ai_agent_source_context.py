@@ -101,7 +101,7 @@ def _write_source(root: Path) -> None:
     root.mkdir()
     root.joinpath("app.py").write_text(
         (
-            "from flask import Flask\n"
+            "from flask import Flask, request\n"
             "\n"
             "app = Flask(__name__)\n"
             f'SOURCE_NOTE = "{SOURCE_SENTINEL}"\n'
@@ -125,7 +125,7 @@ def _source_gate_policy(tmp_path: Path) -> tuple[SourceNavigationPolicy, dict[st
     source_root.mkdir()
     source_root.joinpath("app.py").write_text(
         (
-            "from flask import Flask\n"
+            "from flask import Flask, request\n"
             "app = Flask(__name__)\n"
             '@app.get("/hidden")\n'
             "def hidden():\n"
@@ -231,6 +231,101 @@ def test_consecutive_source_excerpts_can_authorize_one_live_route(
     }
     assert selections[-1]["source_informed"] is True
     assert "/hidden/admin" in requests
+
+
+def test_cross_file_mounted_route_can_drive_one_live_request(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    hidden_route_target: tuple[str, list[str]],
+) -> None:
+    target_url, requests = hidden_route_target
+    brief_path = tmp_path / "brief.yaml"
+    source_root = tmp_path / "source"
+    workspace = tmp_path / "workspace"
+    _write_brief(brief_path, target_url)
+    source_root.joinpath("service").mkdir(parents=True)
+    source_root.joinpath("service", "__init__.py").write_text("", encoding="utf-8")
+    source_root.joinpath("service", "routes.py").write_text(
+        (
+            "from fastapi import APIRouter\n"
+            "router = APIRouter()\n"
+            '@router.get("/health")\n'
+            "def health(): return {'ok': True}\n"
+        ),
+        encoding="utf-8",
+    )
+    source_root.joinpath("service", "main.py").write_text(
+        (
+            "from fastapi import FastAPI\n"
+            "from .routes import router\n"
+            "app = FastAPI()\n"
+            'app.include_router(router, prefix="/api")\n'
+        ),
+        encoding="utf-8",
+    )
+    model = ScriptedModelClient(
+        [
+            {
+                "action": "source_context",
+                "task_id": "surface-map",
+                "operation": "excerpt",
+                "args": {
+                    "path": "service/routes.py",
+                    "start_line": 1,
+                    "end_line": 4,
+                },
+            },
+            {
+                "action": "source_context",
+                "task_id": "surface-map",
+                "operation": "excerpt",
+                "args": {"path": "service/main.py", "start_line": 1, "end_line": 4},
+            },
+            {
+                "action": "http_request",
+                "task_id": "surface-map",
+                "method": "GET",
+                "path": "/api/health",
+            },
+        ]
+    )
+    monkeypatch.setattr(ai_agent, "_forced_evidence_probe_action", lambda **_kwargs: None)
+    monkeypatch.setattr(ai_agent, "_forced_primitive_probe_action", lambda **_kwargs: None)
+
+    run_ai_web_agent(
+        brief_path=brief_path,
+        target_url=target_url,
+        settings=AIWebAgentSettings(
+            source_root=source_root,
+            allow_source_to_model=True,
+            tool_runtime_mode="host",
+            tool_runtime=NoProcessToolRuntime(),
+            db_path=tmp_path / "audit.db",
+            workspace_dir=workspace,
+            model_client=model,
+            stdout=StringIO(),
+            max_turns=3,
+        ),
+    )
+
+    assert "source_context_http_routes" not in _prompt(model, 1)
+    assert _prompt(model, 2)["source_context_http_routes"] == [
+        {"method": "GET", "path": "/api/health"}
+    ]
+    assert "/api/health" in requests
+
+    selections = [
+        json.loads(line)["payload"]
+        for line in workspace.joinpath("events.jsonl").read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["kind"] == "agent_action_selected"
+    ]
+    assert selections[-1]["action"] == {
+        "action": "http_request",
+        "method": "GET",
+        "path": "/api/health",
+        "task_id": "surface-map",
+    }
+    assert selections[-1]["source_informed"] is True
 
 
 def test_overflowed_source_chain_recovers_on_the_next_valid_read(
