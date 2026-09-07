@@ -408,6 +408,13 @@ class SourceNavigationEvidence:
     def observation_count(self) -> int:
         return self._observation_count
 
+    @property
+    def task_id(self) -> str:
+        """Return the active task lineage without exposing observed source text."""
+        if self._poisoned or not self._require_task or not self._observation_count:
+            return ""
+        return self._task_id
+
     def observe(
         self,
         observation: Mapping[str, object],
