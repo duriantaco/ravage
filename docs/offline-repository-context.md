@@ -82,12 +82,15 @@ excerpts. File contents and model lookup literals exist only in the next model
 request. Consecutive reads for one task may accumulate snapshot-specific integer
 atoms for structurally relevant lines in process memory; source text is not kept
 in that authorization state. The chain is limited to 16 observations and 2,048
-atoms. A task change, failed or invalid read, limit violation, or first non-source
-action discards it, and a resumed process starts with an empty chain. Durable
-receipts retain the snapshot identity, usage counts, and structural paths and
-coordinates; they omit file contents, per-file and excerpt digests, errors, and
-search terms. A resume must use the same snapshot, consent flag, and cumulative
-observation budget.
+atoms. While a chain is active, the focused action schema pins the next action to
+its task. If the model labels an otherwise authorized non-source action with a
+different active task, Ravage records it under the evidence task before applying
+the route or probe gate. A source read for a different task, failed or invalid
+read, limit violation, or first non-source action discards the chain, and a resumed
+process starts with an empty chain. Durable receipts retain the snapshot identity,
+usage counts, and structural paths and coordinates; they omit file contents,
+per-file and excerpt digests, errors, and search terms. A resume must use the same
+snapshot, consent flag, and cumulative observation budget.
 
 Source is hypothesis material and never target evidence or proof. Immediately
 after a source observation, the model may issue another source action, a
