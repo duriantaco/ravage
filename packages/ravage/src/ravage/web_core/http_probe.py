@@ -25,7 +25,7 @@ from http.cookiejar import CookieJar
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 from urllib.error import HTTPError, URLError
-from urllib.parse import SplitResult, parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import SplitResult, parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import (
     HTTPCookieProcessor,
     HTTPHandler,
@@ -61,6 +61,8 @@ DEFAULT_USER_AGENT = "ravage-probe/1.0"
 _HTTP_PROTOCOL_ERROR = "HTTP protocol error"
 _IPV6_VERSION = 6
 _HTTP_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_HTTP_PATH_SAFE = "/:@-._~!$&'()*+,;=%"
+_HTTP_QUERY_SAFE = "/?:@-._~!$&'()*+,;=%"
 _TRAFFIC_IDENTITY_ALIAS_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 _SENSITIVE_SUMMARY_HEADERS = frozenset(
     {
@@ -1212,6 +1214,7 @@ class ProbeSession:
             )
             self._observe_traffic(response, disposition="blocked", reason=response.error)
             return response
+        absolute_url = _http_transport_url(absolute_url)
         request_headers = {
             "User-Agent": DEFAULT_USER_AGENT,
             "Accept": (
@@ -1759,6 +1762,19 @@ def inject_query_param(url: str, name: str, value: str) -> str:
         next_query.append((name, value))
     return urlunsplit(
         (parts.scheme, parts.netloc, parts.path, urlencode(next_query), parts.fragment)
+    )
+
+
+def _http_transport_url(url: str) -> str:
+    parts = urlsplit(url)
+    return urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            quote(parts.path, safe=_HTTP_PATH_SAFE),
+            quote(parts.query, safe=_HTTP_QUERY_SAFE),
+            "",
+        )
     )
 
 
