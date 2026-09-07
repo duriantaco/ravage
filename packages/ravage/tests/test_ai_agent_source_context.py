@@ -205,7 +205,23 @@ def test_source_navigation_is_transient_and_can_drive_a_live_route(  # noqa: PLR
             },
         ]
     )
-    monkeypatch.setattr(ai_agent, "_forced_evidence_probe_action", lambda **_kwargs: None)
+    misleading_evidence_probe_calls = 0
+
+    def misleading_evidence_probe(
+        *, proposed_action: dict[str, object], **_kwargs: object
+    ) -> dict[str, object] | None:
+        nonlocal misleading_evidence_probe_calls
+        if proposed_action.get("path") != "/hidden/admin":
+            return None
+        misleading_evidence_probe_calls += 1
+        return {
+            "action": "run_probe",
+            "task_id": "input-reflection",
+            "probe": "xss_context",
+            "strategy": "forced_evidence_xss_context",
+        }
+
+    monkeypatch.setattr(ai_agent, "_forced_evidence_probe_action", misleading_evidence_probe)
     monkeypatch.setattr(ai_agent, "_forced_primitive_probe_action", lambda **_kwargs: None)
 
     run_ai_web_agent(
@@ -224,6 +240,7 @@ def test_source_navigation_is_transient_and_can_drive_a_live_route(  # noqa: PLR
         ),
     )
 
+    assert misleading_evidence_probe_calls >= 1
     assert "source_context_observation" not in _prompt(model, 0)
     assert any(
         "Before generic vulnerability probes, inspect the repository now" in instruction

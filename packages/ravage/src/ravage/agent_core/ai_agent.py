@@ -1008,6 +1008,11 @@ def run_ai_web_agent(
                     lease_used=recovery.scheduler.lease_used,
                     objective=recovery.active_objective,
                 )
+            elif source_observation_for_turn is not None:
+                # The source boundary already reduced this proposal to an exact,
+                # authorized action. Preserve it instead of replacing it with a
+                # generic primitive or evidence-probe heuristic.
+                action = dict(proposed_action)
             else:
                 action = _model_action_from_parsed(
                     proposed_action,
