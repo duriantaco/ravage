@@ -65,6 +65,7 @@ _SOURCE_CANDIDATE_REQUIRED_FIELDS = frozenset(
     }
 )
 _SOURCE_CANDIDATE_OPTIONAL_FIELDS = frozenset({"sink_kind"})
+_SOURCE_INFORMED_HTTP_RESPONSE_KIND = "source_informed_agent_http_response"
 
 
 @dataclass(slots=True)
@@ -880,7 +881,7 @@ def project_surface_graph(
             str(item.get("selector") or ""),
         ): _copy_legacy_record(
             item,
-            list_fields=("content_types", "hints"),
+            list_fields=("content_types", "hints", "sources"),
             mapping_fields=("fields", "input_locations"),
         )
         for item in _mapping_items(legacy.get("request_templates"))[:512]
@@ -908,6 +909,7 @@ def project_surface_graph(
         url = operation.structural_url
         structural = "{" in operation.route_shape
         source_backed = "source_code" in operation.provenance
+        source_informed = _SOURCE_INFORMED_HTTP_RESPONSE_KIND in operation.provenance
         endpoint = existing_endpoints.setdefault(
             url,
             {
@@ -940,6 +942,11 @@ def project_surface_graph(
                     **({"selector": operation.selector} if operation.selector else {}),
                 },
             )
+            if source_informed:
+                template["sources"] = sorted(
+                    set(_string_items(template.get("sources")))
+                    | {_SOURCE_INFORMED_HTTP_RESPONSE_KIND}
+                )[:16]
             if source_backed:
                 _project_source_template(template, operation)
             for parameter in operation.parameters:
@@ -966,6 +973,7 @@ def project_surface_graph(
                 set(_string_items(payload.get("sources")))
                 | {source}
                 | ({"source_code"} if source_backed else set())
+                | ({_SOURCE_INFORMED_HTTP_RESPONSE_KIND} if source_informed else set())
             )[:16]
             payload["locations"] = sorted(set(_string_items(payload.get("locations"))) | {url})[:16]
             payload["data_types"] = sorted(

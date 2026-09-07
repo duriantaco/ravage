@@ -27,7 +27,11 @@ from ravage.agent_core.observation_analysis import (
     extract_probe_signals,
     extract_signals,
 )
-from ravage.agent_core.surface_graph import SurfaceGraphError
+from ravage.agent_core.surface_graph import (
+    SurfaceAccessObservation,
+    SurfaceGraphError,
+    SurfaceOperation,
+)
 from ravage.agent_core.surface_graph_ingest import ingest_probe_result, project_surface_graph
 from ravage.auth.sessions import AuthenticationError
 from ravage.finding_evidence import confirmed_finding_evidence_failures
@@ -60,6 +64,9 @@ if TYPE_CHECKING:
     from ravage.web_core.http_probe import ProbeSession
 
 _EXECUTOR_TOOL_RECOGNIZER = "executor_tool_observation"
+_SOURCE_INFORMED_HTTP_RESPONSE_KIND = "source_informed_agent_http_response"
+_SOURCE_INFORMED_SIGNAL_LINEAGE_KEY = "source_informed_signal_lineage"
+_MAX_SOURCE_INFORMED_SIGNAL_LINEAGE = 256
 _MAX_DISPLAY_FINDING_TYPES = 3
 _MAX_DISPLAY_NAME_CHARS = 80
 _MAX_DISPLAY_SUMMARY_CHARS = 240
@@ -159,6 +166,7 @@ class ActionResult:
     session_mode: str = ""
     evidence_source_kind: str = ""
     evidence_observation: str = field(default="", repr=False, compare=False)
+    source_informed: bool = False
 
     def to_json(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -173,6 +181,8 @@ class ActionResult:
         }
         if self.session_mode:
             payload["session_mode"] = self.session_mode
+        if self.source_informed:
+            payload["source_informed"] = True
         return payload
 
 
@@ -193,6 +203,7 @@ class HttpActionExecutor(Protocol):
         node_id: str,
         arguments: dict[str, object],
         action_id: str,
+        source_informed: bool = False,
     ) -> HttpActionExecution: ...
 
 
@@ -223,6 +234,7 @@ def execute_action(  # noqa: C901, PLR0911, PLR0912, PLR0913, PLR0915
     authentication: ManagedAttackAuthentication | None = None,
     traffic_policy: TrafficPolicyController | None = None,
     http_executor: HttpActionExecutor | None = None,
+    source_informed: bool = False,
 ) -> ActionResult:
     if authentication is not None:
         authentication.assert_traffic_policy(traffic_policy)
@@ -274,14 +286,25 @@ def execute_action(  # noqa: C901, PLR0911, PLR0912, PLR0913, PLR0915
                 audit=audit,
                 engagement_id=engagement_id,
                 action_id=action_id,
+                source_informed=source_informed,
             )
         from ravage.agent_core.stateful_http import request_arguments  # noqa: PLC0415
 
         try:
-            execution = http_executor(
-                node_id="base-agent",
-                arguments=request_arguments(action),
-                action_id=action_id,
+            request = request_arguments(action)
+            execution = (
+                http_executor(
+                    node_id="base-agent",
+                    arguments=request,
+                    action_id=action_id,
+                    source_informed=True,
+                )
+                if source_informed
+                else http_executor(
+                    node_id="base-agent",
+                    arguments=request,
+                    action_id=action_id,
+                )
             )
         except ValueError as exc:
             safe_error = (
@@ -296,6 +319,7 @@ def execute_action(  # noqa: C901, PLR0911, PLR0912, PLR0913, PLR0915
                 session_mode=(
                     f"identity:{authentication.identity}" if authentication is not None else ""
                 ),
+                source_informed=source_informed,
             )
         return _record_http_action_result(
             execution,
@@ -312,6 +336,7 @@ def execute_action(  # noqa: C901, PLR0911, PLR0912, PLR0913, PLR0915
             session_mode=(
                 f"identity:{authentication.identity}" if authentication is not None else ""
             ),
+            source_informed=source_informed,
         )
     if kind == "run_command":
         tool_result = runtime.run_command(
@@ -690,6 +715,7 @@ def _http_request_unavailable(
     audit: AuditStore,
     engagement_id: UUID,
     action_id: str,
+    source_informed: bool = False,
 ) -> ActionResult:
     return _http_request_blocked(
         error="structured HTTP executor is unavailable for this agent route",
@@ -697,6 +723,7 @@ def _http_request_unavailable(
         audit=audit,
         engagement_id=engagement_id,
         action_id=action_id,
+        source_informed=source_informed,
     )
 
 
@@ -708,6 +735,7 @@ def _http_request_blocked(  # noqa: PLR0913
     engagement_id: UUID,
     action_id: str,
     session_mode: str = "",
+    source_informed: bool = False,
 ) -> ActionResult:
     payload: dict[str, object] = {
         "ok": False,
@@ -717,6 +745,8 @@ def _http_request_blocked(  # noqa: PLR0913
     }
     if session_mode:
         payload["session_mode"] = session_mode
+    if source_informed:
+        payload["source_informed"] = True
     _record(audit, engagement_id, actor="tool", action="tool_http_request", payload=payload)
     workspace.record_event(kind="tool_http_request", payload=payload)
     return ActionResult(
@@ -725,6 +755,7 @@ def _http_request_blocked(  # noqa: PLR0913
         outcome="blocked",
         session_mode=session_mode,
         evidence_source_kind="tool_http_request_blocked",
+        source_informed=source_informed,
     )
 
 
@@ -2512,12 +2543,17 @@ def _record_http_action_result(  # noqa: PLR0913
     max_observation_chars: int,
     max_transcript_chars: int,
     session_mode: str = "",
+    source_informed: bool = False,
 ) -> ActionResult:
     result = execution.result
     if not isinstance(result, ActionResult):
         raise TypeError("structured HTTP executor must return ActionResult")
     observation_id = str(execution.observation_id or uuid.uuid4())
-    evidence_text = result.evidence_observation or result.observation
+    source_informed = source_informed or result.source_informed
+    evidence_text = _source_informed_http_evidence(
+        result.evidence_observation or result.observation,
+        source_informed=source_informed,
+    )
     transcript_text = _clip_probe_text(evidence_text, max_chars=max_transcript_chars)
     response_payload = _http_response_payload(evidence_text)
     response_text = _http_response_signal_text(response_payload)
@@ -2536,6 +2572,8 @@ def _record_http_action_result(  # noqa: PLR0913
     }
     if session_mode:
         payload["session_mode"] = session_mode
+    if source_informed:
+        payload["source_informed"] = True
     _record_tool_payload(
         payload,
         kind="tool_http_request",
@@ -2554,15 +2592,25 @@ def _record_http_action_result(  # noqa: PLR0913
         recognized_proofs=recognized_proofs,
     )
     state.last_observation["http_response"] = _http_response_memory(response_payload)
+    if source_informed:
+        state.last_observation["source_informed"] = True
     workspace.record_transcript(role="tool", content=transcript_text)
     if _passive_http_discovery_allowed(action, response_payload):
+        discovery_signals = extract_http_discovery_signals(response_text)
         _ingest_passive_http_response(
             response_payload,
             state=state,
             observation_id=observation_id,
             identity_alias=_probe_identity_alias(session_mode),
+            source_informed=source_informed,
         )
-        merge_signals(state, extract_http_discovery_signals(response_text))
+        merge_signals(state, discovery_signals)
+        if source_informed:
+            _record_source_informed_signal_lineage(
+                state,
+                discovery_signals,
+                observation_id=observation_id,
+            )
     known_proof_replayed = _only_known_auto_capture_proofs(
         evidence_text,
         enabled=proof_recognition_enabled,
@@ -2579,6 +2627,7 @@ def _record_http_action_result(  # noqa: PLR0913
         evidence="tool_http_request",
         action_id=action_id,
         recognized_proofs=recognized_proofs,
+        source_informed=source_informed,
     )
     outcome = result.outcome or ("http_response_observed" if result.ok else "blocked")
     if found:
@@ -2597,7 +2646,23 @@ def _record_http_action_result(  # noqa: PLR0913
         evidence_source_kind="tool_http_request",
         evidence_observation=evidence_text,
         session_mode=session_mode,
+        source_informed=source_informed,
     )
+
+
+def _source_informed_http_evidence(evidence_text: str, *, source_informed: bool) -> str:
+    """Attach lineage to a structured HTTP envelope without changing its response."""
+    if not source_informed:
+        return evidence_text
+    try:
+        envelope = json.loads(evidence_text)
+    except (TypeError, json.JSONDecodeError):
+        return evidence_text
+    if not isinstance(envelope, Mapping):
+        return evidence_text
+    marked = {str(key): value for key, value in envelope.items()}
+    marked["source_informed"] = True
+    return json.dumps(marked, ensure_ascii=False, sort_keys=True)
 
 
 def _http_response_payload(evidence_text: str) -> dict[str, object]:
@@ -2673,6 +2738,7 @@ def _ingest_passive_http_response(
     state: AgentState,
     observation_id: str,
     identity_alias: str,
+    source_informed: bool = False,
 ) -> None:
     final_url = str(response.get("final_url") or "").strip()
     body = response.get("body")
@@ -2683,26 +2749,106 @@ def _ingest_passive_http_response(
     document = parse_passive_recon_document(final_url, headers, body)
     for operation in document.operations:
         try:
-            state.surface_graph.add(
-                url=operation.url,
-                method=operation.method,
-                parameters=(
-                    {"name": parameter.name, "location": parameter.location}
-                    for parameter in operation.parameters
-                ),
-                header_names=operation.header_names,
-                hints=operation.hints,
-                source_kind=operation.source_kind,
-                identity_alias=identity_alias,
-                access_level="declared",
-                response_status=None,
-                scope_decision="unknown",
-                evidence_refs=(observation_id,),
-            )
+            if source_informed:
+                added = state.surface_graph.add_operation(
+                    SurfaceOperation.create(
+                        url=operation.url,
+                        method=operation.method,
+                        parameters=(
+                            {"name": parameter.name, "location": parameter.location}
+                            for parameter in operation.parameters
+                        ),
+                        header_names=operation.header_names,
+                        hints=operation.hints,
+                        provenance=(
+                            operation.source_kind,
+                            _SOURCE_INFORMED_HTTP_RESPONSE_KIND,
+                        ),
+                    )
+                )
+                state.surface_graph.observe(
+                    SurfaceAccessObservation.create(
+                        operation_id=added.operation_id,
+                        identity_alias=identity_alias,
+                        source_kind=_SOURCE_INFORMED_HTTP_RESPONSE_KIND,
+                        access_level="declared",
+                        response_status=None,
+                        scope_decision="unknown",
+                        evidence_refs=(observation_id,),
+                    )
+                )
+            else:
+                state.surface_graph.add(
+                    url=operation.url,
+                    method=operation.method,
+                    parameters=(
+                        {"name": parameter.name, "location": parameter.location}
+                        for parameter in operation.parameters
+                    ),
+                    header_names=operation.header_names,
+                    hints=operation.hints,
+                    source_kind=operation.source_kind,
+                    identity_alias=identity_alias,
+                    access_level="declared",
+                    response_status=None,
+                    scope_decision="unknown",
+                    evidence_refs=(observation_id,),
+                )
         except SurfaceGraphError:
             # Cross-origin or malformed declarations are not part of this target.
             continue
     state.surface = project_surface_graph(state.surface_graph, state.surface)
+
+
+def _record_source_informed_signal_lineage(
+    state: AgentState,
+    signals: Mapping[str, Sequence[str]],
+    *,
+    observation_id: str,
+) -> None:
+    """Keep exact provenance for values retained in the legacy signal buckets."""
+    raw_records = state.surface.get(_SOURCE_INFORMED_SIGNAL_LINEAGE_KEY)
+    records = (
+        [
+            {str(key): value for key, value in item.items()}
+            for item in raw_records[-_MAX_SOURCE_INFORMED_SIGNAL_LINEAGE:]
+            if isinstance(item, Mapping)
+        ]
+        if isinstance(raw_records, list)
+        else []
+    )
+    by_value = {
+        (str(item.get("kind") or ""), str(item.get("value") or "")): item
+        for item in records
+        if str(item.get("kind") or "") and str(item.get("value") or "")
+    }
+    for kind in sorted(signals):
+        for raw_value in signals[kind]:
+            value = str(raw_value)
+            if not value:
+                continue
+            key = (str(kind), value)
+            current = by_value.get(key)
+            if current is None:
+                current = {
+                    "kind": str(kind),
+                    "value": value,
+                    "source_kind": _SOURCE_INFORMED_HTTP_RESPONSE_KIND,
+                    "evidence_refs": [observation_id],
+                }
+                records.append(current)
+                by_value[key] = current
+                continue
+            refs = current.get("evidence_refs")
+            evidence_refs = (
+                [str(item) for item in refs if str(item)] if isinstance(refs, list) else []
+            )
+            append_unique(evidence_refs, observation_id, limit=16)
+            current["source_kind"] = _SOURCE_INFORMED_HTTP_RESPONSE_KIND
+            current["evidence_refs"] = evidence_refs
+    state.surface[_SOURCE_INFORMED_SIGNAL_LINEAGE_KEY] = records[
+        -_MAX_SOURCE_INFORMED_SIGNAL_LINEAGE:
+    ]
 
 
 def _tool_result_payload(
@@ -2984,6 +3130,7 @@ def _action_result_from_observation(
     evidence_source_kind: str = "",
     evidence_observation: str = "",
     session_mode: str = "",
+    source_informed: bool = False,
 ) -> ActionResult:
     return ActionResult(
         ok=ok,
@@ -2997,6 +3144,7 @@ def _action_result_from_observation(
         session_mode=session_mode,
         evidence_source_kind=evidence_source_kind,
         evidence_observation=evidence_observation,
+        source_informed=source_informed,
     )
 
 
@@ -3011,6 +3159,7 @@ def _capture_recognized_proof(
     evidence: str,
     action_id: str = "",
     recognized_proofs: Sequence[str] | None = None,
+    source_informed: bool = False,
 ) -> str:
     if not enabled:
         return ""
@@ -3019,13 +3168,15 @@ def _capture_recognized_proof(
         if proof in state.flags:
             continue
         state.flags.append(proof)
-        payload = {
+        payload: dict[str, object] = {
             "flag": proof,
             "evidence": evidence,
             "flag_record_path": str(workspace.events_path),
         }
         if action_id:
             payload["action_id"] = action_id
+        if source_informed:
+            payload["source_informed"] = True
         payload.update(_capture_provenance(state=state, capture_method="automatic"))
         _record(audit, engagement_id, actor="agent", action="flag_captured", payload=payload)
         workspace.record_event(kind="flag_captured", payload=payload)

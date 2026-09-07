@@ -8,7 +8,7 @@ import json
 import shutil
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -131,6 +131,7 @@ class StatefulHttpActionSession:
         node_id: str,
         arguments: dict[str, object],
         action_id: str,
+        source_informed: bool = False,
     ) -> ActionExecution:
         # Keep traffic-delta recovery inside the executor's single-action
         # boundary. This also prevents one caller from claiming another
@@ -140,6 +141,7 @@ class StatefulHttpActionSession:
                 node_id=node_id,
                 arguments=arguments,
                 action_id=action_id,
+                source_informed=source_informed,
                 _deadline_monotonic=None,
             )
 
@@ -149,6 +151,7 @@ class StatefulHttpActionSession:
         node_id: str,
         arguments: dict[str, object],
         action_id: str,
+        source_informed: bool,
         _deadline_monotonic: float | None,
     ) -> ActionExecution:
         executor = self._executor or self._open()
@@ -173,6 +176,7 @@ class StatefulHttpActionSession:
                     node_id=node_id,
                     arguments=arguments,
                     action_id=action_id,
+                    source_informed=source_informed,
                     _deadline_monotonic=_deadline_monotonic,
                 )
             except BaseException as exc:
@@ -195,9 +199,18 @@ class StatefulHttpActionSession:
                 self._advance_http_state_epoch()
             if session_before.full != session_after.full:
                 reactivate_for_session_change(self.state)
+        if source_informed:
+            execution = replace(
+                execution,
+                result=replace(execution.result, source_informed=True),
+            )
         blackboard.record_action_result(
             producer_node_id=node_id,
-            action={"action": "http_request", **arguments},
+            action={
+                "action": "http_request",
+                **arguments,
+                **({"source_informed": True} if source_informed else {}),
+            },
             result=execution.result,
             observation_id=execution.observation_id,
         )
@@ -235,11 +248,16 @@ class StatefulHttpActionSession:
                 if exchange.source_observation_id == observation_id
             ]
             latest = exchanges[-1]
+            source_informed = any(
+                item.request_resource_type == "source_informed_agent_http"
+                for item in exchanges
+            )
             evidence = json.dumps(
                 {
                     "action_id": action_id,
                     "node_id": producer_node_id,
                     "outcome": "http_request_interrupted",
+                    **({"source_informed": True} if source_informed else {}),
                     "traffic_exchange_ids": [item.exchange_id for item in exchanges],
                     "response": {
                         "status": latest.response_status,
@@ -257,13 +275,18 @@ class StatefulHttpActionSession:
             )
             blackboard.record_action_result(
                 producer_node_id=producer_node_id,
-                action={"action": "http_request", **arguments},
+                action={
+                    "action": "http_request",
+                    **arguments,
+                    **({"source_informed": True} if source_informed else {}),
+                },
                 result=ActionResult(
                     ok=False,
                     observation=evidence,
                     outcome="http_request_interrupted",
                     evidence_source_kind="tool_http_request",
                     evidence_observation=evidence,
+                    source_informed=source_informed,
                 ),
                 observation_id=observation_id,
             )
@@ -370,6 +393,7 @@ class StatefulHttpActionSession:
                     node_id="base-agent-validator",
                     arguments=arguments,
                     action_id=f"validate-{uuid4()}",
+                    source_informed=False,
                     _deadline_monotonic=_deadline_monotonic,
                 )
         except ValueError as exc:

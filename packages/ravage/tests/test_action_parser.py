@@ -148,18 +148,27 @@ def test_validate_poc_accepts_url_or_path_steps_with_supported_body_shapes() -> 
 
 
 def test_http_methods_are_canonicalized_after_validation() -> None:
-    direct = parse_action(
-        '{"action":"http_request","method":" get ","path":"/health"}'
-    )
+    direct = parse_action('{"action":"http_request","method":" get ","path":"/health"}')
     replay = parse_action(
-        '{"action":"validate_poc","steps":'
-        '[{"method":" patch ","path":"/profile","body":"{}"}]}'
+        '{"action":"validate_poc","steps":[{"method":" patch ","path":"/profile","body":"{}"}]}'
     )
 
     assert direct["method"] == "GET"
-    assert replay["steps"] == [
-        {"method": "PATCH", "path": "/profile", "body": "{}"}
-    ]
+    assert replay["steps"] == [{"method": "PATCH", "path": "/profile", "body": "{}"}]
+
+
+def test_model_action_cannot_self_claim_executor_source_lineage() -> None:
+    direct = parse_action(
+        '{"action":"http_request","method":"GET","path":"/health","source_informed":true}'
+    )
+    replay = parse_action(
+        '{"action":"validate_poc","source_informed":true,"steps":['
+        '{"method":"GET","path":"/health","source_informed":true}]}'
+    )
+
+    assert "source_informed" not in direct
+    assert "source_informed" not in replay
+    assert "source_informed" not in replay["steps"][0]
 
 
 @pytest.mark.parametrize(

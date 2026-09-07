@@ -923,6 +923,7 @@ class ScopedGraphHttpExecutor:
         node_id: str,
         arguments: dict[str, object],
         action_id: str,
+        source_informed: bool = False,
         _deadline_monotonic: float | None = None,
     ) -> ActionExecution:
         with self._execution_lock:
@@ -930,6 +931,7 @@ class ScopedGraphHttpExecutor:
                 node_id=node_id,
                 arguments=arguments,
                 action_id=action_id,
+                source_informed=source_informed,
                 _deadline_monotonic=_deadline_monotonic,
             )
 
@@ -939,6 +941,7 @@ class ScopedGraphHttpExecutor:
         node_id: str,
         arguments: dict[str, object],
         action_id: str,
+        source_informed: bool,
         _deadline_monotonic: float | None,
     ) -> ActionExecution:
         _remaining_deadline(_deadline_monotonic, clock=self._clock)
@@ -1037,6 +1040,7 @@ class ScopedGraphHttpExecutor:
                                     body=body,
                                     response=interrupted,
                                     response_body=b"",
+                                    source_informed=source_informed,
                                 )
                             except BaseException as capture_error:
                                 exc.add_note(
@@ -1056,6 +1060,7 @@ class ScopedGraphHttpExecutor:
                             body=body,
                             response=response,
                             response_body=raw_response.body,
+                            source_informed=source_informed,
                         )
                         if traffic_exchange_id:
                             traffic_exchange_ids.append(traffic_exchange_id)
@@ -1163,6 +1168,8 @@ class ScopedGraphHttpExecutor:
                 "error": response.error,
             },
         }
+        if source_informed:
+            observation_payload["source_informed"] = True
         evidence_observation = json.dumps(
             observation_payload,
             ensure_ascii=False,
@@ -1204,6 +1211,7 @@ class ScopedGraphHttpExecutor:
                 flag=proofs[0] if proofs else "",
                 evidence_source_kind="tool_http_request",
                 evidence_observation=evidence_observation,
+                source_informed=source_informed,
             ),
             observation_id=observation_id,
         )
@@ -1497,6 +1505,7 @@ class ScopedGraphHttpExecutor:
         body: bytes | None,
         response: ScopedHttpTransportResponse,
         response_body: bytes,
+        source_informed: bool,
     ) -> str:
         if self.traffic_observer is None:
             return ""
@@ -1504,7 +1513,9 @@ class ScopedGraphHttpExecutor:
             {
                 "disposition": "sent",
                 "source_observation_id": observation_id,
-                "resource_type": "agent_http",
+                "resource_type": (
+                    "source_informed_agent_http" if source_informed else "agent_http"
+                ),
                 "method": method,
                 "url": url,
                 "request_headers": dict(headers),

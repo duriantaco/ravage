@@ -106,9 +106,7 @@ def stateful_http_target() -> Iterator[_HttpTarget]:  # noqa: C901
                 }
             )
             if self.path == "/redirect-outside":
-                self._redirect(
-                    "https://outside.example/private?token=redirect-secret-value"
-                )
+                self._redirect("https://outside.example/private?token=redirect-secret-value")
                 return
             if self.path.startswith("/redirect-loop"):
                 self._redirect("/redirect-loop?token=redirect-secret-value")
@@ -533,9 +531,11 @@ def test_direct_http_reuses_cookie_and_links_traffic_evidence(
         audit.close()
 
     assert login.ok is True
+    assert login.source_informed is False
     assert login.flag == ""
     assert login.stop is False
     assert private.ok is True
+    assert private.source_informed is False
     assert private.flag == ""
     assert private.stop is False
     assert json.loads(private.evidence_observation)["response"]["body"] == (
@@ -567,18 +567,19 @@ def test_direct_http_reuses_cookie_and_links_traffic_evidence(
 
     exchanges = TrafficStore.open(workspace.root).exchanges()
     assert len(exchanges) == 2
+    assert all(exchange.request_resource_type == "agent_http" for exchange in exchanges)
     events = [json.loads(line) for line in workspace.events_path.read_text().splitlines()]
     http_events = [event for event in events if event["kind"] == "tool_http_request"]
     assert len(http_events) == 2
     for event, exchange in zip(http_events, exchanges, strict=True):
         payload = event["payload"]
+        assert "source_informed" not in payload
         assert payload["observation_id"] == exchange.source_observation_id
         assert payload["recognized_proofs"] == []
         evidence = json.loads(payload["result"])
         assert evidence["traffic_exchange_ids"] == [exchange.exchange_id]
         assert all(
-            receipt["request_body_sha256"] == "unavailable"
-            for receipt in evidence["requests"]
+            receipt["request_body_sha256"] == "unavailable" for receipt in evidence["requests"]
         )
     assert _FAKE_REQUEST_PROOF not in (workspace.root / "traffic" / "exchanges.jsonl").read_text()
 
@@ -591,6 +592,110 @@ def test_direct_http_reuses_cookie_and_links_traffic_evidence(
     }
     assert all(record["source"] == "tool_http_request" for record in raw_records)
     assert all(record["kind"] != "proof_confirmed" for record in blackboard["records"])
+
+
+def test_source_informed_http_proof_keeps_executor_lineage(
+    tmp_path: Path,
+    stateful_http_target: _HttpTarget,
+) -> None:
+    workspace = AgentWorkspace.open(tmp_path / "workspace")
+    target_url = stateful_http_target.url
+    scope = Scope(in_scope=[target_url], out_of_scope=[])
+    state = AgentState()
+    http_session = StatefulHttpActionSession(
+        target_url=target_url,
+        scope=scope,
+        allow_remote_target=False,
+        roe_max_rps=100,
+        max_total_requests=2,
+        workspace_dir=workspace.root,
+        state=state,
+        proof_recognition_enabled=True,
+    )
+    audit = AuditStore(tmp_path / "audit.db", scope=scope)
+    try:
+        outcome = execute_action(
+            {"action": "http_request", "method": "GET", "path": "/long-proof"},
+            target_url=target_url,
+            runtime=NoProcessToolRuntime(),
+            state=state,
+            workspace=workspace,
+            audit=audit,
+            engagement_id=uuid4(),
+            proof_recognition_enabled=True,
+            repeat_count=1,
+            max_observation_chars=4_000,
+            max_transcript_chars=20_000,
+            action_id="source-informed-proof",
+            http_executor=http_session,
+            source_informed=True,
+        )
+    finally:
+        http_session.finalize()
+        audit.close()
+
+    assert outcome.source_informed is True
+    assert outcome.flag == _LATE_RESPONSE_PROOF
+    assert json.loads(outcome.evidence_observation)["source_informed"] is True
+    [exchange] = TrafficStore.open(workspace.root).exchanges()
+    assert exchange.request_resource_type == "source_informed_agent_http"
+    events = [json.loads(line) for line in workspace.events_path.read_text().splitlines()]
+    http_event = next(event for event in events if event["kind"] == "tool_http_request")
+    proof_event = next(event for event in events if event["kind"] == "flag_captured")
+    assert http_event["payload"]["source_informed"] is True
+    assert proof_event["payload"]["source_informed"] is True
+    blackboard = json.loads((workspace.root / "evidence-blackboard.json").read_text())
+    source_records = [
+        record
+        for record in blackboard["records"]
+        if record["payload"].get("source_informed") is True
+    ]
+    assert {record["kind"] for record in source_records} >= {
+        "raw_observation",
+        "proof_confirmed",
+    }
+
+
+@pytest.mark.parametrize("executor_available", [False, True])
+def test_blocked_source_informed_http_keeps_decision_lineage(
+    tmp_path: Path,
+    executor_available: bool,
+) -> None:
+    workspace = AgentWorkspace.open(tmp_path / "workspace")
+    scope = Scope(in_scope=["http://127.0.0.1:8080"], out_of_scope=[])
+    audit = AuditStore(tmp_path / "audit.db", scope=scope)
+
+    def blocked_executor(**_kwargs: object) -> object:
+        raise ValueError("request rejected before dispatch")
+
+    try:
+        outcome = execute_action(
+            {"action": "http_request", "method": "GET", "path": "/source-route"},
+            target_url="http://127.0.0.1:8080",
+            runtime=NoProcessToolRuntime(),
+            state=AgentState(),
+            workspace=workspace,
+            audit=audit,
+            engagement_id=uuid4(),
+            repeat_count=1,
+            max_observation_chars=4_000,
+            max_transcript_chars=20_000,
+            action_id="source-informed-blocked",
+            http_executor=blocked_executor if executor_available else None,  # type: ignore[arg-type]
+            source_informed=True,
+        )
+    finally:
+        audit.close()
+
+    assert outcome.ok is False
+    assert outcome.source_informed is True
+    assert json.loads(outcome.observation)["source_informed"] is True
+    [http_event] = [
+        json.loads(line)
+        for line in workspace.events_path.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["kind"] == "tool_http_request"
+    ]
+    assert http_event["payload"]["source_informed"] is True
 
 
 def test_resume_releases_nonpersisted_session_and_clears_durable_marker(
@@ -654,11 +759,13 @@ def test_resume_releases_nonpersisted_session_and_clears_durable_marker(
         ("/redirect-loop", 5),
     ],
 )
+@pytest.mark.parametrize("source_informed", [False, True])
 def test_redirect_policy_failure_closes_evidence_transaction_and_can_resume(
     tmp_path: Path,
     stateful_http_target: _HttpTarget,
     path: str,
     expected_request_count: int,
+    source_informed: bool,
 ) -> None:
     workspace = AgentWorkspace.open(tmp_path / "workspace")
     target_url = stateful_http_target.url
@@ -688,6 +795,7 @@ def test_redirect_policy_failure_closes_evidence_transaction_and_can_resume(
             max_transcript_chars=20_000,
             action_id="redirect-policy-failure",
             http_executor=initial,
+            source_informed=source_informed,
         )
         terminal = initial.finalize()
     finally:
@@ -698,31 +806,30 @@ def test_redirect_policy_failure_closes_evidence_transaction_and_can_resume(
     assert terminal is not None
     assert terminal.agent_http_exchange_count == expected_request_count
     assert len(stateful_http_target.requests) == expected_request_count
-    http_state = json.loads(
-        (workspace.root / "agent-http-state.json").read_text(encoding="utf-8")
-    )
+    http_state = json.loads((workspace.root / "agent-http-state.json").read_text(encoding="utf-8"))
     assert http_state["request_count"] == expected_request_count
     exchanges = TrafficStore.open(workspace.root).exchanges()
     assert len(exchanges) == expected_request_count
+    assert {item.request_resource_type for item in exchanges} == {
+        "source_informed_agent_http" if source_informed else "agent_http"
+    }
     observation_ids = {item.source_observation_id for item in exchanges}
     assert len(observation_ids) == 1
     assert "" not in observation_ids
 
-    blackboard_text = (workspace.root / "evidence-blackboard.json").read_text(
-        encoding="utf-8"
-    )
+    blackboard_text = (workspace.root / "evidence-blackboard.json").read_text(encoding="utf-8")
     blackboard = json.loads(blackboard_text)
     raw_records = [
         record
         for record in blackboard["records"]
-        if record["kind"] == "raw_observation"
-        and record["source"] == "tool_http_request"
+        if record["kind"] == "raw_observation" and record["source"] == "tool_http_request"
     ]
     assert len(raw_records) == 1
     assert raw_records[0]["observation_id"] in observation_ids
     assert raw_records[0]["material"] is False
     assert raw_records[0]["payload"]["ok"] is False
     assert raw_records[0]["payload"]["outcome"] == "http_request_interrupted"
+    assert raw_records[0]["payload"].get("source_informed", False) is source_informed
     assert "redirect-secret-value" not in blackboard_text
     assert "redirect-secret-value" not in workspace.events_path.read_text(encoding="utf-8")
 
@@ -782,9 +889,7 @@ def test_transport_interrupt_closes_request_traffic_evidence_transaction(
 
     assert terminal is not None
     assert terminal.agent_http_exchange_count == 1
-    http_state = json.loads(
-        (workspace.root / "agent-http-state.json").read_text(encoding="utf-8")
-    )
+    http_state = json.loads((workspace.root / "agent-http-state.json").read_text(encoding="utf-8"))
     assert http_state["request_count"] == 1
     [exchange] = TrafficStore.open(workspace.root).exchanges()
     assert exchange.request_sent is True
@@ -796,8 +901,7 @@ def test_transport_interrupt_closes_request_traffic_evidence_transaction(
     raw_records = [
         record
         for record in blackboard["records"]
-        if record["kind"] == "raw_observation"
-        and record["source"] == "tool_http_request"
+        if record["kind"] == "raw_observation" and record["source"] == "tool_http_request"
     ]
     assert len(raw_records) == 1
     assert raw_records[0]["observation_id"] == exchange.source_observation_id
@@ -1259,12 +1363,8 @@ def test_cookie_transition_makes_same_get_fresh_in_agent_repeat_ledger(
         json.loads(line)
         for line in (workspace_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
     ]
-    selections = [
-        event["payload"] for event in events if event["kind"] == "agent_action_selected"
-    ]
-    http_selections = [
-        item for item in selections if item["action"]["action"] == "http_request"
-    ]
+    selections = [event["payload"] for event in events if event["kind"] == "agent_action_selected"]
+    http_selections = [item for item in selections if item["action"]["action"] == "http_request"]
     assert [item["repeat_count"] for item in http_selections] == [1, 1, 1]
     assert http_selections[0]["action"]["path"] == "/dashboard"
     assert http_selections[2]["action"]["path"] == "/dashboard"
@@ -1491,8 +1591,7 @@ def test_validate_poc_captures_executor_proof_beyond_validator_summary(
     assert response_summary["body_len"] > 300
     assert "...[truncated" in response_summary["body_snippet"]
     events = [
-        json.loads(line)
-        for line in workspace.events_path.read_text(encoding="utf-8").splitlines()
+        json.loads(line) for line in workspace.events_path.read_text(encoding="utf-8").splitlines()
     ]
     outer = next(event for event in events if event["kind"] == "tool_validate_poc")
     assert outer["payload"]["recognized_proofs"] == [_LATE_RESPONSE_PROOF]
@@ -1553,8 +1652,7 @@ def test_validate_poc_does_not_capture_proof_from_authored_expectation(
     assert _FORGED_VALIDATOR_PROOF not in outcome.evidence_observation
     assert "[REDACTED-PROOF]" in outcome.evidence_observation
     events = [
-        json.loads(line)
-        for line in workspace.events_path.read_text(encoding="utf-8").splitlines()
+        json.loads(line) for line in workspace.events_path.read_text(encoding="utf-8").splitlines()
     ]
     outer = next(event for event in events if event["kind"] == "tool_validate_poc")
     assert outer["payload"]["recognized_proofs"] == []

@@ -376,6 +376,42 @@ def test_remote_http_uses_stable_identity_and_auditable_receipt() -> None:
     assert execution.observation_id.startswith("http:")
 
 
+def test_source_informed_http_marks_result_and_every_redirect_exchange(tmp_path: Path) -> None:
+    transport = QueuedTransport(
+        [
+            _response(
+                status=302,
+                headers={"Location": "/app/final"},
+                body=b"redirect",
+            ),
+            _response(url=f"{TARGET_URL}/final", body=b"target body"),
+        ]
+    )
+    store = TrafficStore.create(tmp_path / "workspace")
+    recorder = ProbeTrafficRecorder(
+        store,
+        capture_session_id="source-informed-redirects",
+        source="agent_http",
+        strict=True,
+    )
+    executor = _executor(transport, traffic_observer=recorder)
+
+    execution = executor(
+        node_id="node-source",
+        arguments={"method": "GET", "path": "/app/source-route"},
+        action_id="action-source",
+        source_informed=True,
+    )
+
+    assert execution.result.source_informed is True
+    assert json.loads(execution.result.observation)["source_informed"] is True
+    assert json.loads(execution.result.evidence_observation)["source_informed"] is True
+    assert [item.request_resource_type for item in store.exchanges()] == [
+        "source_informed_agent_http",
+        "source_informed_agent_http",
+    ]
+
+
 def test_managed_authentication_owns_request_and_redacts_all_observations(
     tmp_path,
 ) -> None:

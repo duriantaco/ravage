@@ -198,7 +198,9 @@ def attempt_record_payload(  # noqa: PLR0913 - mirrors the turn boundary.
             "stop": outcome.get("stop"),
             "classification": classification,
             "repeat_count": outcome.get("repeat_count"),
+            **({"source_informed": True} if outcome.get("source_informed") is True else {}),
         },
+        **({"source_informed": True} if outcome.get("source_informed") is True else {}),
         "novel": novel,
         "status": _attempt_status(
             classification=classification,
@@ -237,10 +239,12 @@ def turn_trace_payload(  # noqa: PLR0913 - flat fields define the trace schema.
             "repeat_count": outcome.get("repeat_count"),
             "classification": outcome.get("outcome"),
             "flag_captured": bool(outcome.get("flag")),
+            **({"source_informed": True} if outcome.get("source_informed") is True else {}),
             "observation_digest": observation_digest(sanitized_observation)
             if sanitized_observation
             else {},
         },
+        **({"source_informed": True} if outcome.get("source_informed") is True else {}),
         "pre_state": dict(pre_state),
         "post_state": dict(post_state),
         "state_delta": state_trace_delta(pre_state, post_state),

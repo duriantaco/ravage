@@ -24,6 +24,7 @@ VALID_ACTIONS = {
 _HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"})
 _BODYLESS_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _MAX_VALIDATE_POC_STEPS = 12
+_EXECUTOR_OWNED_ACTION_FIELDS = frozenset({"source_informed"})
 
 REQUIRED_TEXT_FIELDS = {
     "run_command": "command",
@@ -95,7 +96,11 @@ def normalize_action(
             raw="" if action == SOURCE_CONTEXT_ACTION else raw_payload,
         )
 
-    normalized: dict[str, object] = dict(payload)
+    normalized: dict[str, object] = {
+        str(key): value
+        for key, value in payload.items()
+        if str(key) not in _EXECUTOR_OWNED_ACTION_FIELDS
+    }
     normalized["action"] = action
     if action == "http_request":
         normalized["method"] = _canonical_http_method(payload.get("method"))
@@ -103,7 +108,14 @@ def normalize_action(
         steps = payload.get("steps")
         assert isinstance(steps, list)
         normalized["steps"] = [
-            {**step, "method": _canonical_http_method(step.get("method"))}
+            {
+                **{
+                    str(key): value
+                    for key, value in step.items()
+                    if str(key) not in _EXECUTOR_OWNED_ACTION_FIELDS
+                },
+                "method": _canonical_http_method(step.get("method")),
+            }
             for step in steps
             if isinstance(step, dict)
         ]
@@ -162,9 +174,7 @@ def _http_request_validation_error(payload: dict[str, Any]) -> str:  # noqa: PLR
         return f"http_request method is not allowed: {method}"
     if payload.get("headers") is not None and not isinstance(payload.get("headers"), dict):
         return "http_request headers must be an object"
-    body_fields = [
-        name for name in ("body", "json", "form") if payload.get(name) is not None
-    ]
+    body_fields = [name for name in ("body", "json", "form") if payload.get(name) is not None]
     if len(body_fields) > 1:
         return "http_request accepts only one of body, json, or form"
     if method in _BODYLESS_HTTP_METHODS and body_fields:
@@ -231,10 +241,7 @@ def _finding_validation_error(value: object) -> str:
             return f"validate_poc finding {field} is too long"
     severity = str(value.get("severity") or "").strip().lower()
     if severity not in _FINDING_SEVERITIES:
-        return (
-            "validate_poc finding severity must be critical, high, medium, low, "
-            "or informational"
-        )
+        return "validate_poc finding severity must be critical, high, medium, low, or informational"
     vuln_class = str(value.get("vuln_class") or "").strip()
     if not _VULN_CLASS_RE.fullmatch(vuln_class):
         return "validate_poc finding vuln_class must be a canonical snake_case identifier"
@@ -247,10 +254,7 @@ def _finding_validation_error(value: object) -> str:
         return "validate_poc finding exploit_steps item is too long"
     forbidden = sorted({"endpoint", "proof", "provenance"}.intersection(value))
     if forbidden:
-        return (
-            "validate_poc finding cannot provide executor-owned fields: "
-            + ", ".join(forbidden)
-        )
+        return "validate_poc finding cannot provide executor-owned fields: " + ", ".join(forbidden)
     return ""
 
 
