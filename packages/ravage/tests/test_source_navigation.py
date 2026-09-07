@@ -983,6 +983,13 @@ def test_adversarial_python_shapes_do_not_authorize(
             "/do-once",
         ),
         (
+            'const express=require("express");\nconst app=express();\n'
+            'for (const signal of ["SIGINT", "SIGTERM"]) { consume(signal); }\n'
+            'app.get("/after-for-of",handler);\n',
+            "js",
+            "/after-for-of",
+        ),
+        (
             'import expressAlias from "express";\nconst custom=expressAlias();\n'
             'custom.get("/alias", handler);\n',
             "js",

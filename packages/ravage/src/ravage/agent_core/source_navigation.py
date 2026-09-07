@@ -1116,7 +1116,27 @@ def _script_declaration_valid(tokens: Sequence[_Token], index: int) -> bool:
             "]",
             "}",
         }
+    if (
+        offset < len(tokens)
+        and tokens[offset].value in {"in", "of"}
+        and _script_token_is_in_for_header(tokens, index)
+    ):
+        return offset + 1 < len(tokens) and tokens[offset + 1].value != ")"
     return tokens[index].value != "const"
+
+
+def _script_token_is_in_for_header(tokens: Sequence[_Token], index: int) -> bool:
+    depth = 0
+    for offset in range(index - 1, -1, -1):
+        value = tokens[offset].value
+        if value == ")":
+            depth += 1
+        elif value == "(":
+            if depth:
+                depth -= 1
+                continue
+            return offset > 0 and tokens[offset - 1].value == "for"
+    return False
 
 
 def _script_parenthesized_tokens_valid(
