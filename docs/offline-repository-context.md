@@ -79,18 +79,24 @@ ravage attack brief.yaml \
 
 The model can list files and omissions, search literal text, and request bounded
 excerpts. File contents and model lookup literals exist only in the next model
-request. Durable receipts retain the snapshot identity, usage counts, and
-structural paths and coordinates; they omit file contents, per-file and excerpt
-digests, errors, and search terms. A resume must use the same snapshot, consent
-flag, and cumulative observation budget.
+request. Consecutive reads for one task may accumulate snapshot-specific integer
+atoms for structurally relevant lines in process memory; source text is not kept
+in that authorization state. The chain is limited to 16 observations and 2,048
+atoms. A task change, failed or invalid read, limit violation, or first non-source
+action discards it, and a resumed process starts with an empty chain. Durable
+receipts retain the snapshot identity, usage counts, and structural paths and
+coordinates; they omit file contents, per-file and excerpt digests, errors, and
+search terms. A resume must use the same snapshot, consent flag, and cumulative
+observation budget.
 
 Source is hypothesis material and never target evidence or proof. Immediately
 after a source observation, the model may issue another source action, a
 catalogued native probe, or a bodyless `GET`, `HEAD`, or `OPTIONS` request. A
-exact static route path whose structural lines appeared in that observation may
-be used so the agent can test hidden application routes. Empty-valued query-field
-names are allowed only when they are structurally tied to the same handler and
-visible in that observation. Query values, URL fragments, headers, bodies,
+exact static route path whose complete structural lines appeared in the current
+consecutive-read chain may be used so the agent can test hidden application
+routes. Empty-valued query-field names are allowed only when they are structurally
+tied to the same handler and visible in that chain. Query values, URL fragments,
+headers, bodies,
 commands, findings, and narrative fields are blocked on that turn. Any security
 conclusion still requires evidence returned by the live target or a trusted typed
 validator.

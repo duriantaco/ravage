@@ -148,6 +148,254 @@ def _source_gate_policy(tmp_path: Path) -> tuple[SourceNavigationPolicy, dict[st
     return build_source_navigation_policy(context), observation
 
 
+def test_consecutive_source_excerpts_can_authorize_one_live_route(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    hidden_route_target: tuple[str, list[str]],
+) -> None:
+    target_url, requests = hidden_route_target
+    brief_path = tmp_path / "brief.yaml"
+    source_root = tmp_path / "source"
+    workspace = tmp_path / "workspace"
+    _write_brief(brief_path, target_url)
+    source_root.mkdir()
+    source_root.joinpath("app.py").write_text(
+        "\n".join(
+            [
+                "from flask import Flask",
+                "app = Flask(__name__)",
+                *(f"# neutral filler {index}" for index in range(78)),
+                '@app.get("/hidden/admin")',
+                "def hidden_admin(): return 'ok'",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    model = ScriptedModelClient(
+        [
+            {
+                "action": "source_context",
+                "task_id": "surface-map",
+                "operation": "excerpt",
+                "args": {"path": "app.py", "start_line": 1, "end_line": 2},
+            },
+            {
+                "action": "source_context",
+                "task_id": "surface-map",
+                "operation": "excerpt",
+                "args": {"path": "app.py", "start_line": 81, "end_line": 82},
+            },
+            {
+                "action": "http_request",
+                "task_id": "surface-map",
+                "method": "GET",
+                "path": "/hidden/admin",
+            },
+        ]
+    )
+    monkeypatch.setattr(ai_agent, "_forced_evidence_probe_action", lambda **_kwargs: None)
+    monkeypatch.setattr(ai_agent, "_forced_primitive_probe_action", lambda **_kwargs: None)
+
+    run_ai_web_agent(
+        brief_path=brief_path,
+        target_url=target_url,
+        settings=AIWebAgentSettings(
+            source_root=source_root,
+            allow_source_to_model=True,
+            tool_runtime_mode="host",
+            tool_runtime=NoProcessToolRuntime(),
+            db_path=tmp_path / "audit.db",
+            workspace_dir=workspace,
+            model_client=model,
+            stdout=StringIO(),
+            max_turns=3,
+        ),
+    )
+
+    assert "http_request" not in _prompt(model, 1)["action_schema"]
+    assert "source_context_http_routes" not in _prompt(model, 1)
+    assert _prompt(model, 2)["source_context_http_routes"] == [
+        {"method": "GET", "path": "/hidden/admin"}
+    ]
+    selections = [
+        json.loads(line)["payload"]
+        for line in workspace.joinpath("events.jsonl").read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["kind"] == "agent_action_selected"
+    ]
+    assert selections[-1]["action"] == {
+        "action": "http_request",
+        "method": "GET",
+        "path": "/hidden/admin",
+        "task_id": "surface-map",
+    }
+    assert selections[-1]["source_informed"] is True
+    assert "/hidden/admin" in requests
+
+
+def test_overflowed_source_chain_recovers_on_the_next_valid_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    hidden_route_target: tuple[str, list[str]],
+) -> None:
+    target_url, requests = hidden_route_target
+    brief_path = tmp_path / "brief.yaml"
+    source_root = tmp_path / "source"
+    workspace = tmp_path / "workspace"
+    _write_brief(brief_path, target_url)
+    source_root.mkdir()
+    source_root.joinpath("app.py").write_text(
+        "\n".join(
+            [
+                "from flask import Flask",
+                "app = Flask(__name__)",
+                *(f"# neutral filler {index}" for index in range(18)),
+                '@app.get("/hidden/admin")',
+                "def hidden_admin(): return 'ok'",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    source_reads = [
+        {
+            "action": "source_context",
+            "task_id": "surface-map",
+            "operation": "excerpt",
+            "args": {"path": "app.py", "start_line": line, "end_line": line},
+        }
+        for line in range(1, 18)
+    ]
+    model = ScriptedModelClient(
+        [
+            *source_reads,
+            {
+                "action": "source_context",
+                "task_id": "surface-map",
+                "operation": "excerpt",
+                "args": {"path": "app.py", "start_line": 1, "end_line": 22},
+            },
+            {
+                "action": "http_request",
+                "task_id": "surface-map",
+                "method": "GET",
+                "path": "/hidden/admin",
+            },
+        ]
+    )
+    monkeypatch.setattr(ai_agent, "_forced_evidence_probe_action", lambda **_kwargs: None)
+    monkeypatch.setattr(ai_agent, "_forced_primitive_probe_action", lambda **_kwargs: None)
+
+    run_ai_web_agent(
+        brief_path=brief_path,
+        target_url=target_url,
+        settings=AIWebAgentSettings(
+            source_root=source_root,
+            allow_source_to_model=True,
+            tool_runtime_mode="host",
+            tool_runtime=NoProcessToolRuntime(),
+            db_path=tmp_path / "audit.db",
+            workspace_dir=workspace,
+            model_client=model,
+            stdout=StringIO(),
+            max_turns=19,
+        ),
+    )
+
+    assert "source_context_http_routes" not in _prompt(model, 17)
+    assert _prompt(model, 18)["source_context_http_routes"] == [
+        {"method": "GET", "path": "/hidden/admin"}
+    ]
+    assert "/hidden/admin" in requests
+
+
+@pytest.mark.parametrize(
+    "intervening_action",
+    [
+        {
+            "action": "run_probe",
+            "task_id": "surface-map",
+            "probe": "surface_map",
+        },
+        {
+            "action": "source_context",
+            "task_id": "surface-map",
+            "operation": "excerpt",
+            "args": {"path": "missing.py", "start_line": 1, "end_line": 1},
+        },
+    ],
+    ids=["non-source-action", "failed-source-read"],
+)
+def test_intervening_action_discards_split_source_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    hidden_route_target: tuple[str, list[str]],
+    intervening_action: dict[str, object],
+) -> None:
+    target_url, requests = hidden_route_target
+    brief_path = tmp_path / "brief.yaml"
+    source_root = tmp_path / "source"
+    _write_brief(brief_path, target_url)
+    source_root.mkdir()
+    source_root.joinpath("app.py").write_text(
+        "\n".join(
+            [
+                "from flask import Flask",
+                "app = Flask(__name__)",
+                *(f"# neutral filler {index}" for index in range(78)),
+                '@app.get("/hidden/admin")',
+                "def hidden_admin(): return 'ok'",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    model = ScriptedModelClient(
+        [
+            {
+                "action": "source_context",
+                "task_id": "surface-map",
+                "operation": "excerpt",
+                "args": {"path": "app.py", "start_line": 1, "end_line": 2},
+            },
+            intervening_action,
+            {
+                "action": "source_context",
+                "task_id": "surface-map",
+                "operation": "excerpt",
+                "args": {"path": "app.py", "start_line": 81, "end_line": 82},
+            },
+            {
+                "action": "http_request",
+                "task_id": "surface-map",
+                "method": "GET",
+                "path": "/hidden/admin",
+            },
+        ]
+    )
+    monkeypatch.setattr(ai_agent, "_forced_evidence_probe_action", lambda **_kwargs: None)
+    monkeypatch.setattr(ai_agent, "_forced_primitive_probe_action", lambda **_kwargs: None)
+
+    run_ai_web_agent(
+        brief_path=brief_path,
+        target_url=target_url,
+        settings=AIWebAgentSettings(
+            source_root=source_root,
+            allow_source_to_model=True,
+            tool_runtime_mode="host",
+            tool_runtime=NoProcessToolRuntime(),
+            db_path=tmp_path / "audit.db",
+            workspace_dir=tmp_path / "workspace",
+            model_client=model,
+            stdout=StringIO(),
+            max_turns=4,
+        ),
+    )
+
+    assert "source_context_http_routes" not in _prompt(model, 3)
+    assert "/hidden/admin" not in requests
+
+
 def test_source_navigation_is_transient_and_can_drive_a_live_route(  # noqa: PLR0915
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -641,6 +889,72 @@ def test_post_source_gate_requires_visible_structural_path_and_query_names(
     assert allowed_general_schema == allowed
     assert blocked["action"] == "invalid"
     assert SOURCE_SENTINEL not in json.dumps(blocked)
+
+
+def test_accumulated_source_gate_requires_the_observing_task(tmp_path: Path) -> None:
+    state = AgentState(
+        tasks=[
+            {"id": "surface-map", "status": "pending"},
+            {"id": "flag-and-secret-sweep", "status": "pending"},
+        ],
+    )
+    policy, observation = _source_gate_policy(tmp_path)
+    evidence = policy.begin_evidence(require_task=True)
+    assert evidence.observe(observation, task_id="surface-map")
+
+    allowed = _without_source_narrative(
+        {
+            "action": "http_request",
+            "task_id": "surface-map",
+            "method": "GET",
+            "path": "/hidden",
+        },
+        state=state,
+        navigation_evidence=evidence,
+    )
+    wrong_task = _without_source_narrative(
+        {
+            "action": "http_request",
+            "task_id": "flag-and-secret-sweep",
+            "method": "GET",
+            "path": "/hidden",
+        },
+        state=state,
+        navigation_evidence=evidence,
+    )
+    missing_action_task = _without_source_narrative(
+        {
+            "action": "http_request",
+            "method": "GET",
+            "path": "/hidden",
+        },
+        state=state,
+        navigation_evidence=evidence,
+    )
+    wrong_task_probe = _without_source_narrative(
+        {
+            "action": "run_probe",
+            "task_id": "flag-and-secret-sweep",
+            "probe": "surface_map",
+        },
+        state=state,
+        navigation_evidence=evidence,
+    )
+    matching_task_probe = _without_source_narrative(
+        {
+            "action": "run_probe",
+            "task_id": "surface-map",
+            "probe": "surface_map",
+        },
+        state=state,
+        navigation_evidence=evidence,
+    )
+
+    assert allowed["action"] == "http_request"
+    assert wrong_task["action"] == "invalid"
+    assert missing_action_task["action"] == "invalid"
+    assert wrong_task_probe["action"] == "invalid"
+    assert matching_task_probe["action"] == "run_probe"
 
 
 @pytest.mark.parametrize("value", ["1234", "admin", "abc123", "%31%32%33%34"])

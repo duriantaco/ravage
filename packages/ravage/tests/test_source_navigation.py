@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from typing import TYPE_CHECKING
 
 import pytest
@@ -103,6 +104,192 @@ def test_python_route_and_query_require_their_exact_visible_lines(tmp_path: Path
     assert not policy.permits_http_action(
         {"action": "http_request", "method": "GET", "path": "/other"},
         observation=full,
+    )
+
+
+def test_ephemeral_evidence_combines_split_route_requirements(tmp_path: Path) -> None:
+    _captured, policy, executor = _context(
+        tmp_path,
+        {
+            "app.py": (
+                "from flask import Flask\n"
+                "app = Flask(__name__)\n"
+                '@app.get("/split")\n'
+                "def split(): return 'ok'\n"
+            )
+        },
+    )
+    binding = _excerpt(executor, "app.py", 1, 2)
+    route = _excerpt(executor, "app.py", 3, 4)
+    action = {"action": "http_request", "method": "GET", "path": "/split"}
+    evidence = policy.begin_evidence()
+
+    assert evidence.observe(binding)
+    assert evidence.authorized_http_routes() == ()
+    assert not evidence.permits_http_action(action)
+    assert evidence.observe(route)
+    assert evidence.authorized_http_routes() == (("GET", "/split"),)
+    assert evidence.permits_http_action(action)
+
+    evidence.clear()
+    assert evidence.observation_count == 0
+    assert evidence.authorized_http_routes() == ()
+    assert not evidence.permits_http_action(action)
+
+
+def test_ephemeral_evidence_poisoning_discards_prior_authority(tmp_path: Path) -> None:
+    _captured, policy, executor = _context(
+        tmp_path,
+        {
+            "app.py": (
+                "from flask import Flask\n"
+                "app = Flask(__name__)\n"
+                '@app.get("/guarded")\n'
+                "def guarded(): return 'ok'\n"
+            )
+        },
+    )
+    full = _excerpt(executor, "app.py", 1, 4)
+    forged = dict(full)
+    forged["snapshot_id"] = "sha256:wrong"
+    malformed = dict(full)
+    malformed["start_line"] = 0
+    error = dict(full)
+    error["type"] = "error"
+    action = {"action": "http_request", "method": "GET", "path": "/guarded"}
+    evidence = policy.begin_evidence()
+
+    for invalid in (forged, malformed, error):
+        evidence.clear()
+        assert evidence.observe(full)
+        assert evidence.permits_http_action(action)
+        assert not evidence.observe(invalid)
+        assert not evidence.permits_http_action(action)
+        assert evidence.authorized_http_routes() == ()
+
+    evidence.clear()
+    assert evidence.observe(full)
+    assert evidence.permits_http_action(action)
+
+    file_list = executor.execute(
+        {
+            "action": "source_context",
+            "operation": "list_files",
+            "args": {"limit": 10},
+        }
+    ).observation
+    assert evidence.observe(file_list)
+    assert evidence.permits_http_action(action)
+
+
+def test_ephemeral_evidence_overflow_clears_and_poison_session(tmp_path: Path) -> None:
+    _captured, policy, executor = _context(
+        tmp_path,
+        {
+            "app.py": (
+                "from flask import Flask\n"
+                "app = Flask(__name__)\n"
+                '@app.get("/bounded")\n'
+                "def bounded(): return 'ok'\n"
+            )
+        },
+    )
+    full = _excerpt(executor, "app.py", 1, 4)
+    action = {"action": "http_request", "method": "GET", "path": "/bounded"}
+    evidence = policy.begin_evidence()
+
+    for _ in range(16):
+        assert evidence.observe(full)
+    assert evidence.permits_http_action(action)
+
+    assert not evidence.observe(full)
+    assert evidence.observation_count == 0
+    assert evidence.authorized_http_routes() == ()
+    assert not evidence.permits_http_action(action)
+    assert not evidence.observe(full)
+
+
+def test_task_bound_evidence_rejects_missing_and_switched_tasks(tmp_path: Path) -> None:
+    _captured, policy, executor = _context(
+        tmp_path,
+        {
+            "app.py": (
+                "from flask import Flask\n"
+                "app = Flask(__name__)\n"
+                '@app.get("/task-bound")\n'
+                "def task_bound(): return 'ok'\n"
+            )
+        },
+    )
+    binding = _excerpt(executor, "app.py", 1, 2)
+    route = _excerpt(executor, "app.py", 3, 4)
+    evidence = policy.begin_evidence(require_task=True)
+
+    assert not evidence.observe(binding)
+    assert not evidence.observe(route, task_id="task-a")
+
+    evidence.clear()
+    assert evidence.observe(binding, task_id="task-a")
+    assert evidence.observe(route, task_id="task-b")
+    assert not evidence.permits_http_action(
+        {
+            "action": "http_request",
+            "task_id": "task-b",
+            "method": "GET",
+            "path": "/task-bound",
+        }
+    )
+    assert evidence.observe(binding, task_id="task-b")
+    assert evidence.permits_http_action(
+        {
+            "action": "http_request",
+            "task_id": "task-b",
+            "method": "GET",
+            "path": "/task-bound",
+        }
+    )
+    assert not evidence.permits_http_action(
+        {
+            "action": "http_request",
+            "task_id": "task-a",
+            "method": "GET",
+            "path": "/task-bound",
+        }
+    )
+
+
+def test_evidence_atoms_cannot_be_reused_across_snapshots(tmp_path: Path) -> None:
+    _captured_a, policy_a, executor_a = _context(
+        tmp_path / "a",
+        {
+            "app.py": (
+                "from flask import Flask\n"
+                "app = Flask(__name__)\n"
+                '@app.get("/route-a")\n'
+                "def route_a(): return 'a'\n"
+            )
+        },
+    )
+    _captured_b, policy_b, _executor_b = _context(
+        tmp_path / "b",
+        {
+            "app.py": (
+                "from flask import Flask\n"
+                "app = Flask(__name__)\n"
+                '@app.get("/route-b")\n'
+                "def route_b(): return 'b'\n"
+            )
+        },
+    )
+    evidence = policy_a.begin_evidence()
+    assert evidence.observe(_excerpt(executor_a, "app.py", 1, 4))
+
+    with pytest.raises(FrozenInstanceError):
+        evidence._policy = policy_b  # type: ignore[misc]  # noqa: SLF001
+
+    object.__setattr__(evidence, "_policy", policy_b)
+    assert not evidence.permits_http_action(
+        {"action": "http_request", "method": "GET", "path": "/route-b"}
     )
 
 

@@ -87,6 +87,7 @@ from ravage.agent_core.source_guided import (
     prepare_source_guided_analysis,
 )
 from ravage.agent_core.source_navigation import (
+    SourceNavigationEvidence,
     SourceNavigationPolicy,
     build_source_navigation_policy,
 )
@@ -530,6 +531,7 @@ def run_ai_web_agent(
     source_preparation: SourceGuidedPreparation | None = None
     source_context_executor: SourceContextExecutor | None = None
     source_navigation_policy: SourceNavigationPolicy | None = None
+    source_navigation_evidence: SourceNavigationEvidence | None = None
     recovery_state_path = workspace.root / "recovery-state.json"
     try:
         if resumed_state:
@@ -561,6 +563,9 @@ def run_ai_web_agent(
                 source_navigation_policy = build_source_navigation_policy(
                     repository_context,
                     candidate_payloads=source_preparation.candidate_payloads,
+                )
+                source_navigation_evidence = source_navigation_policy.begin_evidence(
+                    require_task=True
                 )
             # Persist the source binding before the persistent HTTP lane can
             # create durable traffic/evidence artifacts. An interrupted seed is
@@ -866,10 +871,8 @@ def run_ai_web_agent(
             )
             source_observation_for_turn = transient_source_observation
             source_context_http_routes = (
-                source_navigation_policy.authorized_http_routes(
-                    observation=source_observation_for_turn
-                )
-                if source_navigation_policy is not None
+                source_navigation_evidence.authorized_http_routes()
+                if source_navigation_evidence is not None
                 and source_observation_for_turn is not None
                 else ()
             )
@@ -929,6 +932,7 @@ def run_ai_web_agent(
                     state=state,
                     navigation_policy=source_navigation_policy,
                     source_observation=source_observation_for_turn,
+                    navigation_evidence=source_navigation_evidence,
                 )
             reply_content = _durable_model_reply_content(
                 reply.content,
@@ -1048,6 +1052,7 @@ def run_ai_web_agent(
                     state=state,
                     navigation_policy=source_navigation_policy,
                     source_observation=source_observation_for_turn,
+                    navigation_evidence=source_navigation_evidence,
                 )
                 if shadow_action is not None:
                     gated_shadow_action = _without_source_narrative(
@@ -1055,6 +1060,7 @@ def run_ai_web_agent(
                         state=state,
                         navigation_policy=source_navigation_policy,
                         source_observation=source_observation_for_turn,
+                        navigation_evidence=source_navigation_evidence,
                     )
                     if gated_shadow_action.get("action") == "invalid":
                         shadow_action = None
@@ -1157,6 +1163,19 @@ def run_ai_web_agent(
                         else source_context_executor.execute(action)
                     )
                     transient_source_observation = source_execution.observation
+                    action_task_id = str(action.get("task_id") or "")
+                    if source_navigation_evidence is not None:
+                        if not source_execution.ok:
+                            source_navigation_evidence.clear()
+                        elif not source_navigation_evidence.observe(
+                            source_execution.observation,
+                            task_id=action_task_id,
+                        ):
+                            source_navigation_evidence = (
+                                source_navigation_policy.begin_evidence(require_task=True)
+                                if source_navigation_policy is not None
+                                else None
+                            )
                     _update_source_context_binding(
                         state,
                         executor=source_context_executor,
@@ -1184,6 +1203,8 @@ def run_ai_web_agent(
                         outcome="source_context" if source_execution.ok else "blocked",
                     )
             elif recovery is not None:
+                if source_navigation_evidence is not None:
+                    source_navigation_evidence.clear()
                 outcome, branch_handoff = _execute_recovery_action(
                     recovery=recovery,
                     action=action,
@@ -1202,6 +1223,8 @@ def run_ai_web_agent(
                     source_informed=source_informed,
                 )
             else:
+                if source_navigation_evidence is not None:
+                    source_navigation_evidence.clear()
                 outcome = execute_action(
                     action,
                     target_url=target_url,
@@ -1760,6 +1783,7 @@ def _without_source_narrative(  # noqa: PLR0911 - each safe action lane fails cl
     state: AgentState,
     navigation_policy: SourceNavigationPolicy | None = None,
     source_observation: Mapping[str, object] | None = None,
+    navigation_evidence: SourceNavigationEvidence | None = None,
 ) -> dict[str, object]:
     safe = {
         str(key): value
@@ -1801,17 +1825,26 @@ def _without_source_narrative(  # noqa: PLR0911 - each safe action lane fails cl
             for key, value in safe.items()
             if key in {"action", "method", "path", "task_id"}
         }
-        if (
-            navigation_policy is None
-            or source_observation is None
-            or not navigation_policy.permits_http_action(
-                safe,
-                observation=source_observation,
+        if navigation_evidence is not None:
+            permitted = navigation_evidence.permits_http_action(safe)
+        else:
+            permitted = bool(
+                navigation_policy is not None
+                and source_observation is not None
+                and navigation_policy.permits_http_action(
+                    safe,
+                    observation=source_observation,
+                )
             )
-        ):
+        if not permitted:
             return _blocked_source_informed_action()
         return safe
     if kind == "run_probe":
+        if (
+            navigation_evidence is not None
+            and not navigation_evidence.permits_source_informed_action(safe)
+        ):
+            return _blocked_source_informed_action()
         probe = str(safe.get("probe") or "")
         probe_names = {
             str(item.get("name") or "")

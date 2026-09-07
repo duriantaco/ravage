@@ -6,15 +6,18 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import io
 import re
 import tokenize
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import PurePosixPath
+from types import MappingProxyType
 
 from ravage.agent_core.source_context import (
     MAX_SOURCE_CONTEXT_EXCERPT_LINES,
+    MAX_SOURCE_CONTEXT_FILE_PAGE,
     MAX_SOURCE_CONTEXT_SEARCH_MATCHES,
     SOURCE_CONTEXT_OBSERVATION_SCHEMA,
     SOURCE_CONTEXT_PROVENANCE,
@@ -31,6 +34,8 @@ _MAX_QUERY_NAME_CHARS = 128
 _MAX_QUERY_FIELDS = 16
 _MAX_REQUIRED_LINES = 32
 _MAX_SCRIPT_NESTING = 32
+_MAX_ACCUMULATED_OBSERVATIONS = 16
+_MAX_ACCUMULATED_REQUIREMENT_ATOMS = 2_048
 _MAX_PROMPT_NAVIGATION_ROUTES = 32
 _MIN_ROUTE_ARGUMENTS = 2
 _STATIC_SHORT_CIRCUIT_PREFIX_TOKENS = 2
@@ -141,6 +146,7 @@ class SourceNavigationPolicy:
 
     _snapshot_id: str
     _facts: tuple[_RouteFact, ...]
+    _line_atoms: Mapping[tuple[str, int], int]
 
     @property
     def route_count(self) -> int:
@@ -156,10 +162,8 @@ class SourceNavigationPolicy:
         observation: Mapping[str, object],
     ) -> tuple[tuple[str, str], ...]:
         """Return a bounded set of exact routes authorized by this observation."""
-        routes = sorted(
-            {(fact.method, fact.path) for fact, _lines in self._authorized_facts(observation)}
-        )
-        return tuple(routes[:_MAX_PROMPT_NAVIGATION_ROUTES])
+        evidence = self.begin_evidence()
+        return evidence.authorized_http_routes() if evidence.observe(observation) else ()
 
     def permits_http_action(
         self,
@@ -168,7 +172,113 @@ class SourceNavigationPolicy:
         observation: Mapping[str, object],
     ) -> bool:
         """Allow an exact route only when its structural lines were just observed."""
-        if not isinstance(action, Mapping) or "url" in action:
+        evidence = self.begin_evidence()
+        return evidence.permits_http_action(action) if evidence.observe(observation) else False
+
+    def begin_evidence(self, *, require_task: bool = False) -> SourceNavigationEvidence:
+        """Create one bounded, ephemeral authorization session for consecutive reads."""
+        return SourceNavigationEvidence(self, _require_task=require_task)
+
+    def _authorized_facts(
+        self,
+        observed_atoms: frozenset[int] | set[int],
+    ) -> tuple[_RouteFact, ...]:
+        return tuple(
+            fact
+            for fact in self._facts
+            if self._required_atoms(fact).issubset(observed_atoms)
+        )
+
+    def _required_atoms(self, fact: _RouteFact) -> frozenset[int]:
+        return frozenset(
+            self._line_atoms[(fact.source_file, line)] for line in fact.required_lines
+        )
+
+    def _query_atom(self, fact: _RouteFact, query: _QueryFact) -> int:
+        return self._line_atoms[(fact.source_file, query.line)]
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class SourceNavigationEvidence:
+    """Opaque, text-free route evidence accumulated across consecutive source reads."""
+
+    _policy: SourceNavigationPolicy
+    _require_task: bool = False
+    _observed_atoms: frozenset[int] = field(default_factory=frozenset)
+    _observation_count: int = 0
+    _task_id: str = ""
+    _poisoned: bool = False
+
+    @property
+    def observation_count(self) -> int:
+        return self._observation_count
+
+    def observe(
+        self,
+        observation: Mapping[str, object],
+        *,
+        task_id: str = "",
+    ) -> bool:
+        """Add only policy-relevant atoms from one trusted snapshot observation."""
+        normalized_task_id = str(task_id or "").strip()
+        if (
+            self._poisoned
+            or (self._require_task and not normalized_task_id)
+        ):
+            self._poison()
+            return False
+        if (
+            self._require_task
+            and self._observation_count
+            and normalized_task_id != self._task_id
+        ):
+            self.clear()
+        visible = _visible_lines(
+            observation,
+            snapshot_id=self._policy._snapshot_id,  # noqa: SLF001
+        )
+        if visible is None:
+            self._poison()
+            return False
+        atoms = frozenset(
+            atom
+            for source_file, lines in visible.items()
+            for line in lines
+            if (atom := self._policy._line_atoms.get((source_file, line))) is not None  # noqa: SLF001
+        )
+        combined_atoms = self._observed_atoms | atoms
+        if (
+            self._observation_count >= _MAX_ACCUMULATED_OBSERVATIONS
+            or len(combined_atoms) > _MAX_ACCUMULATED_REQUIREMENT_ATOMS
+        ):
+            self._poison()
+            return False
+        object.__setattr__(self, "_observation_count", self._observation_count + 1)
+        object.__setattr__(self, "_observed_atoms", combined_atoms)
+        if self._require_task:
+            object.__setattr__(self, "_task_id", normalized_task_id)
+        return True
+
+    def authorized_http_routes(self) -> tuple[tuple[str, str], ...]:
+        """Return exact routes whose complete requirements were observed in this session."""
+        if self._poisoned:
+            return ()
+        routes = sorted(
+            {
+                (fact.method, fact.path)
+                for fact in self._policy._authorized_facts(self._observed_atoms)  # noqa: SLF001
+            }
+        )
+        return tuple(routes[:_MAX_PROMPT_NAVIGATION_ROUTES])
+
+    def permits_http_action(self, action: Mapping[str, object]) -> bool:
+        """Authorize one bounded request from accumulated structural evidence."""
+        if (
+            self._poisoned
+            or not isinstance(action, Mapping)
+            or "url" in action
+            or not self.permits_source_informed_action(action)
+        ):
             return False
         method = str(action.get("method") or "GET").upper()
         if method not in {"GET", "HEAD", "OPTIONS"}:
@@ -177,29 +287,45 @@ class SourceNavigationPolicy:
         if parsed is None:
             return False
         path, query_names = parsed
-        for fact, file_lines in self._authorized_facts(observation):
+        for fact in self._policy._authorized_facts(self._observed_atoms):  # noqa: SLF001
             if fact.method != method or fact.path != path:
                 continue
             if all(
-                any(query.name == name and query.line in file_lines for query in fact.query_facts)
+                any(
+                    query.name == name
+                    and self._policy._query_atom(fact, query) in self._observed_atoms  # noqa: SLF001
+                    for query in fact.query_facts
+                )
                 for name in query_names
             ):
                 return True
         return False
 
-    def _authorized_facts(
-        self,
-        observation: Mapping[str, object],
-    ) -> tuple[tuple[_RouteFact, frozenset[int]], ...]:
-        visible = _visible_lines(observation, snapshot_id=self._snapshot_id)
-        if not visible:
-            return ()
-        return tuple(
-            (fact, file_lines)
-            for fact in self._facts
-            if (file_lines := visible.get(fact.source_file, frozenset()))
-            and fact.required_lines.issubset(file_lines)
+    def permits_source_informed_action(self, action: Mapping[str, object]) -> bool:
+        """Require a source-informed action to retain this session's task lineage."""
+        if self._poisoned or not isinstance(action, Mapping):
+            return False
+        if not self._require_task:
+            return True
+        action_task_id = str(action.get("task_id") or "").strip()
+        return bool(
+            self._observation_count
+            and self._task_id
+            and action_task_id == self._task_id
         )
+
+    def clear(self) -> None:
+        """Consume all authority and make the session reusable for a new source chain."""
+        object.__setattr__(self, "_observed_atoms", frozenset())
+        object.__setattr__(self, "_observation_count", 0)
+        object.__setattr__(self, "_task_id", "")
+        object.__setattr__(self, "_poisoned", False)
+
+    def _poison(self) -> None:
+        object.__setattr__(self, "_observed_atoms", frozenset())
+        object.__setattr__(self, "_observation_count", 0)
+        object.__setattr__(self, "_task_id", "")
+        object.__setattr__(self, "_poisoned", True)
 
 
 def build_source_navigation_policy(
@@ -235,7 +361,7 @@ def build_source_navigation_policy(
             ):
                 raise _PolicyOverflowError  # noqa: TRY301
     except _PolicyOverflowError:
-        return SourceNavigationPolicy(context.snapshot_id, ())
+        return SourceNavigationPolicy(context.snapshot_id, (), MappingProxyType({}))
     ordered = tuple(
         sorted(
             set(facts),
@@ -247,7 +373,30 @@ def build_source_navigation_policy(
             ),
         )
     )
-    return SourceNavigationPolicy(context.snapshot_id, ordered)
+    source_lines = sorted(
+        {
+            (fact.source_file, line)
+            for fact in ordered
+            for line in (
+                *fact.required_lines,
+                *(query.line for query in fact.query_facts),
+            )
+        }
+    )
+    line_atoms = {
+        source_line: _requirement_atom(context.snapshot_id, *source_line)
+        for source_line in source_lines
+    }
+    return SourceNavigationPolicy(
+        context.snapshot_id,
+        ordered,
+        MappingProxyType(line_atoms),
+    )
+
+
+def _requirement_atom(snapshot_id: str, source_file: str, line: int) -> int:
+    material = f"{snapshot_id}\0{source_file}\0{line}".encode()
+    return int.from_bytes(hashlib.sha256(material).digest()[:16])
 
 
 def _non_runtime_path(path: PurePosixPath) -> bool:
@@ -2637,9 +2786,9 @@ def _matching_opening_symbol(
     return None
 
 
-def _visible_lines(  # noqa: PLR0911
+def _source_observation_envelope_valid(
     observation: Mapping[str, object], *, snapshot_id: str
-) -> dict[str, frozenset[int]]:
+) -> bool:
     if (
         not isinstance(observation, Mapping)
         or observation.get("schema") != SOURCE_CONTEXT_OBSERVATION_SCHEMA
@@ -2647,43 +2796,97 @@ def _visible_lines(  # noqa: PLR0911
         or observation.get("trust") != SOURCE_CONTEXT_TRUST
         or observation.get("proof_eligible") is not False
     ):
-        return {}
+        return False
     provenance = observation.get("provenance")
-    if (
-        not isinstance(provenance, Mapping)
-        or provenance.get("kind") != SOURCE_CONTEXT_PROVENANCE
-        or provenance.get("snapshot_id") != snapshot_id
-    ):
-        return {}
+    return bool(
+        isinstance(provenance, Mapping)
+        and provenance.get("kind") == SOURCE_CONTEXT_PROVENANCE
+        and provenance.get("snapshot_id") == snapshot_id
+    )
+
+
+def _visible_lines(
+    observation: Mapping[str, object], *, snapshot_id: str
+) -> dict[str, frozenset[int]] | None:
+    if not _source_observation_envelope_valid(observation, snapshot_id=snapshot_id):
+        return None
     observation_type = observation.get("type")
+    if observation_type == "file_list":
+        return _zero_line_page(
+            observation,
+            operation="list_files",
+            collection="files",
+        )
+    if observation_type == "omission_list":
+        return _zero_line_page(
+            observation,
+            operation="list_omissions",
+            collection="omissions",
+        )
     if observation_type == "excerpt":
-        path = observation.get("path")
-        start = observation.get("start_line")
-        end = observation.get("end_line")
-        if (
-            not isinstance(path, str)
-            or type(start) is not int
-            or type(end) is not int
-            or start < 1
-            or end < start
-            or end - start + 1 > MAX_SOURCE_CONTEXT_EXCERPT_LINES
-        ):
-            return {}
-        return {path: frozenset(range(start, end + 1))}
+        return _excerpt_visible_lines(observation)
     if observation_type == "search_results":
-        matches = observation.get("matches")
-        if not isinstance(matches, list) or len(matches) > MAX_SOURCE_CONTEXT_SEARCH_MATCHES:
-            return {}
-        visible: dict[str, set[int]] = {}
-        for match in matches:
-            if not isinstance(match, Mapping) or match.get("text_truncated") is not False:
-                continue
-            path = match.get("path")
-            line = match.get("line")
-            if isinstance(path, str) and type(line) is int and line > 0:
-                visible.setdefault(path, set()).add(line)
-        return {path: frozenset(lines) for path, lines in visible.items()}
+        return _search_visible_lines(observation)
+    return None
+
+
+def _zero_line_page(
+    observation: Mapping[str, object],
+    *,
+    operation: str,
+    collection: str,
+) -> dict[str, frozenset[int]] | None:
+    entries = observation.get(collection)
+    if (
+        observation.get("operation") != operation
+        or not isinstance(entries, list)
+        or len(entries) > MAX_SOURCE_CONTEXT_FILE_PAGE
+    ):
+        return None
     return {}
+
+
+def _excerpt_visible_lines(
+    observation: Mapping[str, object],
+) -> dict[str, frozenset[int]] | None:
+    path = observation.get("path")
+    start = observation.get("start_line")
+    end = observation.get("end_line")
+    if (
+        observation.get("operation") != "excerpt"
+        or not isinstance(path, str)
+        or type(start) is not int
+        or type(end) is not int
+        or start < 1
+        or end < start
+        or end - start + 1 > MAX_SOURCE_CONTEXT_EXCERPT_LINES
+    ):
+        return None
+    return {path: frozenset(range(start, end + 1))}
+
+
+def _search_visible_lines(
+    observation: Mapping[str, object],
+) -> dict[str, frozenset[int]] | None:
+    matches = observation.get("matches")
+    if (
+        observation.get("operation") != "search"
+        or not isinstance(matches, list)
+        or len(matches) > MAX_SOURCE_CONTEXT_SEARCH_MATCHES
+    ):
+        return None
+    visible: dict[str, set[int]] = {}
+    for match in matches:
+        if not isinstance(match, Mapping) or type(match.get("text_truncated")) is not bool:
+            return None
+        if match.get("text_truncated") is True:
+            continue
+        path = match.get("path")
+        line = match.get("line")
+        if not isinstance(path, str) or type(line) is not int or line < 1:
+            return None
+        visible.setdefault(path, set()).add(line)
+    return {path: frozenset(lines) for path, lines in visible.items()}
 
 
 def _parse_relative_location(  # noqa: PLR0911
@@ -2747,4 +2950,8 @@ def _safe_query_name(value: object) -> str:
     )
 
 
-__all__ = ["SourceNavigationPolicy", "build_source_navigation_policy"]
+__all__ = [
+    "SourceNavigationEvidence",
+    "SourceNavigationPolicy",
+    "build_source_navigation_policy",
+]
