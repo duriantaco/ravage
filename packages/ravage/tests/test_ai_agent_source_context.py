@@ -46,8 +46,14 @@ def hidden_route_target() -> Iterator[tuple[str, list[str]]]:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             requests.append(self.path)
-            body = b"hidden route reached" if self.path == "/hidden/admin" else b"root"
+            body = (
+                b'<form action="/response-derived" method="get">'
+                b'<input name="response_field"></form>'
+                if self.path == "/hidden/admin"
+                else b"root"
+            )
             self.send_response(200)
+            self.send_header("Content-Type", "text/html")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -119,6 +125,8 @@ def _source_gate_policy(tmp_path: Path) -> tuple[SourceNavigationPolicy, dict[st
     source_root.mkdir()
     source_root.joinpath("app.py").write_text(
         (
+            "from flask import Flask\n"
+            "app = Flask(__name__)\n"
             '@app.get("/hidden")\n'
             "def hidden():\n"
             '    return request.args.get("mode")\n'
@@ -126,17 +134,21 @@ def _source_gate_policy(tmp_path: Path) -> tuple[SourceNavigationPolicy, dict[st
         encoding="utf-8",
     )
     context = capture_repository(source_root)
-    observation = SourceContextExecutor(context).execute(
-        {
-            "action": "source_context",
-            "operation": "excerpt",
-            "args": {"path": "app.py", "start_line": 1, "end_line": 3},
-        }
-    ).observation
+    observation = (
+        SourceContextExecutor(context)
+        .execute(
+            {
+                "action": "source_context",
+                "operation": "excerpt",
+                "args": {"path": "app.py", "start_line": 1, "end_line": 5},
+            }
+        )
+        .observation
+    )
     return build_source_navigation_policy(context), observation
 
 
-def test_source_navigation_is_transient_and_can_drive_a_live_route(
+def test_source_navigation_is_transient_and_can_drive_a_live_route(  # noqa: PLR0915
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     hidden_route_target: tuple[str, list[str]],
@@ -179,7 +191,7 @@ def test_source_navigation_is_transient_and_can_drive_a_live_route(
                 "action": "source_context",
                 "task_id": "surface-map",
                 "operation": "excerpt",
-                "args": {"path": "app.py", "start_line": 4, "end_line": 8},
+                "args": {"path": "app.py", "start_line": 1, "end_line": 8},
             },
             {
                 "action": "http_request",
@@ -225,11 +237,33 @@ def test_source_navigation_is_transient_and_can_drive_a_live_route(
     }
     assert _prompt(model, 1)["source_context_observation"]["operation"] == "search"
     assert SEARCH_SENTINEL in json.dumps(_prompt(model, 1))
+    assert set(_prompt(model, 1)["action_schema"]) == {"run_probe", "source_context"}
+    assert "source_context_http_routes" not in _prompt(model, 1)
     assert _prompt(model, 2)["source_context_observation"]["operation"] == "excerpt"
+    assert set(_prompt(model, 2)["action_schema"]) == {
+        "http_request",
+        "run_probe",
+        "source_context",
+    }
+    assert set(_prompt(model, 2)["action_schema"]["http_request"]) == {
+        "action",
+        "task_id",
+        "method",
+        "path",
+    }
+    assert _prompt(model, 2)["source_context_http_routes"] == [
+        {"method": "GET", "path": "/hidden/admin"}
+    ]
+    assert any(
+        "emit exactly action, task_id, method, and path" in instruction
+        for instruction in _prompt(model, 2)["tool_guidance"]
+    )
     assert SOURCE_SENTINEL in json.dumps(_prompt(model, 2))
     assert SEARCH_SENTINEL not in json.dumps(_prompt(model, 2))
     assert "source_context_observation" not in _prompt(model, 3)
+    assert "form" in _prompt(model, 3)["action_schema"]["http_request"]
     assert _prompt(model, 4)["source_context_observation"]["type"] == "error"
+    assert set(_prompt(model, 4)["action_schema"]) == {"run_probe", "source_context"}
     assert _prompt(model, 5)["source_context_observation"]["operation"] == "excerpt"
 
     events = [
@@ -237,9 +271,7 @@ def test_source_navigation_is_transient_and_can_drive_a_live_route(
         for line in workspace.joinpath("events.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     selections = [
-        event["payload"]["action"]
-        for event in events
-        if event["kind"] == "agent_action_selected"
+        event["payload"]["action"] for event in events if event["kind"] == "agent_action_selected"
     ]
     selection_payloads = [
         event["payload"] for event in events if event["kind"] == "agent_action_selected"
@@ -257,8 +289,52 @@ def test_source_navigation_is_transient_and_can_drive_a_live_route(
         "task_id": "surface-map",
     }
     assert selection_payloads[5]["source_informed"] is True
+    harness_selections = [
+        event["payload"] for event in events if event["kind"] == "harness_selection"
+    ]
+    assert harness_selections[5]["source_informed"] is True
+    action_starts = [event["payload"] for event in events if event["kind"] == "action_started"]
+    assert action_starts[5]["source_informed"] is True
+    http_events = [event for event in events if event["kind"] == "tool_http_request"]
+    assert http_events[-1]["payload"]["source_informed"] is True
     assert "/hidden/admin" in requests
     assert all(SOURCE_SENTINEL not in request for request in requests)
+
+    transcript = [
+        json.loads(line)
+        for line in workspace.joinpath("transcript.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    tool_envelopes = [
+        json.loads(item["content"])
+        for item in transcript
+        if item["role"] == "tool" and item["content"].startswith("{")
+    ]
+    assert tool_envelopes[-1]["source_informed"] is True
+
+    blackboard = json.loads(
+        workspace.joinpath("evidence-blackboard.json").read_text(encoding="utf-8")
+    )
+    raw_http_records = [
+        record
+        for record in blackboard["records"]
+        if record["kind"] == "raw_observation" and record["source"] == "tool_http_request"
+    ]
+    assert raw_http_records[-1]["payload"]["source_informed"] is True
+
+    exchanges = [
+        json.loads(line)
+        for line in workspace.joinpath("traffic", "exchanges.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert exchanges[-1]["request"]["resource_type"] == "source_informed_agent_http"
+
+    attempts = [event["payload"] for event in events if event["kind"] == "agent_attempt_recorded"]
+    assert attempts[-1]["source_informed"] is True
+    assert attempts[-1]["outcome"]["source_informed"] is True
+    turn_traces = [event["payload"] for event in events if event["kind"] == "harness_turn_trace"]
+    assert turn_traces[-1]["source_informed"] is True
+    assert turn_traces[-1]["outcome"]["source_informed"] is True
 
     for artifact in [*workspace.rglob("*"), audit_path]:
         if artifact.is_file():
@@ -282,6 +358,52 @@ def test_source_navigation_is_transient_and_can_drive_a_live_route(
     assert SEARCH_SENTINEL not in evidence_memory
     assert saved["actions"][-1]["source_informed"] is True
     assert saved["last_observation"]["source_informed"] is True
+    hidden_operations = [
+        operation
+        for operation in saved["surface_graph"]["operations"]
+        if operation["route_shape"] == "/hidden/admin"
+    ]
+    assert "source_informed_agent_http_response" in hidden_operations[-1]["provenance"]
+    derived_operations = [
+        operation
+        for operation in saved["surface_graph"]["operations"]
+        if operation["route_shape"] == "/response-derived"
+    ]
+    assert derived_operations[-1]["provenance"] == [
+        "native_recon",
+        "source_informed_agent_http_response",
+    ]
+    derived_observations = [
+        observation
+        for observation in saved["surface_graph"]["observations"]
+        if observation["operation_id"] == derived_operations[-1]["operation_id"]
+    ]
+    assert derived_observations[-1]["source_kind"] == ("source_informed_agent_http_response")
+    derived_template = next(
+        template
+        for template in saved["surface"]["request_templates"]
+        if template["url"].endswith("/response-derived")
+    )
+    assert derived_template["sources"] == ["source_informed_agent_http_response"]
+    derived_parameter = next(
+        parameter
+        for parameter in saved["surface"]["parameters"]
+        if parameter["name"] == "response_field"
+    )
+    assert "source_informed_agent_http_response" in derived_parameter["sources"]
+    lineage = saved["surface"]["source_informed_signal_lineage"]
+    assert {(item["kind"], item["value"], item["source_kind"]) for item in lineage} >= {
+        (
+            "endpoints",
+            "/response-derived",
+            "source_informed_agent_http_response",
+        ),
+        (
+            "parameters",
+            "response_field",
+            "source_informed_agent_http_response",
+        ),
+    }
 
 
 def test_final_harness_rewrite_cannot_bypass_source_navigation_policy(
@@ -301,7 +423,7 @@ def test_final_harness_rewrite_cannot_bypass_source_navigation_policy(
                 "action": "source_context",
                 "task_id": "surface-map",
                 "operation": "excerpt",
-                "args": {"path": "app.py", "start_line": 4, "end_line": 8},
+                "args": {"path": "app.py", "start_line": 1, "end_line": 8},
             },
             {
                 "action": "http_request",
@@ -311,21 +433,28 @@ def test_final_harness_rewrite_cannot_bypass_source_navigation_policy(
             },
         ]
     )
-    original_selector = ai_agent._model_action_from_parsed  # noqa: SLF001
+    original_resolver = ai_agent._resolve_same_turn_harness_action  # noqa: SLF001
 
     def rewrite_after_source(
-        action: dict[str, object],
+        *,
+        selected_action: dict[str, object],
         **kwargs: object,
-    ) -> dict[str, object]:
-        if action.get("action") == "source_context":
-            return original_selector(action, **kwargs)  # type: ignore[arg-type]
-        return {
-            "action": "http_request",
-            "method": "GET",
-            "path": f"/{SOURCE_SENTINEL}",
-        }
+    ) -> tuple[dict[str, object], str | None]:
+        if selected_action.get("action") == "source_context":
+            return original_resolver(  # type: ignore[arg-type]
+                selected_action=selected_action,
+                **kwargs,
+            )
+        return (
+            {
+                "action": "http_request",
+                "method": "GET",
+                "path": f"/{SOURCE_SENTINEL}",
+            },
+            "test_final_harness_rewrite",
+        )
 
-    monkeypatch.setattr(ai_agent, "_model_action_from_parsed", rewrite_after_source)
+    monkeypatch.setattr(ai_agent, "_resolve_same_turn_harness_action", rewrite_after_source)
     monkeypatch.setattr(ai_agent, "_forced_evidence_probe_action", lambda **_kwargs: None)
     monkeypatch.setattr(ai_agent, "_forced_primitive_probe_action", lambda **_kwargs: None)
 
@@ -350,9 +479,7 @@ def test_final_harness_rewrite_cannot_bypass_source_navigation_policy(
         for line in workspace.joinpath("events.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     selections = [
-        event["payload"]["action"]
-        for event in events
-        if event["kind"] == "agent_action_selected"
+        event["payload"]["action"] for event in events if event["kind"] == "agent_action_selected"
     ]
     assert selections[-1]["action"] == "invalid"
     assert all(SOURCE_SENTINEL not in request for request in requests)
@@ -440,9 +567,9 @@ def test_identical_source_lookup_is_blocked_after_two_executions(
     ]
     assert [receipt["ok"] for receipt in receipts] == [True, True, False]
     assert receipts[2]["error_code"] == "identical_action_limit"
-    assert receipts[2]["cumulative_observation_chars"] == receipts[1][
-        "cumulative_observation_chars"
-    ]
+    assert (
+        receipts[2]["cumulative_observation_chars"] == receipts[1]["cumulative_observation_chars"]
+    )
     assert SEARCH_SENTINEL.encode() not in workspace.joinpath("events.jsonl").read_bytes()
 
 
@@ -521,6 +648,30 @@ def test_post_source_gate_rejects_every_nonempty_query_value(
 
     assert blocked["action"] == "invalid"
     assert value not in json.dumps(blocked)
+
+
+@pytest.mark.parametrize("kind", ["http_request", "run_probe"])
+def test_post_source_gate_rejects_unknown_task_id(tmp_path: Path, kind: str) -> None:
+    state = AgentState(tasks=[{"id": "surface-map", "status": "pending"}])
+    action: dict[str, object] = {
+        "action": kind,
+        "task_id": "unknown-task",
+    }
+    if kind == "http_request":
+        action.update({"method": "GET", "path": "/hidden"})
+    else:
+        action["probe"] = "surface_map"
+    policy, observation = _source_gate_policy(tmp_path)
+
+    blocked = _without_source_narrative(
+        action,
+        state=state,
+        navigation_policy=policy,
+        source_observation=observation,
+    )
+
+    assert blocked["action"] == "invalid"
+    assert "unknown-task" not in json.dumps(blocked)
 
 
 @pytest.mark.parametrize("kind", ["http_request", "run_probe"])
