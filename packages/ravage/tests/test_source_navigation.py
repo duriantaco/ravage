@@ -225,12 +225,17 @@ def test_task_bound_evidence_rejects_missing_and_switched_tasks(tmp_path: Path) 
     route = _excerpt(executor, "app.py", 3, 4)
     evidence = policy.begin_evidence(require_task=True)
 
+    assert evidence.task_id == ""
+
     assert not evidence.observe(binding)
+    assert evidence.task_id == ""
     assert not evidence.observe(route, task_id="task-a")
 
     evidence.clear()
     assert evidence.observe(binding, task_id="task-a")
+    assert evidence.task_id == "task-a"
     assert evidence.observe(route, task_id="task-b")
+    assert evidence.task_id == "task-b"
     assert not evidence.permits_http_action(
         {
             "action": "http_request",

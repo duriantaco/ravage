@@ -283,7 +283,7 @@ def test_cross_file_mounted_route_can_drive_one_live_request(
             },
             {
                 "action": "http_request",
-                "task_id": "surface-map",
+                "task_id": "command-boundary",
                 "method": "GET",
                 "path": "/api/health",
             },
@@ -312,6 +312,15 @@ def test_cross_file_mounted_route_can_drive_one_live_request(
     assert _prompt(model, 2)["source_context_http_routes"] == [
         {"method": "GET", "path": "/api/health"}
     ]
+    assert _prompt(model, 2)["source_context_task_id"] == "surface-map"
+    focused_schema = _prompt(model, 2)["action_schema"]
+    assert focused_schema["http_request"]["task_id"] == "surface-map"
+    assert focused_schema["run_probe"]["task_id"] == "surface-map"
+    assert focused_schema["source_context"]["task_id"] == "surface-map"
+    assert {
+        example["task_id"]
+        for example in focused_schema["source_context"]["valid_examples"]
+    } == {"surface-map"}
     assert "/api/health" in requests
 
     selections = [
@@ -986,7 +995,7 @@ def test_post_source_gate_requires_visible_structural_path_and_query_names(
     assert SOURCE_SENTINEL not in json.dumps(blocked)
 
 
-def test_accumulated_source_gate_requires_the_observing_task(tmp_path: Path) -> None:
+def test_accumulated_source_gate_retains_the_observing_task(tmp_path: Path) -> None:
     state = AgentState(
         tasks=[
             {"id": "surface-map", "status": "pending"},
@@ -1007,7 +1016,7 @@ def test_accumulated_source_gate_requires_the_observing_task(tmp_path: Path) -> 
         state=state,
         navigation_evidence=evidence,
     )
-    wrong_task = _without_source_narrative(
+    switched_active_task = _without_source_narrative(
         {
             "action": "http_request",
             "task_id": "flag-and-secret-sweep",
@@ -1026,11 +1035,21 @@ def test_accumulated_source_gate_requires_the_observing_task(tmp_path: Path) -> 
         state=state,
         navigation_evidence=evidence,
     )
-    wrong_task_probe = _without_source_narrative(
+    switched_active_task_probe = _without_source_narrative(
         {
             "action": "run_probe",
             "task_id": "flag-and-secret-sweep",
             "probe": "surface_map",
+        },
+        state=state,
+        navigation_evidence=evidence,
+    )
+    unknown_action_task = _without_source_narrative(
+        {
+            "action": "http_request",
+            "task_id": "unknown-task",
+            "method": "GET",
+            "path": "/hidden",
         },
         state=state,
         navigation_evidence=evidence,
@@ -1046,9 +1065,10 @@ def test_accumulated_source_gate_requires_the_observing_task(tmp_path: Path) -> 
     )
 
     assert allowed["action"] == "http_request"
-    assert wrong_task["action"] == "invalid"
+    assert switched_active_task == allowed
     assert missing_action_task["action"] == "invalid"
-    assert wrong_task_probe["action"] == "invalid"
+    assert switched_active_task_probe == matching_task_probe
+    assert unknown_action_task["action"] == "invalid"
     assert matching_task_probe["action"] == "run_probe"
 
 
