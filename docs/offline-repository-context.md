@@ -91,7 +91,7 @@ observation budget.
 
 Source is hypothesis material and never target evidence or proof. Immediately
 after a source observation, the model may issue another source action, a
-catalogued native probe, or a bodyless `GET`, `HEAD`, or `OPTIONS` request. A
+catalogued native probe, or a bodyless `GET`, `HEAD`, or `OPTIONS` request. An
 exact static route path whose complete structural lines appeared in the current
 consecutive-read chain may be used so the agent can test hidden application
 routes. Empty-valued query-field names are allowed only when they are structurally
@@ -100,6 +100,34 @@ headers, bodies,
 commands, findings, and narrative fields are blocked on that turn. Any security
 conclusion still requires evidence returned by the live target or a trusted typed
 validator.
+
+For Python applications, static route discovery follows direct relative imports
+between modules for FastAPI `FastAPI`/`APIRouter` `include_router` mounts and
+Flask `Flask`/`Blueprint` `register_blueprint` mounts. It composes literal router,
+blueprint, and registration prefixes, including bounded nested mounts, and
+requires the relevant constructor, import, mount, and route lines from every file
+before authorizing a request. Route authority is emitted only for modules whose
+import-time statements fit the passive static subset; receiver escapes,
+mutation hooks, uncertain control flow, active package initializers, and local
+modules that can shadow a framework import fail closed. Dynamic prefixes,
+ambiguous bindings, multiple mounts of one component, absolute application
+imports, re-exports, application-factory mounts, annotations outside the narrow
+validated builtin/FastAPI/typing subset, and annotated module assignments
+currently yield no route authorization. An omitted runtime-source file or
+directory also makes route coverage incomplete and yields no authority.
+Framework metadata/static routes, implicit Flask methods, alternate-slash
+redirects, and competing recognized roots occupy their live paths without
+granting source authority themselves. Routes added to a FastAPI router after a
+same-file mount are also excluded until dependency-version evidence can select
+the framework's copy or live-refresh behavior safely. Discovery starts from
+every supported application constructor in the captured snapshot; ambiguous
+method/path ownership across those roots and other supported languages fails
+closed. It does not identify which application object a deployment serves or
+prove that a discovered route is live. Python can also select constructors and
+modules through arbitrary runtime data flow; only the direct imports and literal
+dynamic-import forms recognized by this static grammar participate in the
+completeness check. The bodyless request to the configured target is the
+reachability check.
 
 Search is case-sensitive literal text lookup. It returns matching lines with
 one-based line/column positions, repository-relative paths, and file content
@@ -156,7 +184,10 @@ Run the offline suite:
 ```bash
 .venv/bin/python -m pytest \
   packages/ravage/tests/test_repository_context.py \
-  packages/ravage/tests/test_repository_review.py -q
+  packages/ravage/tests/test_repository_review.py \
+  packages/ravage/tests/test_source_navigation.py \
+  packages/ravage/tests/test_source_navigation_python_mounts.py \
+  packages/ravage/tests/test_ai_agent_source_context.py -q
 ```
 
 The fixed fixture contains eight harmless Python, TypeScript/TSX, JSON, YAML,
