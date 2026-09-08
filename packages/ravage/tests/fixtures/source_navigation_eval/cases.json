@@ -1,0 +1,90 @@
+{
+  "schema": "ravage.source-navigation-corpus.v1",
+  "cases": [
+    {
+      "id": "flask-direct", "framework": "flask", "category": "supported",
+      "description": "A literal route bound to one Flask application.",
+      "files": {"app.py": "from flask import Flask\napp = Flask(__name__)\n@app.get('/health')\ndef health():\n    return 'ready'\n"},
+      "expected_routes": [["GET", "/health"]], "forbidden_routes": [["GET", "/absent"]]
+    },
+    {
+      "id": "fastapi-direct", "framework": "fastapi", "category": "supported",
+      "description": "Two independent bodyless routes with framework documentation disabled.",
+      "files": {"main.py": "from fastapi import FastAPI\napp = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)\n@app.get('/health')\ndef health():\n    return {'ready': True}\n@app.get('/version')\ndef version():\n    return {'version': 'fixture'}\n"},
+      "expected_routes": [["GET", "/health"], ["GET", "/version"]], "forbidden_routes": [["GET", "/docs"]]
+    },
+    {
+      "id": "fastapi-mounted", "framework": "fastapi", "category": "supported",
+      "description": "The prefix and route live in separate modules.",
+      "files": {"service/__init__.py": "", "service/routes.py": "from fastapi import APIRouter\nrouter = APIRouter()\n@router.get('/health')\ndef health():\n    return {'ready': True}\n", "service/main.py": "from fastapi import FastAPI\nfrom .routes import router\napp = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)\napp.include_router(router, prefix='/api')\n"},
+      "expected_routes": [["GET", "/api/health"]], "forbidden_routes": [["GET", "/health"]]
+    },
+    {
+      "id": "flask-blueprint", "framework": "flask", "category": "supported",
+      "description": "A separately imported blueprint receives an application prefix.",
+      "files": {"service/__init__.py": "", "service/views.py": "from flask import Blueprint\nviews = Blueprint('status', __name__)\n@views.get('/health')\ndef health():\n    return 'ready'\n", "service/main.py": "from flask import Flask\nfrom .views import views\napp = Flask(__name__)\napp.register_blueprint(views, url_prefix='/api')\n"},
+      "expected_routes": [["GET", "/api/health"]], "forbidden_routes": [["GET", "/health"]]
+    },
+    {
+      "id": "fastapi-nested", "framework": "fastapi", "category": "supported",
+      "description": "The final route requires all three modules and four prefix fragments.",
+      "files": {"service/__init__.py": "", "service/leaf.py": "from fastapi import APIRouter\nleaf = APIRouter(prefix='/leaf')\n@leaf.get('/health')\ndef health():\n    return {'ready': True}\n", "service/middle.py": "from fastapi import APIRouter\nfrom .leaf import leaf\nmiddle = APIRouter(prefix='/middle')\nmiddle.include_router(leaf, prefix='/nested')\n", "service/main.py": "from fastapi import FastAPI\nfrom .middle import middle\napp = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)\napp.include_router(middle, prefix='/api')\n"},
+      "expected_routes": [["GET", "/api/middle/nested/leaf/health"]], "forbidden_routes": [["GET", "/health"], ["GET", "/api/health"]]
+    },
+    {
+      "id": "express-direct", "framework": "express", "category": "supported",
+      "description": "An Express application with a literal route and unrelated string.",
+      "files": {"server.js": "const express = require('express');\nconst app = express();\nconst note = '/not-a-route';\napp.get('/health', (req, res) => res.send('ready'));\n"},
+      "expected_routes": [["GET", "/health"]], "forbidden_routes": [["GET", "/not-a-route"]]
+    },
+    {
+      "id": "flask-empty-query", "framework": "flask", "category": "supported",
+      "description": "A query name is structural but a source string must not become a query value.",
+      "files": {"app.py": "from flask import Flask, request\napp = Flask(__name__)\n@app.get('/status')\ndef status():\n    return request.args.get('format', '')\n"},
+      "expected_routes": [["GET", "/status"]], "forbidden_routes": [["GET", "/status?format=source-value"], ["GET", "/status?unknown="]]
+    },
+    {
+      "id": "misleading-text", "framework": "flask", "category": "supported",
+      "description": "Comment and string lookalikes cannot create routes.",
+      "files": {"app.py": "from flask import Flask\napp = Flask(__name__)\n# @app.get('/comment-only')\nNOTE = \"@app.get('/string-only')\"\n@app.get('/health')\ndef health():\n    return 'ready'\n"},
+      "expected_routes": [["GET", "/health"]], "forbidden_routes": [["GET", "/comment-only"], ["GET", "/string-only"]]
+    },
+    {
+      "id": "orphan-router", "framework": "fastapi", "category": "negative",
+      "description": "A router with no root application mount is not a reachable application route.",
+      "files": {"routes.py": "from fastapi import APIRouter\nrouter = APIRouter()\n@router.get('/health')\ndef health():\n    return {'ready': True}\n"},
+      "expected_routes": [], "forbidden_routes": [["GET", "/health"]]
+    },
+    {
+      "id": "missing-router-module", "framework": "fastapi", "category": "negative",
+      "description": "An imported router file is missing from the repository.",
+      "files": {"service/__init__.py": "", "service/main.py": "from fastapi import FastAPI\nfrom .missing import router\napp = FastAPI()\napp.include_router(router, prefix='/api')\n"},
+      "expected_routes": [], "forbidden_routes": [["GET", "/api/health"]]
+    },
+    {
+      "id": "dynamic-prefix", "framework": "fastapi", "category": "unsupported",
+      "description": "An environment-dependent prefix has no exact static navigation authority.",
+      "files": {"service/__init__.py": "", "service/routes.py": "from fastapi import APIRouter\nrouter = APIRouter()\n@router.get('/health')\ndef health():\n    return {'ready': True}\n", "service/main.py": "import os\nfrom fastapi import FastAPI\nfrom .routes import router\napp = FastAPI()\napp.include_router(router, prefix=os.environ.get('ROUTE_PREFIX', '/api'))\n"},
+      "expected_routes": [], "forbidden_routes": [["GET", "/api/health"], ["GET", "/health"]]
+    },
+    {
+      "id": "duplicate-handler", "framework": "fastapi", "category": "negative",
+      "description": "Two handlers compete for the same method and path.",
+      "files": {"main.py": "from fastapi import FastAPI\napp = FastAPI()\n@app.get('/health')\ndef first():\n    return {'version': 1}\n@app.get('/health')\ndef second():\n    return {'version': 2}\n"},
+      "expected_routes": [], "forbidden_routes": [["GET", "/health"]]
+    },
+    {
+      "id": "omitted-runtime-file", "framework": "mixed", "category": "unsupported",
+      "description": "A runtime file omitted by the byte limit can hide a conflicting root.",
+      "max_file_bytes": 180,
+      "files": {"app.py": "# This runtime module intentionally exceeds the fixture capture byte limit, so its application occupancy cannot be established from the captured snapshot. The resulting incomplete snapshot must not authorize a competing route.\nfrom flask import Flask\napp = Flask(__name__)\n", "server.js": "const express = require('express');\nconst app = express();\napp.get('/static/health.txt', (req, res) => res.send('ready'));\n"},
+      "expected_routes": [], "forbidden_routes": [["GET", "/static/health.txt"]]
+    },
+    {
+      "id": "dynamic-express-path", "framework": "express", "category": "unsupported",
+      "description": "A runtime route expression must not be replaced with a nearby string.",
+      "files": {"server.js": "const express = require('express');\nconst app = express();\nconst hint = '/health';\napp.get(process.env.ROUTE_PATH, (req, res) => res.send('ready'));\n"},
+      "expected_routes": [], "forbidden_routes": [["GET", "/health"]]
+    }
+  ]
+}
