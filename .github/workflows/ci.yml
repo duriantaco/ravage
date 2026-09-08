@@ -183,6 +183,57 @@ jobs:
       - name: Run all tests that do not require external services
         run: python -m pytest -m "not integration" -q
 
+  review_quality:
+    name: Read-only review quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up evaluation Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12.13"
+
+      - name: Install the frozen evaluation dependencies
+        run: |
+          python -m pip install -c benchmarks/repository-review/requirements.txt \
+            -r benchmarks/repository-review/requirements.txt \
+            -e packages/schemas -e packages/ravage
+
+      - name: Require the measured read-only review baseline
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          PUSH_BEFORE_SHA: ${{ github.event.before || '' }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${OPENAI_API_KEY}" ]]; then
+            echo "::error::The review quality gate requires the OPENAI_API_KEY Actions secret."
+          fi
+          gate_base="${PR_BASE_SHA:-${PUSH_BEFORE_SHA}}"
+          if [[ -z "${gate_base}" || "${gate_base}" =~ ^0+$ ]]; then
+            gate_base="$(git rev-parse origin/main)"
+          fi
+          python scripts/eval/run_review_quality_gate.py check \
+            --base-revision "${gate_base}" \
+            --allow-paid-models \
+            --output-dir /tmp/repository-review-quality
+
+      - name: Retain quality scores and diagnostic evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: repository-review-quality-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/repository-review-quality/
+          if-no-files-found: error
+          retention-days: 30
+
   clean_install:
     name: Clean wheel install smoke
     runs-on: ubuntu-latest
@@ -251,6 +302,7 @@ jobs:
       - clean_install
       - cockpit_browser
       - scope_integration
+      - review_quality
     runs-on: ubuntu-latest
     steps:
       - name: Require every regression gate
@@ -260,9 +312,11 @@ jobs:
           CLEAN_INSTALL_RESULT: ${{ needs.clean_install.result }}
           COCKPIT_BROWSER_RESULT: ${{ needs.cockpit_browser.result }}
           SCOPE_INTEGRATION_RESULT: ${{ needs.scope_integration.result }}
+          REVIEW_QUALITY_RESULT: ${{ needs.review_quality.result }}
         run: |
           test "${STATIC_RESULT}" = success
           test "${TEST_RESULT}" = success
           test "${CLEAN_INSTALL_RESULT}" = success
           test "${COCKPIT_BROWSER_RESULT}" = success
           test "${SCOPE_INTEGRATION_RESULT}" = success
+          test "${REVIEW_QUALITY_RESULT}" = success

@@ -4,6 +4,10 @@ The permanent runner checks route inventory and a harmless local source-to-reque
 handoff. Use it to catch regressions before changing the source reader or its
 authorization gate.
 
+The separate [read-only review quality gate](review-quality-gate.md) measures
+repeated GPT-5.4 reviews against a frozen detection baseline and blocks the
+required CI aggregate when quality regresses.
+
 ## Offline inventory
 
 From a checkout with the development dependencies installed:
