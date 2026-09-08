@@ -51,7 +51,9 @@ random starting order, and every arm has an eight-turn limit.
 
 The harness uses the production source executor, prompt helper, and authorization
 gate. Its action dispatcher permits fixture reads and bodyless GET requests to
-its own loopback server. It does not launch the full agent. A treatment pass
+its own loopback server. Both arms receive the same explicit path and request
+field limits. Rejected actions fail the run with a fixed diagnostic code without
+recording their raw contents. It does not launch the full agent. A treatment pass
 requires source evidence, an advertised route, a proposed and selected request,
 the observed server request, and the exact server-issued receipt to agree.
 The control must not obtain the receipt. Reports store hashes and boolean links,

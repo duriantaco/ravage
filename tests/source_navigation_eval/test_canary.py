@@ -39,20 +39,40 @@ def test_scripted_canary_links_actual_receipts_and_preserves_isolation() -> None
 
 
 @pytest.mark.parametrize(
-    "action",
+    ("action", "code"),
     [
-        {"action": "run_probe", "probe": "surface_map"},
-        {"action": "run_command", "command": "anything"},
-        {"action": "http_request", "method": "POST", "path": "/"},
-        {"action": "http_request", "method": "GET", "url": "https://example.invalid/"},
-        {"action": "http_request", "method": "GET", "path": "//example.invalid/"},
-        {"action": "http_request", "method": "GET", "path": "http://example.invalid/"},
-        {"action": "http_request", "method": "GET", "path": "/\r\nHeader: value"},
-        {"action": "http_request", "method": "GET", "path": "/", "body": "data"},
-        {"action": "http_request", "method": "GET", "path": "/", "headers": {}},
+        ({"action": "run_probe", "probe": "surface_map"}, "unsupported_action"),
+        ({"action": "run_command", "command": "anything"}, "unsupported_action"),
+        ({"action": "http_request", "method": "POST", "path": "/"}, "unsupported_method"),
+        (
+            {"action": "http_request", "method": "GET", "url": "https://example.invalid/"},
+            "unexpected_fields",
+        ),
+        (
+            {"action": "http_request", "method": "GET", "path": "//example.invalid/"},
+            "invalid_relative_path",
+        ),
+        (
+            {"action": "http_request", "method": "GET", "path": "http://example.invalid/"},
+            "invalid_relative_path",
+        ),
+        (
+            {"action": "http_request", "method": "GET", "path": "/\r\nHeader: value"},
+            "invalid_relative_path",
+        ),
+        (
+            {"action": "http_request", "method": "GET", "path": "/", "body": "data"},
+            "unexpected_fields",
+        ),
+        (
+            {"action": "http_request", "method": "GET", "path": "/", "headers": {}},
+            "unexpected_fields",
+        ),
     ],
 )
-def test_unsupported_actions_send_no_traffic(tmp_path: Path, action: dict[str, object]) -> None:
+def test_unsupported_actions_send_no_traffic(
+    tmp_path: Path, action: dict[str, object], code: str
+) -> None:
     class InvalidDriver(ScriptedDriver):
         def action(self, _prompt: dict[str, object]) -> dict[str, object]:
             return {"task_id": "surface-map", **action}
@@ -61,7 +81,7 @@ def test_unsupported_actions_send_no_traffic(tmp_path: Path, action: dict[str, o
     materialize(case, tmp_path)
     result = run_arm(tmp_path, "/api/health", treatment=False, driver=InvalidDriver())
     assert not result["passed"]
-    assert result["errors"]
+    assert result["errors"] == [f"local action rejected: {code}"]
     assert result["request_count"] == 0
 
 
