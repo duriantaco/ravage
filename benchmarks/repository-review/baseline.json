@@ -1,0 +1,816 @@
+{
+  "elapsed_seconds": 1796.8155468330078,
+  "engine_digest": "sha256:a91ae5457850795583166930f0d12936bdf5f71877d06432bfe19d69618f7969",
+  "evaluator_digest": "sha256:431056cf9a58ad0b6f61454ac11633576708577049a290ec0a9d1add4f1a61da",
+  "measured_at": "2026-09-08T07:01:44.477094+00:00",
+  "policy": {
+    "input_price": 2.5,
+    "manifest_digest": "sha256:2a11a95152385f6a5434c68ca87fe6a246652e3f396071405393b58a41f5c60d",
+    "max_cost_per_run_usd": 0.5,
+    "max_cost_usd": 10.0,
+    "max_effort_ratio": 1.5,
+    "max_output_tokens": 4096,
+    "max_turns": 24,
+    "min_precision": 0.9,
+    "min_recall": 0.8,
+    "model": "gpt-5.4-2026-03-05",
+    "output_price": 15.0,
+    "reasoning_effort": "high",
+    "repeats": 3,
+    "schema_version": "ravage.repository-review-quality-policy.v1"
+  },
+  "raw_report_digest": "sha256:a9eb0eab23aa053be353a01502ef058e0b1fa53103ad13d2d32843c00f73242b",
+  "revision": "18d2bb93ac9226af6966e9acfa6653b40dd9f426",
+  "runtime": {
+    "PyYAML": "6.0.3",
+    "cryptography": "48.0.0",
+    "pathspec": "1.1.1",
+    "pydantic": "2.13.4",
+    "python": "3.12.13",
+    "rich": "15.0.0"
+  },
+  "samples": [
+    {
+      "arm": "literal_only",
+      "case_id": "aurora",
+      "cost_usd": 0.034708,
+      "false_positives": 0,
+      "hits": [
+        "order-access-01"
+      ],
+      "input_tokens": 9610,
+      "model_calls": 7,
+      "output_tokens": 981,
+      "repeat": 1,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "aurora",
+      "cost_usd": 0.036265,
+      "false_positives": 0,
+      "hits": [
+        "order-access-01"
+      ],
+      "input_tokens": 8986,
+      "model_calls": 6,
+      "output_tokens": 920,
+      "repeat": 1,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "boreal",
+      "cost_usd": 0.0291585,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 10731,
+      "model_calls": 7,
+      "output_tokens": 693,
+      "repeat": 1,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "boreal",
+      "cost_usd": 0.0460155,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 13329,
+      "model_calls": 9,
+      "output_tokens": 1115,
+      "repeat": 1,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "cinder",
+      "cost_usd": 0.033665,
+      "false_positives": 0,
+      "hits": [
+        "process-boundary-01"
+      ],
+      "input_tokens": 6764,
+      "model_calls": 6,
+      "output_tokens": 1117,
+      "repeat": 1,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "cinder",
+      "cost_usd": 0.0434395,
+      "false_positives": 0,
+      "hits": [
+        "process-boundary-01"
+      ],
+      "input_tokens": 15325,
+      "model_calls": 8,
+      "output_tokens": 1417,
+      "repeat": 1,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "delta",
+      "cost_usd": 0.0484375,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 8347,
+      "model_calls": 6,
+      "output_tokens": 1838,
+      "repeat": 1,
+      "unscored_findings": 1
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "delta",
+      "cost_usd": 0.091266,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 12354,
+      "model_calls": 8,
+      "output_tokens": 4563,
+      "repeat": 1,
+      "unscored_findings": 2
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "elm",
+      "cost_usd": 0.0319275,
+      "false_positives": 0,
+      "hits": [
+        "catalog-query-01"
+      ],
+      "input_tokens": 8703,
+      "model_calls": 8,
+      "output_tokens": 678,
+      "repeat": 1,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "elm",
+      "cost_usd": 0.0351075,
+      "false_positives": 0,
+      "hits": [
+        "catalog-query-01"
+      ],
+      "input_tokens": 9729,
+      "model_calls": 7,
+      "output_tokens": 719,
+      "repeat": 1,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "flint",
+      "cost_usd": 0.034353,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 10458,
+      "model_calls": 7,
+      "output_tokens": 816,
+      "repeat": 1,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "flint",
+      "cost_usd": 0.041785,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 10324,
+      "model_calls": 8,
+      "output_tokens": 1065,
+      "repeat": 1,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "grove",
+      "cost_usd": 0.0386875,
+      "false_positives": 0,
+      "hits": [
+        "export-path-01"
+      ],
+      "input_tokens": 10291,
+      "model_calls": 8,
+      "output_tokens": 864,
+      "repeat": 1,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "grove",
+      "cost_usd": 0.0348255,
+      "false_positives": 0,
+      "hits": [
+        "export-path-01"
+      ],
+      "input_tokens": 9297,
+      "model_calls": 6,
+      "output_tokens": 1041,
+      "repeat": 1,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "harbor",
+      "cost_usd": 0.0455765,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 14459,
+      "model_calls": 8,
+      "output_tokens": 1435,
+      "repeat": 1,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "harbor",
+      "cost_usd": 0.0387125,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 6479,
+      "model_calls": 6,
+      "output_tokens": 1501,
+      "repeat": 1,
+      "unscored_findings": 1
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "juniper",
+      "cost_usd": 0.1226455,
+      "false_positives": 0,
+      "hits": [
+        "report-path-01"
+      ],
+      "input_tokens": 105859,
+      "model_calls": 17,
+      "output_tokens": 2898,
+      "repeat": 1,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "juniper",
+      "cost_usd": 0.196142,
+      "false_positives": 0,
+      "hits": [
+        "report-path-01"
+      ],
+      "input_tokens": 167024,
+      "model_calls": 20,
+      "output_tokens": 5130,
+      "repeat": 1,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "keystone",
+      "cost_usd": 0.215765,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 236018,
+      "model_calls": 22,
+      "output_tokens": 5768,
+      "repeat": 1,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "keystone",
+      "cost_usd": 0.1885695,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 155475,
+      "model_calls": 20,
+      "output_tokens": 5974,
+      "repeat": 1,
+      "unscored_findings": 1
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "aurora",
+      "cost_usd": 0.02763,
+      "false_positives": 0,
+      "hits": [
+        "order-access-01"
+      ],
+      "input_tokens": 6588,
+      "model_calls": 5,
+      "output_tokens": 744,
+      "repeat": 2,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "aurora",
+      "cost_usd": 0.0385675,
+      "false_positives": 0,
+      "hits": [
+        "order-access-01"
+      ],
+      "input_tokens": 15493,
+      "model_calls": 8,
+      "output_tokens": 949,
+      "repeat": 2,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "boreal",
+      "cost_usd": 0.049738,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 21340,
+      "model_calls": 10,
+      "output_tokens": 988,
+      "repeat": 2,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "boreal",
+      "cost_usd": 0.0377175,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 10797,
+      "model_calls": 7,
+      "output_tokens": 715,
+      "repeat": 2,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "cinder",
+      "cost_usd": 0.0315755,
+      "false_positives": 0,
+      "hits": [
+        "process-boundary-01"
+      ],
+      "input_tokens": 7817,
+      "model_calls": 5,
+      "output_tokens": 1071,
+      "repeat": 2,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "cinder",
+      "cost_usd": 0.0363025,
+      "false_positives": 0,
+      "hits": [
+        "process-boundary-01"
+      ],
+      "input_tokens": 8575,
+      "model_calls": 7,
+      "output_tokens": 991,
+      "repeat": 2,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "delta",
+      "cost_usd": 0.04104,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 7722,
+      "model_calls": 7,
+      "output_tokens": 1449,
+      "repeat": 2,
+      "unscored_findings": 1
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "delta",
+      "cost_usd": 0.1056035,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 12719,
+      "model_calls": 8,
+      "output_tokens": 5458,
+      "repeat": 2,
+      "unscored_findings": 1
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "elm",
+      "cost_usd": 0.0306,
+      "false_positives": 0,
+      "hits": [
+        "catalog-query-01"
+      ],
+      "input_tokens": 7614,
+      "model_calls": 6,
+      "output_tokens": 771,
+      "repeat": 2,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "elm",
+      "cost_usd": 0.027115,
+      "false_positives": 0,
+      "hits": [
+        "catalog-query-01"
+      ],
+      "input_tokens": 6256,
+      "model_calls": 6,
+      "output_tokens": 765,
+      "repeat": 2,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "flint",
+      "cost_usd": 0.03207,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 8316,
+      "model_calls": 7,
+      "output_tokens": 752,
+      "repeat": 2,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "flint",
+      "cost_usd": 0.0385605,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 11565,
+      "model_calls": 8,
+      "output_tokens": 912,
+      "repeat": 2,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "grove",
+      "cost_usd": 0.033698,
+      "false_positives": 0,
+      "hits": [
+        "export-path-01"
+      ],
+      "input_tokens": 9590,
+      "model_calls": 6,
+      "output_tokens": 917,
+      "repeat": 2,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "grove",
+      "cost_usd": 0.0383955,
+      "false_positives": 0,
+      "hits": [
+        "export-path-01"
+      ],
+      "input_tokens": 10701,
+      "model_calls": 8,
+      "output_tokens": 1045,
+      "repeat": 2,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "harbor",
+      "cost_usd": 0.050385,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 8382,
+      "model_calls": 7,
+      "output_tokens": 1962,
+      "repeat": 2,
+      "unscored_findings": 1
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "harbor",
+      "cost_usd": 0.0433305,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 12303,
+      "model_calls": 7,
+      "output_tokens": 1107,
+      "repeat": 2,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "juniper",
+      "cost_usd": 0.142032,
+      "false_positives": 0,
+      "hits": [
+        "report-path-01"
+      ],
+      "input_tokens": 143196,
+      "model_calls": 17,
+      "output_tokens": 4150,
+      "repeat": 2,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "juniper",
+      "cost_usd": 0.1085845,
+      "false_positives": 0,
+      "hits": [
+        "report-path-01"
+      ],
+      "input_tokens": 103501,
+      "model_calls": 16,
+      "output_tokens": 3544,
+      "repeat": 2,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "keystone",
+      "cost_usd": 0.1965185,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 135911,
+      "model_calls": 20,
+      "output_tokens": 7691,
+      "repeat": 2,
+      "unscored_findings": 1
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "keystone",
+      "cost_usd": 0.209484,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 229224,
+      "model_calls": 22,
+      "output_tokens": 6712,
+      "repeat": 2,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "aurora",
+      "cost_usd": 0.0285155,
+      "false_positives": 0,
+      "hits": [
+        "order-access-01"
+      ],
+      "input_tokens": 8789,
+      "model_calls": 6,
+      "output_tokens": 705,
+      "repeat": 3,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "aurora",
+      "cost_usd": 0.0300825,
+      "false_positives": 0,
+      "hits": [
+        "order-access-01"
+      ],
+      "input_tokens": 8127,
+      "model_calls": 6,
+      "output_tokens": 651,
+      "repeat": 3,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "boreal",
+      "cost_usd": 0.0419655,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 13443,
+      "model_calls": 8,
+      "output_tokens": 826,
+      "repeat": 3,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "boreal",
+      "cost_usd": 0.042612,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 16374,
+      "model_calls": 8,
+      "output_tokens": 803,
+      "repeat": 3,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "cinder",
+      "cost_usd": 0.0376855,
+      "false_positives": 0,
+      "hits": [
+        "process-boundary-01"
+      ],
+      "input_tokens": 8923,
+      "model_calls": 7,
+      "output_tokens": 1294,
+      "repeat": 3,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "cinder",
+      "cost_usd": 0.039263,
+      "false_positives": 0,
+      "hits": [
+        "process-boundary-01"
+      ],
+      "input_tokens": 10112,
+      "model_calls": 6,
+      "output_tokens": 1201,
+      "repeat": 3,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "delta",
+      "cost_usd": 0.07529,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 8198,
+      "model_calls": 6,
+      "output_tokens": 3653,
+      "repeat": 3,
+      "unscored_findings": 1
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "delta",
+      "cost_usd": 0.0499125,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 8337,
+      "model_calls": 7,
+      "output_tokens": 1938,
+      "repeat": 3,
+      "unscored_findings": 2
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "elm",
+      "cost_usd": 0.0203575,
+      "false_positives": 0,
+      "hits": [
+        "catalog-query-01"
+      ],
+      "input_tokens": 4675,
+      "model_calls": 5,
+      "output_tokens": 578,
+      "repeat": 3,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "elm",
+      "cost_usd": 0.024685,
+      "false_positives": 0,
+      "hits": [
+        "catalog-query-01"
+      ],
+      "input_tokens": 6100,
+      "model_calls": 5,
+      "output_tokens": 629,
+      "repeat": 3,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "flint",
+      "cost_usd": 0.0283575,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 7863,
+      "model_calls": 6,
+      "output_tokens": 580,
+      "repeat": 3,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "flint",
+      "cost_usd": 0.0305175,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 7989,
+      "model_calls": 7,
+      "output_tokens": 703,
+      "repeat": 3,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "grove",
+      "cost_usd": 0.039878,
+      "false_positives": 0,
+      "hits": [
+        "export-path-01"
+      ],
+      "input_tokens": 10676,
+      "model_calls": 8,
+      "output_tokens": 1148,
+      "repeat": 3,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "grove",
+      "cost_usd": 0.0320355,
+      "false_positives": 0,
+      "hits": [
+        "export-path-01"
+      ],
+      "input_tokens": 9297,
+      "model_calls": 6,
+      "output_tokens": 855,
+      "repeat": 3,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "harbor",
+      "cost_usd": 0.033014,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 12452,
+      "model_calls": 7,
+      "output_tokens": 932,
+      "repeat": 3,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "harbor",
+      "cost_usd": 0.058728,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 12666,
+      "model_calls": 9,
+      "output_tokens": 2073,
+      "repeat": 3,
+      "unscored_findings": 1
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "juniper",
+      "cost_usd": 0.151628,
+      "false_positives": 0,
+      "hits": [
+        "report-path-01"
+      ],
+      "input_tokens": 149432,
+      "model_calls": 19,
+      "output_tokens": 4480,
+      "repeat": 3,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "juniper",
+      "cost_usd": 0.155026,
+      "false_positives": 0,
+      "hits": [
+        "report-path-01"
+      ],
+      "input_tokens": 156394,
+      "model_calls": 17,
+      "output_tokens": 4199,
+      "repeat": 3,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "candidate_assisted",
+      "case_id": "keystone",
+      "cost_usd": 0.2004495,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 206007,
+      "model_calls": 20,
+      "output_tokens": 5640,
+      "repeat": 3,
+      "unscored_findings": 0
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "keystone",
+      "cost_usd": 0.0860965,
+      "false_positives": 0,
+      "hits": [],
+      "input_tokens": 75553,
+      "model_calls": 14,
+      "output_tokens": 2786,
+      "repeat": 3,
+      "unscored_findings": 1
+    }
+  ],
+  "schema_version": "ravage.repository-review-quality.v1",
+  "verified_model_calls": 558
+}

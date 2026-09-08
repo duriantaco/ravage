@@ -1,0 +1,207 @@
+{
+  "accepted_as_baseline": false,
+  "completion": {
+    "attempted_runs": 60,
+    "completed_runs": 58,
+    "completion_rate": 0.96666667,
+    "failed_runs": 2,
+    "planned_runs": 60,
+    "skipped_runs": 0
+  },
+  "configuration": {
+    "aggregate_cost_ceiling_usd": 10.0,
+    "allow_paid_models": true,
+    "arms": [
+      "literal_only",
+      "candidate_assisted"
+    ],
+    "max_cost_usd_per_run": 0.5,
+    "max_turns": 12,
+    "objective_digest": "sha256:bcdd358b33323fd24f13247bb8a62f01303da32b3240b2b221f3835226f98ac1",
+    "repeats": 3
+  },
+  "failures": [
+    {
+      "arm": "literal_only",
+      "case_id": "keystone",
+      "message": "review did not produce a valid final action within 12 model turns",
+      "repeat": 1,
+      "type": "RepositoryReviewError"
+    },
+    {
+      "arm": "literal_only",
+      "case_id": "keystone",
+      "message": "review did not produce a valid final action within 12 model turns",
+      "repeat": 3,
+      "type": "RepositoryReviewError"
+    }
+  ],
+  "partial_scores": [
+    {
+      "arm": "literal_only",
+      "completion": {
+        "attempted_runs": 30,
+        "completed_runs": 28,
+        "completion_rate": 0.93333333,
+        "failed_runs": 2,
+        "planned_runs": 30,
+        "skipped_runs": 0
+      },
+      "detection": {
+        "off_class_unscored_findings": 7,
+        "score": {
+          "by_vuln_class": [
+            {
+              "expected": 3,
+              "f1": 1.0,
+              "false_negatives": 0,
+              "false_positives": 0,
+              "precision": 1.0,
+              "recall": 1.0,
+              "reported": 3,
+              "true_positives": 3,
+              "vuln_class": "command_injection"
+            },
+            {
+              "expected": 3,
+              "f1": 1.0,
+              "false_negatives": 0,
+              "false_positives": 0,
+              "precision": 1.0,
+              "recall": 1.0,
+              "reported": 3,
+              "true_positives": 3,
+              "vuln_class": "idor"
+            },
+            {
+              "expected": 6,
+              "f1": 1.0,
+              "false_negatives": 0,
+              "false_positives": 0,
+              "precision": 1.0,
+              "recall": 1.0,
+              "reported": 6,
+              "true_positives": 6,
+              "vuln_class": "path_traversal"
+            },
+            {
+              "expected": 3,
+              "f1": 1.0,
+              "false_negatives": 0,
+              "false_positives": 0,
+              "precision": 1.0,
+              "recall": 1.0,
+              "reported": 3,
+              "true_positives": 3,
+              "vuln_class": "sql_injection"
+            }
+          ],
+          "case_count": 28,
+          "expected": 15,
+          "f1": 1.0,
+          "false_negatives": 0,
+          "false_positives": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "reported": 15,
+          "true_positives": 15
+        },
+        "score_scope": "manifest_evaluated_classes_only",
+        "scored_runs": 28,
+        "unscored_runs": 2
+      }
+    },
+    {
+      "arm": "candidate_assisted",
+      "completion": {
+        "attempted_runs": 30,
+        "completed_runs": 30,
+        "completion_rate": 1.0,
+        "failed_runs": 0,
+        "planned_runs": 30,
+        "skipped_runs": 0
+      },
+      "detection": {
+        "off_class_unscored_findings": 4,
+        "score": {
+          "by_vuln_class": [
+            {
+              "expected": 3,
+              "f1": 1.0,
+              "false_negatives": 0,
+              "false_positives": 0,
+              "precision": 1.0,
+              "recall": 1.0,
+              "reported": 3,
+              "true_positives": 3,
+              "vuln_class": "command_injection"
+            },
+            {
+              "expected": 3,
+              "f1": 1.0,
+              "false_negatives": 0,
+              "false_positives": 0,
+              "precision": 1.0,
+              "recall": 1.0,
+              "reported": 3,
+              "true_positives": 3,
+              "vuln_class": "idor"
+            },
+            {
+              "expected": 6,
+              "f1": 1.0,
+              "false_negatives": 0,
+              "false_positives": 0,
+              "precision": 1.0,
+              "recall": 1.0,
+              "reported": 6,
+              "true_positives": 6,
+              "vuln_class": "path_traversal"
+            },
+            {
+              "expected": 3,
+              "f1": 1.0,
+              "false_negatives": 0,
+              "false_positives": 0,
+              "precision": 1.0,
+              "recall": 1.0,
+              "reported": 3,
+              "true_positives": 3,
+              "vuln_class": "sql_injection"
+            }
+          ],
+          "case_count": 30,
+          "expected": 15,
+          "f1": 1.0,
+          "false_negatives": 0,
+          "false_positives": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "reported": 15,
+          "true_positives": 15
+        },
+        "score_scope": "manifest_evaluated_classes_only",
+        "scored_runs": 30,
+        "unscored_runs": 0
+      }
+    }
+  ],
+  "provider_usage": {
+    "attempted_calls": 466,
+    "known_cost_usd": 2.976079500000001,
+    "unverified_call": false,
+    "verified_calls": 466
+  },
+  "raw_report_digest": "sha256:b142581f706f1a3d40e43f874f3edc0a7e0e65720571ad366f8011a75349dd4f",
+  "reason": "Two literal-only keystone reviews exhausted the initial 12-turn budget.",
+  "route": {
+    "max_output_tokens": 4096,
+    "model": "gpt-5.4-2026-03-05",
+    "provider": "openai",
+    "reasoning_effort": "high",
+    "requested_tier": "high",
+    "route_ordinal": 1,
+    "selected_tier": "high"
+  },
+  "schema_version": "ravage.repository-review-quality-calibration.v1"
+}
