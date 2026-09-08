@@ -1,0 +1,34 @@
+{
+  "baseline_revision": "18d2bb93ac9226af6966e9acfa6653b40dd9f426",
+  "case_count": 10,
+  "claim_limit": "Read-only review on the frozen diagnostic source corpus. Scores cover only labelled classes; other findings are counted separately. This does not measure exploitation, external websites, or generalisation to unseen repositories.",
+  "evaluated_revision": "d5a5e6588b8b5927fd0ad4526021487bd03dc5bf",
+  "issues": [],
+  "passed": true,
+  "sample_count": 60,
+  "schema_version": "ravage.repository-review-quality-verdict.v1",
+  "scores": [
+    {
+      "actual_cost_usd": 1.916636,
+      "arm": "literal_only",
+      "false_negatives": 0,
+      "false_positives": 0,
+      "model_calls": 284,
+      "precision": 1.0,
+      "recall": 1.0,
+      "true_positives": 15,
+      "unscored_findings": 10
+    },
+    {
+      "actual_cost_usd": 1.927985,
+      "arm": "candidate_assisted",
+      "false_negatives": 0,
+      "false_positives": 0,
+      "model_calls": 253,
+      "precision": 1.0,
+      "recall": 1.0,
+      "true_positives": 15,
+      "unscored_findings": 3
+    }
+  ]
+}
