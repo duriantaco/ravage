@@ -1,0 +1,155 @@
+{
+  "schema_version": "ravage.repository-review-eval-manifest.v2",
+  "cases": [
+    {
+      "id": "aurora",
+      "source_root": "packages/ravage/tests/fixtures/repository_review_eval/aurora",
+      "snapshot_id": "sha256:511d99f7461078f3186d4f57b1361755e1e11c7f5aab68ad9db4bd6909a33f5c",
+      "evaluated_classes": [
+        "idor"
+      ],
+      "expected": [
+        {
+          "id": "order-access-01",
+          "vuln_class": "idor",
+          "locations": [
+            {
+              "path": "src/orders/get_order.ts",
+              "start_line": 7,
+              "end_line": 7
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "boreal",
+      "source_root": "packages/ravage/tests/fixtures/repository_review_eval/boreal",
+      "snapshot_id": "sha256:5f619d4e5101531c1be6475943327a5974897de81c21eb82685cc0cbb2c96124",
+      "evaluated_classes": [
+        "idor"
+      ],
+      "expected": []
+    },
+    {
+      "id": "cinder",
+      "source_root": "packages/ravage/tests/fixtures/repository_review_eval/cinder",
+      "snapshot_id": "sha256:7c4c13d01f7aab48978cff0f170283efc4d4e3bf3c79e8792c2633753d2b9d6c",
+      "evaluated_classes": [
+        "command_injection"
+      ],
+      "expected": [
+        {
+          "id": "process-boundary-01",
+          "vuln_class": "command_injection",
+          "locations": [
+            {
+              "path": "src/media/preview.py",
+              "start_line": 20,
+              "end_line": 20
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "delta",
+      "source_root": "packages/ravage/tests/fixtures/repository_review_eval/delta",
+      "snapshot_id": "sha256:b020bd25882ea646dc07fbd497644d7383cefa545c9ca6edb03895cccf1f4674",
+      "evaluated_classes": [
+        "command_injection"
+      ],
+      "expected": []
+    },
+    {
+      "id": "elm",
+      "source_root": "packages/ravage/tests/fixtures/repository_review_eval/elm",
+      "snapshot_id": "sha256:8298bf225f31cd13058c307b9cea05f49971252e3d1507736d4de77c48a2053d",
+      "evaluated_classes": [
+        "sql_injection"
+      ],
+      "expected": [
+        {
+          "id": "catalog-query-01",
+          "vuln_class": "sql_injection",
+          "locations": [
+            {
+              "path": "src/catalog/search.ts",
+              "start_line": 8,
+              "end_line": 8
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "flint",
+      "source_root": "packages/ravage/tests/fixtures/repository_review_eval/flint",
+      "snapshot_id": "sha256:7a9b952739dc63b57161d454a123eafb1e5831bf5a54ffc5b94bf75d82275bd1",
+      "evaluated_classes": [
+        "sql_injection"
+      ],
+      "expected": []
+    },
+    {
+      "id": "grove",
+      "source_root": "packages/ravage/tests/fixtures/repository_review_eval/grove",
+      "snapshot_id": "sha256:01c3acd8152bd2d8cf83a98af46a78d7b2ea833961ce68819fa59407c75b0efa",
+      "evaluated_classes": [
+        "path_traversal"
+      ],
+      "expected": [
+        {
+          "id": "export-path-01",
+          "vuln_class": "path_traversal",
+          "locations": [
+            {
+              "path": "src/exports/download.py",
+              "start_line": 14,
+              "end_line": 14
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "harbor",
+      "source_root": "packages/ravage/tests/fixtures/repository_review_eval/harbor",
+      "snapshot_id": "sha256:7087a39605d09eec28231ae005612df21f652ae3b6816b6e4afe193bdf641a47",
+      "evaluated_classes": [
+        "path_traversal"
+      ],
+      "expected": []
+    },
+    {
+      "id": "juniper",
+      "source_root": "packages/ravage/tests/fixtures/repository_review_eval/juniper",
+      "snapshot_id": "sha256:2bf5eabeab0471ae6b76186b38a190d44ac4d484e9edfe17fd5fb6928d544c0f",
+      "evaluated_classes": [
+        "path_traversal"
+      ],
+      "expected": [
+        {
+          "id": "report-path-01",
+          "vuln_class": "path_traversal",
+          "locations": [
+            {
+              "path": "src/reports/paths.py",
+              "start_line": 7,
+              "end_line": 7
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "keystone",
+      "source_root": "packages/ravage/tests/fixtures/repository_review_eval/keystone",
+      "snapshot_id": "sha256:d4e21486f0d664aab4d2647961e57ed980d35a0373f0635a103964ffb661de87",
+      "evaluated_classes": [
+        "path_traversal"
+      ],
+      "expected": []
+    }
+  ]
+}

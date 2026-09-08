@@ -376,6 +376,42 @@ def test_remote_http_uses_stable_identity_and_auditable_receipt() -> None:
     assert execution.observation_id.startswith("http:")
 
 
+def test_source_informed_http_marks_result_and_every_redirect_exchange(tmp_path: Path) -> None:
+    transport = QueuedTransport(
+        [
+            _response(
+                status=302,
+                headers={"Location": "/app/final"},
+                body=b"redirect",
+            ),
+            _response(url=f"{TARGET_URL}/final", body=b"target body"),
+        ]
+    )
+    store = TrafficStore.create(tmp_path / "workspace")
+    recorder = ProbeTrafficRecorder(
+        store,
+        capture_session_id="source-informed-redirects",
+        source="agent_http",
+        strict=True,
+    )
+    executor = _executor(transport, traffic_observer=recorder)
+
+    execution = executor(
+        node_id="node-source",
+        arguments={"method": "GET", "path": "/app/source-route"},
+        action_id="action-source",
+        source_informed=True,
+    )
+
+    assert execution.result.source_informed is True
+    assert json.loads(execution.result.observation)["source_informed"] is True
+    assert json.loads(execution.result.evidence_observation)["source_informed"] is True
+    assert [item.request_resource_type for item in store.exchanges()] == [
+        "source_informed_agent_http",
+        "source_informed_agent_http",
+    ]
+
+
 def test_managed_authentication_owns_request_and_redacts_all_observations(
     tmp_path,
 ) -> None:
@@ -1343,6 +1379,29 @@ def test_scoped_redirect_is_counted_and_sensitive_headers_do_not_cross_origin() 
     assert len(payload["requests"]) == 2
     assert clock.sleeps
     assert clock.sleeps[0] >= 1.15
+
+
+def test_transport_timeout_is_rebounded_after_deadline_aware_pacing() -> None:
+    transport = QueuedTransport([_response(), _response()])
+    clock = FakeClock()
+    executor = _executor(transport, clock=clock)
+    executor(
+        node_id="node-001",
+        arguments={"path": "/app/first", "timeout_seconds": 10},
+        action_id="action-first",
+    )
+    deadline = clock() + 2.0
+
+    executor(
+        node_id="node-001",
+        arguments={"path": "/app/second", "timeout_seconds": 10},
+        action_id="action-second",
+        _deadline_monotonic=deadline,
+    )
+
+    assert len(transport.calls) == 2
+    assert clock.sleeps
+    assert transport.calls[-1].timeout_seconds == pytest.approx(deadline - clock())
 
 
 def test_dns_change_after_first_request_fails_closed() -> None:

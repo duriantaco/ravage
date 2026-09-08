@@ -4,6 +4,12 @@ import json
 import re
 from typing import Any
 
+from ravage.agent_core.source_context import (
+    SOURCE_CONTEXT_ACTION,
+    normalize_source_context_action,
+    source_context_action_error,
+)
+
 VALID_ACTIONS = {
     "http_request",
     "run_command",
@@ -18,6 +24,7 @@ VALID_ACTIONS = {
 _HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"})
 _BODYLESS_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _MAX_VALIDATE_POC_STEPS = 12
+_EXECUTOR_OWNED_ACTION_FIELDS = frozenset({"source_informed"})
 
 REQUIRED_TEXT_FIELDS = {
     "run_command": "command",
@@ -32,14 +39,20 @@ _MAX_FINDING_FIELD_CHARS = 1_000
 _VULN_CLASS_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 
 
-def parse_action(text: str) -> dict[str, object]:
+def parse_action(text: str, *, allow_source_context: bool = False) -> dict[str, object]:
     cleaned = _strip_fence(text.strip())
     try:
         payload = json.loads(cleaned)
     except json.JSONDecodeError:
         candidates = _json_object_candidates(cleaned)
         if not candidates:
-            return invalid_action("model response was not JSON", raw=cleaned)
+            return invalid_action(
+                "model response was not JSON",
+                raw=_safe_source_context_raw(
+                    cleaned,
+                    allow_source_context=allow_source_context,
+                ),
+            )
         first_error = ""
         for candidate in candidates:
             try:
@@ -49,26 +62,45 @@ def parse_action(text: str) -> dict[str, object]:
                 continue
             if not isinstance(payload, dict):
                 continue
-            normalized = normalize_action(payload)
+            normalized = normalize_action(payload, allow_source_context=allow_source_context)
             if normalized.get("action") != "invalid":
                 return normalized
             first_error = first_error or str(normalized.get("error") or "")
         return invalid_action(
-            f"embedded JSON did not parse: {first_error or 'no valid action object'}", raw=cleaned
+            f"embedded JSON did not parse: {first_error or 'no valid action object'}",
+            raw=_safe_source_context_raw(
+                cleaned,
+                allow_source_context=allow_source_context,
+            ),
         )
     if not isinstance(payload, dict):
         return invalid_action("model response JSON was not an object")
-    return normalize_action(payload)
+    return normalize_action(payload, allow_source_context=allow_source_context)
 
 
-def normalize_action(payload: dict[str, Any]) -> dict[str, object]:
+def normalize_action(
+    payload: dict[str, Any], *, allow_source_context: bool = False
+) -> dict[str, object]:
     action = _action_name(payload)
     raw_payload = _raw_payload(payload)
-    validation_error = _validation_error(action, payload)
+    if action == SOURCE_CONTEXT_ACTION and allow_source_context:
+        payload = normalize_source_context_action(payload)
+    validation_error = _validation_error(
+        action,
+        payload,
+        allow_source_context=allow_source_context,
+    )
     if validation_error:
-        return invalid_action(validation_error, raw=raw_payload)
+        return invalid_action(
+            validation_error,
+            raw="" if action == SOURCE_CONTEXT_ACTION else raw_payload,
+        )
 
-    normalized: dict[str, object] = dict(payload)
+    normalized: dict[str, object] = {
+        str(key): value
+        for key, value in payload.items()
+        if str(key) not in _EXECUTOR_OWNED_ACTION_FIELDS
+    }
     normalized["action"] = action
     if action == "http_request":
         normalized["method"] = _canonical_http_method(payload.get("method"))
@@ -76,7 +108,14 @@ def normalize_action(payload: dict[str, Any]) -> dict[str, object]:
         steps = payload.get("steps")
         assert isinstance(steps, list)
         normalized["steps"] = [
-            {**step, "method": _canonical_http_method(step.get("method"))}
+            {
+                **{
+                    str(key): value
+                    for key, value in step.items()
+                    if str(key) not in _EXECUTOR_OWNED_ACTION_FIELDS
+                },
+                "method": _canonical_http_method(step.get("method")),
+            }
             for step in steps
             if isinstance(step, dict)
         ]
@@ -87,6 +126,12 @@ def invalid_action(error: str, *, raw: str = "") -> dict[str, object]:
     return {"action": "invalid", "error": error, "raw": raw[:2000]}
 
 
+def _safe_source_context_raw(text: str, *, allow_source_context: bool) -> str:
+    if allow_source_context and SOURCE_CONTEXT_ACTION in text:
+        return ""
+    return text
+
+
 def _action_name(payload: dict[str, Any]) -> str:
     return str(payload.get("action") or "").strip()
 
@@ -95,7 +140,16 @@ def _canonical_http_method(value: object) -> str:
     return str(value or "GET").strip().upper()
 
 
-def _validation_error(action: str, payload: dict[str, Any]) -> str:
+def _validation_error(  # noqa: PLR0911 - action contracts fail fast by branch.
+    action: str,
+    payload: dict[str, Any],
+    *,
+    allow_source_context: bool = False,
+) -> str:
+    if action == SOURCE_CONTEXT_ACTION:
+        if not allow_source_context:
+            return f"invalid action: {action}"
+        return source_context_action_error(payload)
     if action not in VALID_ACTIONS:
         return f"invalid action: {action}"
     required_text_field = REQUIRED_TEXT_FIELDS.get(action)
@@ -120,9 +174,7 @@ def _http_request_validation_error(payload: dict[str, Any]) -> str:  # noqa: PLR
         return f"http_request method is not allowed: {method}"
     if payload.get("headers") is not None and not isinstance(payload.get("headers"), dict):
         return "http_request headers must be an object"
-    body_fields = [
-        name for name in ("body", "json", "form") if payload.get(name) is not None
-    ]
+    body_fields = [name for name in ("body", "json", "form") if payload.get(name) is not None]
     if len(body_fields) > 1:
         return "http_request accepts only one of body, json, or form"
     if method in _BODYLESS_HTTP_METHODS and body_fields:
@@ -189,10 +241,7 @@ def _finding_validation_error(value: object) -> str:
             return f"validate_poc finding {field} is too long"
     severity = str(value.get("severity") or "").strip().lower()
     if severity not in _FINDING_SEVERITIES:
-        return (
-            "validate_poc finding severity must be critical, high, medium, low, "
-            "or informational"
-        )
+        return "validate_poc finding severity must be critical, high, medium, low, or informational"
     vuln_class = str(value.get("vuln_class") or "").strip()
     if not _VULN_CLASS_RE.fullmatch(vuln_class):
         return "validate_poc finding vuln_class must be a canonical snake_case identifier"
@@ -205,10 +254,7 @@ def _finding_validation_error(value: object) -> str:
         return "validate_poc finding exploit_steps item is too long"
     forbidden = sorted({"endpoint", "proof", "provenance"}.intersection(value))
     if forbidden:
-        return (
-            "validate_poc finding cannot provide executor-owned fields: "
-            + ", ".join(forbidden)
-        )
+        return "validate_poc finding cannot provide executor-owned fields: " + ", ".join(forbidden)
     return ""
 
 

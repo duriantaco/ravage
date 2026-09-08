@@ -30,7 +30,8 @@ CITATION_FILE = ROOT / "CITATION.cff"
 RELEASE_MANIFEST = ROOT / "tools/release/.release-please-manifest.json"
 LOCK_FILE = ROOT / "uv.lock"
 CHANGELOG_FILE = ROOT / "CHANGELOG.md"
-WORKSPACE_PROJECTS = ("pentest-agent", "ravage", "ravage-schemas")
+WORKSPACE_PROJECTS = ("ravage", "ravage-schemas")
+WORKSPACE_PATHS = {"ravage": "packages/ravage", "ravage-schemas": "packages/schemas"}
 
 
 def main() -> int:
@@ -68,6 +69,7 @@ def main() -> int:
         )
 
     expected = next(iter(versions.values()))
+    errors.extend(_workspace_configuration_errors())
     errors.extend(_workspace_version_errors(expected))
     errors.extend(_release_ref_errors(expected, os.environ))
     errors.extend(_release_changelog_errors(expected, os.environ))
@@ -83,8 +85,6 @@ def main() -> int:
 
 def _workspace_version_errors(expected: str) -> list[str]:
     declared: dict[str, str] = {}
-    root_project = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))["project"]
-    declared[str(root_project["name"])] = str(root_project["version"])
 
     manifest = json.loads(RELEASE_MANIFEST.read_text(encoding="utf-8"))
     manifest_version = manifest.get(".") if isinstance(manifest, dict) else None
@@ -112,6 +112,31 @@ def _workspace_version_errors(expected: str) -> list[str]:
         for source, version in declared.items()
         if version != expected
     ]
+
+
+def _workspace_configuration_errors() -> list[str]:
+    errors: list[str] = []
+    root_config = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
+    if "project" in root_config or "build-system" in root_config:
+        errors.append("root pyproject.toml must remain a virtual, non-distributable workspace")
+    workspace = root_config.get("tool", {}).get("uv", {}).get("workspace", {})
+    if set(workspace.get("members", [])) != set(WORKSPACE_PATHS.values()):
+        errors.append("workspace members must contain only packages/ravage and packages/schemas")
+    if "packages/mcp_servers/*" not in workspace.get("exclude", []):
+        errors.append("unimplemented MCP scaffolds must be excluded from the UV workspace")
+
+    lock = tomllib.loads(LOCK_FILE.read_text(encoding="utf-8"))
+    if set(lock.get("manifest", {}).get("members", [])) != set(WORKSPACE_PROJECTS):
+        errors.append("uv.lock manifest must contain only ravage and ravage-schemas")
+    workspace_sources = {
+        item["name"]: item["source"]
+        for item in lock.get("package", [])
+        if "editable" in item.get("source", {}) or "virtual" in item.get("source", {})
+    }
+    expected_sources = {name: {"editable": path} for name, path in WORKSPACE_PATHS.items()}
+    if workspace_sources != expected_sources:
+        errors.append("uv.lock must install only the two real workspace packages")
+    return errors
 
 
 def _release_ref_errors(expected_version: str, environ: Mapping[str, str]) -> list[str]:

@@ -57,6 +57,7 @@ def test_openai_compatible_chat_client_requests_json_object_response() -> None:
 
     assert reply.content == '{"action":"final","summary":"done"}'
     assert client.request_body["response_format"] == {"type": "json_object"}
+    assert client.request_body["temperature"] == 0
     assert reply.usage_reported is True
     assert reply.cost_known is False
     assert reply.response_model == "stub-returned-model"
@@ -82,7 +83,29 @@ def test_direct_openai_chat_client_requests_standard_service_tier() -> None:
     reply = client.chat([{"role": "user", "content": "return json"}])
 
     assert client.request_body["service_tier"] == "default"
+    assert "temperature" not in client.request_body
     assert reply.cost_known is True
+
+
+def test_exact_gpt54_chat_client_omits_unsupported_temperature() -> None:
+    route = replace(
+        _route(
+            input_cost_per_1m_tokens=2.5,
+            cached_input_cost_per_1m_tokens=0.25,
+            output_cost_per_1m_tokens=15.0,
+        ),
+        provider="openai",
+        model="gpt-5.4-2026-03-05",
+        base_url=None,
+        reasoning_effort="high",
+    )
+    client = _CapturingChatClient(route)
+    client.response_model = route.model
+
+    client.chat([{"role": "user", "content": "return json"}])
+
+    assert "temperature" not in client.request_body
+    assert client.request_body["reasoning_effort"] == "high"
 
 
 @pytest.mark.parametrize(

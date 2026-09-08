@@ -20,6 +20,9 @@ ignore = [
     "S101",
 ]
 
+[lint.per-file-ignores]
+"packages/ravage/tests/fixtures/repository_review_eval/**/*.py" = ["S602", "S603"]
+
 [format]
 quote-style = "double"
 indent-style = "space"

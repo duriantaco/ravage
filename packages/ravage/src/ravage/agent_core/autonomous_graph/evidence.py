@@ -423,20 +423,25 @@ class EvidenceBlackboard:
                 source_kind=admissible_source_kind,
                 raw_observation=(result.evidence_observation or result.observation),
             )
+            raw_payload: dict[str, object] = {
+                "observation_digest": assessment.observation_digest,
+                "ok": result.ok,
+                "outcome": result.outcome,
+                "timed_out": result.timed_out,
+                "exit_code": result.exit_code,
+                "source_kind": source_kind,
+            }
+            # Decision lineage is executor-owned. A model-authored action field
+            # must not be able to claim that a request passed the source gate.
+            if result.source_informed:
+                raw_payload["source_informed"] = True
             raw_record, _ = self._record(
                 kind=EvidenceKind.RAW_OBSERVATION,
                 source=source,
                 producer_node_id=producer_node_id,
                 observation_id=observation_id.strip(),
                 route_fingerprint=assessment.route_fingerprint,
-                payload={
-                    "observation_digest": assessment.observation_digest,
-                    "ok": result.ok,
-                    "outcome": result.outcome,
-                    "timed_out": result.timed_out,
-                    "exit_code": result.exit_code,
-                    "source_kind": source_kind,
-                },
+                payload=raw_payload,
                 material=False,
             )
             promoted, receipts, proof_refs = self._promote_assessment(
@@ -1184,6 +1189,11 @@ class EvidenceBlackboard:
                     "progress_kind": material_kind.value,
                     "tokens": list(values),
                     "observation_digest": assessment.observation_digest,
+                    **(
+                        {"source_informed": True}
+                        if raw_record.payload.get("source_informed") is True
+                        else {}
+                    ),
                 },
                 parent_refs=(raw_record.evidence_id,),
                 material=True,
@@ -1219,7 +1229,14 @@ class EvidenceBlackboard:
                 producer_node_id=producer_node_id,
                 observation_id=raw_record.observation_id,
                 route_fingerprint=assessment.route_fingerprint,
-                payload=lead.to_json(),
+                payload={
+                    **lead.to_json(),
+                    **(
+                        {"source_informed": True}
+                        if raw_record.payload.get("source_informed") is True
+                        else {}
+                    ),
+                },
                 parent_refs=(raw_record.evidence_id,),
                 material=lead.material,
             )

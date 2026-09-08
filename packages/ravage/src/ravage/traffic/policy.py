@@ -577,8 +577,16 @@ class TrafficPolicyController:
             "config": self.config.to_json(),
         }
 
-    def acquire(self, intent: RequestIntent, *, retry: bool = False) -> TrafficDecision:
+    def acquire(
+        self,
+        intent: RequestIntent,
+        *,
+        retry: bool = False,
+        _deadline_monotonic: float | None = None,
+        _monotonic_clock: Callable[[], float] = time.monotonic,
+    ) -> TrafficDecision:
         """Return a cache hit, a scheduled dispatch lease, or a preflight block."""
+        _remaining_wall_clock(_deadline_monotonic, clock=_monotonic_clock)
         self._validate_intent_origin(intent)
         blocked_reason = self._request_restriction_reason(intent)
         if blocked_reason:
@@ -587,8 +595,15 @@ class TrafficPolicyController:
         wait_started = self._now()
         dedupe_observed = False
         while True:
+            _remaining_wall_clock(_deadline_monotonic, clock=_monotonic_clock)
             decision, wait_until = self._acquire_once(intent, retry=retry)
             if decision is not None:
+                try:
+                    _remaining_wall_clock(_deadline_monotonic, clock=_monotonic_clock)
+                except TimeoutError:
+                    if decision.lease is not None:
+                        self.cancel(decision.lease)
+                    raise
                 return decision
             if not dedupe_observed:
                 self._record_deduplicated()
@@ -600,72 +615,102 @@ class TrafficPolicyController:
                     TrafficDecisionKind.BLOCKED,
                     reason="traffic deduplication wait timed out",
                 )
-            self._sleep(max(0.001, min(wait_until - now, 0.05)))
+            sleep_seconds = max(0.001, min(wait_until - now, 0.05))
+            remaining = _remaining_wall_clock(
+                _deadline_monotonic,
+                clock=_monotonic_clock,
+            )
+            _require_wait_within_wall_clock(sleep_seconds, remaining)
+            self._sleep(sleep_seconds)
 
-    def begin_dispatch(self, lease: DispatchLease) -> int:
+    def begin_dispatch(  # noqa: PLR0915 - one durable lease-to-dispatch state machine.
+        self,
+        lease: DispatchLease,
+        *,
+        _deadline_monotonic: float | None = None,
+        _monotonic_clock: Callable[[], float] = time.monotonic,
+    ) -> int:
         """Commit a lease as a physical request immediately before transport."""
-        while True:
-            blocked_reason = ""
-            with self._locked_state() as state:
-                self._prune_state(state)
-                reservations = _dict_value(state, "reservations")
-                raw = reservations.get(lease.lease_id)
-                if not isinstance(raw, dict):
-                    raise TrafficPolicyBlocked("traffic dispatch lease is no longer valid")
-                self._validate_lease(raw, lease)
-                now = self._now()
-                if self.config.mode is TrafficPolicyMode.ENFORCE:
-                    open_until = _number(state.get("circuit_open_until"))
-                    half_open_lease = str(state.get("half_open_lease") or "")
-                    failures = _counter(state, "circuit_failures")
-                    if open_until > now:
-                        self._cancel_reservation(state, lease.lease_id)
-                        state["blocked_count"] = _counter(state, "blocked_count") + 1
-                        blocked_reason = "traffic circuit is open"
-                        ready_at = now
-                    elif failures >= self.config.circuit_failure_threshold:
-                        if half_open_lease and half_open_lease != lease.lease_id:
+        try:
+            while True:
+                _remaining_wall_clock(_deadline_monotonic, clock=_monotonic_clock)
+                blocked_reason = ""
+                with self._locked_state() as state:
+                    self._prune_state(state)
+                    reservations = _dict_value(state, "reservations")
+                    raw = reservations.get(lease.lease_id)
+                    if not isinstance(raw, dict):
+                        raise TrafficPolicyBlocked("traffic dispatch lease is no longer valid")
+                    self._validate_lease(raw, lease)
+                    _remaining_wall_clock(_deadline_monotonic, clock=_monotonic_clock)
+                    now = self._now()
+                    if self.config.mode is TrafficPolicyMode.ENFORCE:
+                        open_until = _number(state.get("circuit_open_until"))
+                        half_open_lease = str(state.get("half_open_lease") or "")
+                        failures = _counter(state, "circuit_failures")
+                        if open_until > now:
                             self._cancel_reservation(state, lease.lease_id)
                             state["blocked_count"] = _counter(state, "blocked_count") + 1
-                            blocked_reason = "traffic circuit half-open trial is already active"
+                            blocked_reason = "traffic circuit is open"
                             ready_at = now
+                        elif failures >= self.config.circuit_failure_threshold:
+                            if half_open_lease and half_open_lease != lease.lease_id:
+                                self._cancel_reservation(state, lease.lease_id)
+                                state["blocked_count"] = _counter(state, "blocked_count") + 1
+                                blocked_reason = (
+                                    "traffic circuit half-open trial is already active"
+                                )
+                                ready_at = now
+                            else:
+                                state["half_open_lease"] = lease.lease_id
+                                raw["half_open"] = True
+                                ready_at = max(
+                                    _number(raw.get("not_before")),
+                                    _number(state.get("backoff_until")),
+                                    _number(state.get("next_physical_dispatch_at")),
+                                )
                         else:
-                            state["half_open_lease"] = lease.lease_id
-                            raw["half_open"] = True
                             ready_at = max(
                                 _number(raw.get("not_before")),
                                 _number(state.get("backoff_until")),
                                 _number(state.get("next_physical_dispatch_at")),
                             )
                     else:
-                        ready_at = max(
-                            _number(raw.get("not_before")),
-                            _number(state.get("backoff_until")),
-                            _number(state.get("next_physical_dispatch_at")),
+                        ready_at = _number(raw.get("not_before"))
+                    if not blocked_reason:
+                        raw["expires_at"] = max(
+                            _number(raw.get("expires_at")),
+                            ready_at + self.config.lease_timeout_seconds,
                         )
-                else:
-                    ready_at = _number(raw.get("not_before"))
-                if not blocked_reason:
-                    raw["expires_at"] = max(
-                        _number(raw.get("expires_at")),
-                        ready_at + self.config.lease_timeout_seconds,
-                    )
-                if not blocked_reason and ready_at <= now:
-                    if (
-                        self.config.mode is TrafficPolicyMode.ENFORCE
-                        and self.config.max_rps is not None
-                    ):
-                        state["next_physical_dispatch_at"] = now + (1.0 / self.config.max_rps)
-                    reservations.pop(lease.lease_id, None)
-                    dispatched = _dict_value(state, "dispatched")
-                    raw["dispatched_at"] = now
-                    raw["expires_at"] = now + self.config.lease_timeout_seconds
-                    dispatched[lease.lease_id] = raw
-                    state["physical_request_count"] = _counter(state, "physical_request_count") + 1
-                    return _counter(state, "physical_request_count")
-            if blocked_reason:
-                raise TrafficPolicyBlocked(blocked_reason)
-            self._sleep(max(0.001, ready_at - self._now()))
+                    if not blocked_reason and ready_at <= now:
+                        if (
+                            self.config.mode is TrafficPolicyMode.ENFORCE
+                            and self.config.max_rps is not None
+                        ):
+                            state["next_physical_dispatch_at"] = now + (
+                                1.0 / self.config.max_rps
+                            )
+                        reservations.pop(lease.lease_id, None)
+                        dispatched = _dict_value(state, "dispatched")
+                        raw["dispatched_at"] = now
+                        raw["expires_at"] = now + self.config.lease_timeout_seconds
+                        dispatched[lease.lease_id] = raw
+                        state["physical_request_count"] = (
+                            _counter(state, "physical_request_count") + 1
+                        )
+                        return _counter(state, "physical_request_count")
+                if blocked_reason:
+                    raise TrafficPolicyBlocked(blocked_reason)
+                sleep_seconds = max(0.001, ready_at - self._now())
+                remaining = _remaining_wall_clock(
+                    _deadline_monotonic,
+                    clock=_monotonic_clock,
+                )
+                _require_wait_within_wall_clock(sleep_seconds, remaining)
+                self._sleep(sleep_seconds)
+        except TimeoutError:
+            self.cancel(lease)
+            raise
 
     def complete(self, lease: DispatchLease, outcome: TrafficOutcome) -> None:
         """Record the result, release dedupe waiters, and update adaptive policy."""
@@ -1441,6 +1486,40 @@ def _retry_after_seconds(headers: Mapping[str, str], *, now: float) -> float:
     if not math.isfinite(seconds):
         return 0.0
     return max(0.0, seconds)
+
+
+def _remaining_wall_clock(
+    deadline_monotonic: float | None,
+    *,
+    clock: Callable[[], float],
+) -> float | None:
+    """Return trusted monotonic budget without mixing it with ledger wall time."""
+    if deadline_monotonic is None:
+        return None
+    if isinstance(deadline_monotonic, bool) or not isinstance(
+        deadline_monotonic,
+        (int, float),
+    ):
+        raise TrafficPolicyError("probe wall-clock deadline is invalid")
+    try:
+        deadline = float(deadline_monotonic)
+        now = float(clock())
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise TrafficPolicyError("probe wall-clock deadline is invalid") from exc
+    if not math.isfinite(deadline) or not math.isfinite(now):
+        raise TrafficPolicyError("probe wall-clock deadline is invalid")
+    remaining = deadline - now
+    if remaining <= 0:
+        raise TimeoutError("probe wall-clock deadline exceeded")
+    return remaining
+
+
+def _require_wait_within_wall_clock(
+    delay_seconds: float,
+    remaining_seconds: float | None,
+) -> None:
+    if remaining_seconds is not None and delay_seconds >= remaining_seconds:
+        raise TimeoutError("probe wall-clock deadline exceeded")
 
 
 def _validate_private_regular_file(path: Path) -> None:

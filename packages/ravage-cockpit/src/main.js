@@ -7,6 +7,8 @@
 // `docker` / `target` / `status` deltas), so the DOM is built once and only the
 // changed panel mutates — no flicker, no scroll jumps.
 
+import { cockpitFetch, consumeEventStream, sessionToken } from "./transport.js";
+
 const app = document.querySelector("#app");
 
 const refs = {};
@@ -34,13 +36,17 @@ const STREAM_STALE_MS = 20000;
 boot();
 
 async function boot() {
+  if (!sessionToken()) {
+    window.location.replace("/");
+    return;
+  }
   buildShell();
   startElapsedClock();
   await seedFromState();
   connectStream();
   window.setInterval(() => {
     const stale = Date.now() - state.lastStreamAt > STREAM_STALE_MS;
-    if (!window.EventSource || !state.streamConnected || stale) {
+    if (!state.streamConnected || stale) {
       seedFromState({ polling: true });
     }
   }, FALLBACK_POLL_MS);
@@ -50,7 +56,7 @@ async function boot() {
 
 async function seedFromState(options = {}) {
   try {
-    const response = await fetch("/api/state", { cache: "no-store" });
+    const response = await cockpitFetch("/api/state");
     if (!response.ok) return;
     applyState(await response.json());
     if (options.polling) markConnection(false);
@@ -59,16 +65,21 @@ async function seedFromState(options = {}) {
   }
 }
 
-function connectStream() {
-  if (!window.EventSource) return;
-  const stream = new EventSource("/api/events/stream");
-  stream.addEventListener("state", (e) => withData(e, applyState));
-  stream.addEventListener("step", (e) => withData(e, appendStep));
-  stream.addEventListener("docker", (e) => withData(e, updateDocker));
-  stream.addEventListener("target", (e) => withData(e, updateTarget));
-  stream.addEventListener("status", (e) => withData(e, updateStatus));
-  stream.onopen = () => markConnection(true);
-  stream.onerror = () => markConnection(false);
+async function connectStream() {
+  const handlers = { state: applyState, step: appendStep, docker: updateDocker, target: updateTarget, status: updateStatus };
+  try {
+    const response = await cockpitFetch("/api/events/stream");
+    if (!response.ok || !response.body) throw new Error("The cockpit event stream is unavailable");
+    markConnection(true);
+    await consumeEventStream(response.body, (event) => {
+      const handler = handlers[event.type];
+      if (handler) withData(event, handler);
+    });
+  } catch {
+    // Reconnect below; state polling continues while the stream is unavailable.
+  }
+  markConnection(false);
+  if (sessionToken()) window.setTimeout(connectStream, 1500);
 }
 
 function withData(event, handler) {

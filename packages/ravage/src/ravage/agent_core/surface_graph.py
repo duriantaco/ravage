@@ -118,7 +118,9 @@ _ALLOWED_SOURCE_KINDS = frozenset(
         "graphql",
         "browser",
         "probe",
+        "source_code",
         "agent_http_response",
+        "source_informed_agent_http_response",
         "external_tool",
         "legacy_import",
     }
@@ -565,7 +567,11 @@ class SurfaceGraphState:
         observed_at: object = "",
     ) -> SurfaceOperation:
         source = _source_kind(source_kind)
-        route_only_metadata = source in {"probe", "agent_http_response"}
+        route_only_metadata = source in {
+            "probe",
+            "agent_http_response",
+            "source_informed_agent_http_response",
+        }
         operation = self.add_operation(
             SurfaceOperation.create(
                 url=url,
@@ -599,11 +605,20 @@ class SurfaceGraphState:
     def ingest_exchange(self, exchange: CapturedHttpExchange) -> SurfaceOperation:
         successful_agent_http = _successful_agent_http_exchange(exchange)
         source = (
-            "agent_http_response"
+            "source_informed_agent_http_response"
             if successful_agent_http
-            else _exchange_source_kind(exchange.source)
+            and exchange.request_resource_type == "source_informed_agent_http"
+            else (
+                "agent_http_response"
+                if successful_agent_http
+                else _exchange_source_kind(exchange.source)
+            )
         )
-        retain_request_metadata = source not in {"probe", "agent_http_response"}
+        retain_request_metadata = source not in {
+            "probe",
+            "agent_http_response",
+            "source_informed_agent_http_response",
+        }
         parameters = _exchange_parameters(exchange) if retain_request_metadata else ()
         content_types = (
             tuple(

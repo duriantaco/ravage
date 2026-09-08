@@ -162,6 +162,44 @@ ravage attack ravage-brief.yaml \
   --report
 ```
 
+If you also have the application checkout and the engagement permits source
+review, add source-guided validation:
+
+```bash
+ravage attack ravage-brief.yaml \
+  --source-root /path/to/application \
+  --allow-paid-models \
+  --report
+```
+
+`--source-root` is CLI-only opt-in; fields inside a brief cannot enable local
+source access. Ravage scans local Python files for direct Flask and
+FastAPI route-input flows into SQL, template, shell, file-read, and outbound-URL
+sinks. Traversal is capped by file count, per-file and total bytes, directory
+count, and directory-entry count; included source that exceeds any cap fails
+closed. Hidden, temporary, version-control, virtual-environment, dependency,
+cache, and build directories are excluded by policy. The private map stores
+structural identifiers such as method, route and input names, input location,
+framework, relative file, line, and sink; a bounded subset is sent to the configured
+model. It does not store or send source snippets, function bodies, unrelated
+constant values, defaults, or absolute source paths. Automatic replay is limited
+to statically bound, non-mutating GET/query SQL candidates where Ravage knows
+the complete supported scalar query shape and the tested field is a string.
+POST, body, form, path, dynamic, relatively bound, and other sink-family
+candidates remain prioritization hints in this version. A source-code graph
+operation is therefore a route/input hypothesis, not necessarily a complete
+request template. Only live differential evidence can produce a finding.
+
+The source map is `RUN_DIR/workspace/artifacts/source-map.json` with private file
+permissions. It reports traversal counts, including excluded directories;
+exclusions are not live proof or coverage of the skipped code. Parse failures,
+skipped symlinks, and dynamic or unsupported recognized route and direct-flow
+patterns are recorded as incomplete coverage. `analysis_complete` means every
+included file parsed and every recognized bounded pattern was handled; it does
+not mean whole-program coverage. A resumed source-guided run must use the same
+`--source-root` snapshot, analyzer contract, and candidate map; drift fails
+before target traffic starts.
+
 For the authenticated brief used above, add `--identity user` to the attack
 command. A brief with one configured identity is auto-selected by the public
 wrapper, but keeping the flag makes the intended role reviewable. A brief with
@@ -425,9 +463,28 @@ ravage audit verify RUN_DIR
 The canonical JSON report is finalized even when a run is incomplete, fails
 after starting, or has no flag-based objective. Evidence-backed findings remain
 in the report independently of any captured flag. JSON-only finalization reads
-saved artifacts and sends no model or target requests. It uses an atomic replace
-and private file permissions so an interrupted write cannot leave a partially
-written report.
+saved artifacts and sends no model or target requests. Both canonical JSON and
+explicit Markdown/JSON exports use private file permissions and atomic replacement
+for each file, so an interrupted write preserves the previous complete file.
+
+Report evidence health is separate from run completion. Inspect
+`source_quality.status`, `audit_source`, `audit_log_source`, `event_sources`, and
+`rejected_confirmed_events`: an expected database that is missing, unreadable,
+or contains rejected records makes the report incomplete. Validated findings
+remain visible, while a report without findings and with unavailable evidence
+has `Unknown` risk. Source health does not replace `ravage audit verify` for
+cryptographic audit-chain verification.
+
+Event source health distinguishes an existing empty log from a missing or
+unreadable log. Persisted workspace state, transcripts, and scan/graph state
+identify expected event logs. An export with neither events nor a requested
+audit source is incomplete; legitimate audit-only exports and unused optional
+event streams remain supported.
+
+When a run directory moves, recorded audit paths inside that run or its
+workspace move with it. A custom relative audit path outside the run cannot be
+relocated because older manifests do not record the producing working directory;
+use an absolute path for external audit storage.
 
 If you did not pass `--report`, render the optional human-readable report later:
 
@@ -839,6 +896,16 @@ Follow an existing run from another terminal:
 ```bash
 ravage observe RUN_DIR
 ```
+
+Open the private link printed by `ravage observe`. Its temporary access token
+is specific to that running observer. The browser removes it from the address
+bar and keeps access in that tab's origin-scoped session storage. Run data and
+teardown actions require authenticated requests. Restarting the observer
+invalidates previous access credentials.
+
+The observer binds to loopback by default and serves HTTP. For remote review,
+use an SSH tunnel to loopback; an explicit external `--host` does not add TLS.
+Treat the printed link as a credential and keep it private.
 
 Resume the same attack workspace after an interrupted run:
 

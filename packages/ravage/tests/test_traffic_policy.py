@@ -558,6 +558,34 @@ def test_inflight_deduplication_reuses_first_response(tmp_path: Path) -> None:
     assert snapshot.deduplicated_count == 1
 
 
+def test_deduplication_wait_stops_at_probe_deadline(tmp_path: Path) -> None:
+    clock = _Clock()
+    controller = _controller(
+        tmp_path,
+        TrafficPolicyConfig(
+            mode=TrafficPolicyMode.ENFORCE,
+            cache_enabled=True,
+            deduplicate=True,
+        ),
+        clock=clock,
+    )
+    intent = _intent(cacheable=True)
+    first = controller.acquire(intent)
+    assert first.lease is not None
+
+    with pytest.raises(TimeoutError, match="wall-clock deadline"):
+        controller.acquire(
+            intent,
+            _deadline_monotonic=clock.now + 0.02,
+            _monotonic_clock=clock,
+        )
+
+    assert clock.sleeps == []
+    assert controller.snapshot().physical_request_count == 0
+    assert controller.snapshot().reservation_count == 1
+    controller.cancel(first.lease)
+
+
 def test_retry_after_backoff_and_circuit_half_open(tmp_path: Path) -> None:
     clock = _Clock()
     controller = _controller(
@@ -625,6 +653,37 @@ def test_backoff_respacing_prevents_reserved_leases_from_bursting(
     assert second_dispatched_at == 1_005.0
     assert clock.now == 1_005.5
     assert clock.sleeps == [5.0, 0.5]
+
+
+def test_backoff_wait_cancels_dispatch_at_probe_deadline(tmp_path: Path) -> None:
+    clock = _Clock()
+    controller = _controller(
+        tmp_path,
+        TrafficPolicyConfig(
+            mode=TrafficPolicyMode.ENFORCE,
+            backoff_initial_seconds=5,
+            backoff_max_seconds=5,
+        ),
+        clock=clock,
+    )
+    first = controller.acquire(_intent("/first"))
+    assert first.lease is not None
+    controller.begin_dispatch(first.lease)
+    controller.complete(first.lease, TrafficOutcome(status=429))
+    second = controller.acquire(_intent("/second"))
+    assert second.lease is not None
+
+    with pytest.raises(TimeoutError, match="wall-clock deadline"):
+        controller.begin_dispatch(
+            second.lease,
+            _deadline_monotonic=clock.now + 1,
+            _monotonic_clock=clock,
+        )
+
+    assert clock.sleeps == []
+    snapshot = controller.snapshot()
+    assert snapshot.physical_request_count == 1
+    assert snapshot.reservation_count == 0
 
 
 def test_cancelled_reservations_do_not_consume_pacing_slots(tmp_path: Path) -> None:

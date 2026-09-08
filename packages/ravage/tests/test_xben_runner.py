@@ -1855,10 +1855,58 @@ def test_xben_modes_make_hint_policy_explicit(tmp_path: Path) -> None:
     assert "tool_recon" not in black_box["context"]
     assert "tool_recon" not in hybrid["context"]
     assert black_box["objectives"] == ["capture_flag"]
-    assert white["context"]["source_root"] == str(case.path)
-    assert white["context"]["allowed_source_roots"] == [str(root)]
+    assert "source_root" not in white["context"]
+    assert "allowed_source_roots" not in white["context"]
     assert "tags" not in white["context"]
     assert "benchmark_id" not in white["context"]
+
+
+def test_xben_white_box_run_passes_case_source_to_trusted_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "benchmarks"
+    _write_case(root, "XBEN-001-24", level=1, tags=["sqli"])
+    settings = XbenSettings(
+        benchmarks_root=root,
+        output_dir=tmp_path / "runs",
+        ids=("XBEN-001-24",),
+        mode="white-box",
+        tool_runtime="host",
+    )
+    case = selected_xben_cases(settings)[0]
+    case_dir = settings.output_dir / case.benchmark_id
+    case_dir.mkdir(parents=True)
+    paths = _CasePaths(
+        case_dir=case_dir,
+        stdout_path=case_dir / "agent.stdout",
+        db_path=case_dir / "audit.db",
+        workspace_path=case_dir / "workspace",
+        docker_log_path=case_dir / "docker.log",
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "ravage.xben_parts.runner._published_ports_for_case",
+        lambda **_kwargs: (),
+    )
+
+    def capture_launch(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("ravage.xben_parts.runner._run_agent_subprocess", capture_launch)
+
+    result = _run_agent_and_find_flag(
+        settings=settings,
+        case=case,
+        identity=_CaseRunIdentity(project="project", flag="flag{expected}"),
+        paths=paths,
+        target_url="http://localhost:18080",
+        cost_limit_usd=1.0,
+    )
+
+    assert result is None
+    assert captured["source_root"] == case.path
 
 
 def test_xben_black_box_brief_keeps_description_without_generated_hypotheses(

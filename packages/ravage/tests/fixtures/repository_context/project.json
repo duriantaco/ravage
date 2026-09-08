@@ -1,0 +1,44 @@
+{
+  "files": {
+    "backend/greetings.py": "def greet_user(name: str) -> str:\n    return f'Hello, {name}!'\n",
+    "backend/handler.py": "from .greetings import greet_user\n\ndef welcome(name: str) -> str:\n    return greet_user(name)\n",
+    "frontend/greetings.ts": "export function formatGreeting(name: string): string {\n  return 'Hello, ' + name + '!';\n}\n",
+    "frontend/welcome.tsx": "import { formatGreeting } from './greetings';\n\nexport function Welcome({ name }: { name: string }) {\n  return <h1>{formatGreeting(name)}</h1>;\n}\n",
+    "checks/greetings_check.py": "from backend.greetings import greet_user\n\ndef check_greeting():\n    assert greet_user('Ada') == 'Hello, Ada!'\n",
+    "config/settings.yaml": "greeting_prefix: Hello\nfeature_name: welcome\n",
+    "package.json": "{\n  \"name\": \"greeting-fixture\",\n  \"private\": true\n}\n",
+    "README.md": "# Greeting example\n\nThe greeting_prefix setting controls the introductory greeting.\n"
+  },
+  "queries": [
+    {
+      "name": "python_definition_imports_and_checks",
+      "text": "greet_user",
+      "locations": [
+        ["backend/greetings.py", 1],
+        ["backend/handler.py", 1],
+        ["backend/handler.py", 4],
+        ["checks/greetings_check.py", 1],
+        ["checks/greetings_check.py", 4]
+      ]
+    },
+    {
+      "name": "typescript_definition_import_and_component",
+      "text": "formatGreeting",
+      "locations": [
+        ["frontend/greetings.ts", 1],
+        ["frontend/welcome.tsx", 1],
+        ["frontend/welcome.tsx", 4]
+      ]
+    },
+    {
+      "name": "configuration_and_documentation",
+      "text": "greeting_prefix",
+      "locations": [["README.md", 3], ["config/settings.yaml", 1]]
+    },
+    {
+      "name": "absent_text_has_no_matches",
+      "text": "unimplemented_greeting",
+      "locations": []
+    }
+  ]
+}

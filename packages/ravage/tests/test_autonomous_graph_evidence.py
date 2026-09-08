@@ -89,6 +89,7 @@ def _probe_result(
     payload: dict[str, object] | None = None,
     *,
     source_kind: str = "tool_run_probe",
+    source_informed: bool = False,
 ) -> ActionResult:
     body = json.dumps(payload or _sql_probe_payload())
     return ActionResult(
@@ -97,6 +98,7 @@ def _probe_result(
         outcome="confirmed_signal",
         evidence_source_kind=source_kind,
         evidence_observation=body,
+        source_informed=source_informed,
     )
 
 
@@ -197,6 +199,47 @@ def test_structured_target_probe_promotes_typed_progress(
         assert record.trusted is True
         assert record.material is True
         assert record.parent_refs == (promotion.raw_evidence_ref,)
+
+
+def test_executor_owned_source_lineage_reaches_promoted_evidence(tmp_path: Path) -> None:
+    blackboard = _blackboard(tmp_path)
+
+    promotion = blackboard.record_action_result(
+        producer_node_id="node-001",
+        action={"action": "run_probe", "probe": "sqli_differential"},
+        result=_probe_result(source_informed=True),
+        observation_id="source-informed-observation",
+    )
+
+    raw = blackboard.state.records[promotion.raw_evidence_ref]
+    assert raw.payload["source_informed"] is True
+    assert promotion.promoted_evidence_refs
+    assert all(
+        blackboard.state.records[reference].payload["source_informed"] is True
+        for reference in promotion.promoted_evidence_refs
+    )
+
+
+def test_model_action_cannot_self_claim_source_lineage(tmp_path: Path) -> None:
+    blackboard = _blackboard(tmp_path)
+
+    promotion = blackboard.record_action_result(
+        producer_node_id="node-001",
+        action={
+            "action": "run_probe",
+            "probe": "sqli_differential",
+            "source_informed": True,
+        },
+        result=_probe_result(),
+        observation_id="model-claimed-source-lineage",
+    )
+
+    raw = blackboard.state.records[promotion.raw_evidence_ref]
+    assert "source_informed" not in raw.payload
+    assert all(
+        "source_informed" not in blackboard.state.records[reference].payload
+        for reference in promotion.promoted_evidence_refs
+    )
 
 
 def test_missing_executor_observation_id_fails_closed(

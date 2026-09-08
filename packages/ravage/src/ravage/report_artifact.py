@@ -1,17 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
-import re
-import tempfile
-from contextlib import suppress
-from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any
 
-from ravage.report import build_pentest_report, redact_sensitive
+from ravage.report import build_pentest_report, redact_report_payload
+from ravage.report_io import atomic_write_private_report
 
-_PRIVATE_FILE_MODE = 0o600
-_PATH_SEPARATOR_RE = re.compile(r"([/\\\\]+)")
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def write_json_report_artifact(  # noqa: PLR0913
@@ -49,68 +45,9 @@ def write_json_report_artifact(  # noqa: PLR0913
         run = report.get("run")
         if isinstance(run, dict):
             run["termination_reason"] = termination_reason
-    report = _redact_report_payload(report)
-    _atomic_write_private_json(output_path, report)
+    report = redact_report_payload(report)
+    atomic_write_private_report(output_path, json.dumps(report, indent=2, sort_keys=True) + "\n")
     return report
-
-
-def _redact_report_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Redact metadata added after ``build_pentest_report`` performed its own pass."""
-
-    def redact(value: object, *, path_context: bool = False) -> object:
-        if isinstance(value, dict):
-            redacted: dict[str, object] = {}
-            for key, item in value.items():
-                safe_key = redact_sensitive(str(key))
-                redacted[safe_key] = redact(
-                    item,
-                    path_context=safe_key.endswith(("_path", "_paths")),
-                )
-            return redacted
-        if isinstance(value, (list, tuple)):
-            return [redact(item, path_context=path_context) for item in value]
-        if isinstance(value, str):
-            if path_context:
-                return "".join(
-                    part if _PATH_SEPARATOR_RE.fullmatch(part) else redact_sensitive(part)
-                    for part in _PATH_SEPARATOR_RE.split(value)
-                )
-            return redact_sensitive(value)
-        return value
-
-    return cast("dict[str, Any]", redact(payload))
-
-
-def _atomic_write_private_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=path.parent,
-    )
-    temporary_path = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, indent=2, sort_keys=True)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        temporary_path.chmod(_PRIVATE_FILE_MODE)
-        temporary_path.replace(path)
-        _fsync_directory(path.parent)
-    finally:
-        with suppress(FileNotFoundError):
-            temporary_path.unlink()
-
-
-def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    with suppress(OSError):
-        descriptor = os.open(path, flags)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
 
 
 __all__ = ["write_json_report_artifact"]

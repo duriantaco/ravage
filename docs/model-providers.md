@@ -177,8 +177,8 @@ Use:
 --model-profile hosted-openai --model-tier mid
 ```
 
-Hosted routes are paid-risk routes. `ravage attack` and `ravage xben` block them
-by default until you pass `--allow-paid-models`.
+Hosted routes are paid-risk routes. `ravage attack`, `ravage review`, and
+`ravage xben` block them by default until you pass `--allow-paid-models`.
 
 The built-in direct OpenAI routes pin GPT-5.4 snapshots and apply OpenAI's
 standard per-token prices for the recognized GPT-5.4 and GPT-5.4 mini snapshot

@@ -4,6 +4,7 @@ import errno
 import socket
 import ssl
 from email.message import Message
+from http import HTTPStatus
 from http.client import HTTPException, IncompleteRead
 from http.cookiejar import Cookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -58,7 +59,7 @@ def test_remote_probe_connects_to_resolver_pin_without_os_dns(
         def do_GET(self) -> None:
             received_hosts.append(self.headers["Host"])
             body = b"resolver-pinned"
-            self.send_response(200)
+            self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -99,6 +100,34 @@ def test_remote_probe_connects_to_resolver_pin_without_os_dns(
     assert response.body == "resolver-pinned"
     assert resolver_calls == [(hostname, port)]
     assert received_hosts == [f"{hostname}:{port}"]
+
+
+def test_probe_session_encodes_unicode_and_del_for_http_transport() -> None:
+    received_paths: list[str] = []
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            received_paths.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        session = ProbeSession(f"http://127.0.0.1:{server.server_port}/")
+        response = session.get("/café/\u200b/\x7f?term=é&encoded=%2F")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert response.status == HTTPStatus.OK
+    assert received_paths == ["/caf%C3%A9/%E2%80%8B/%7F?term=%C3%A9&encoded=%2F"]
 
 
 def test_pinned_https_connection_keeps_original_tls_hostname(monkeypatch) -> None:

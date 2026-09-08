@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "check": "node --check src/main.js"
+    "check": "node --check src/main.js && node --check src/transport.js",
+    "test": "node --test tests/*.test.js"
   }
 }

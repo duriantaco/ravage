@@ -8,7 +8,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +18,13 @@ from urllib.parse import unquote, urlparse
 
 import yaml
 
+from ravage.live_dashboard_security import (
+    BOOTSTRAP_HTML,
+    BOOTSTRAP_PATH,
+    BOOTSTRAP_SCRIPT,
+    CONTENT_SECURITY_POLICY,
+    CockpitAccess,
+)
 from ravage.live_dashboard_view import (
     _activity,
     _agents,
@@ -417,7 +424,7 @@ def serve_dashboard(
     port: int = 8787,
 ) -> None:
     cockpit = start_cockpit(settings, host=host, port=port)
-    sys.stdout.write(f"ravage cockpit listening on {cockpit.url}\n")
+    sys.stdout.write(f"ravage cockpit private link: {cockpit.url}\n")
     sys.stdout.flush()
     try:
         cockpit.wait_forever()
@@ -434,7 +441,7 @@ class CockpitServer:
 
     server: ThreadingHTTPServer
     thread: threading.Thread
-    url: str
+    url: str = field(repr=False)
     stop_event: threading.Event
 
     def wait_forever(self) -> None:
@@ -454,12 +461,11 @@ def start_cockpit(
     host: str = "127.0.0.1",
     port: int = 8787,
 ) -> CockpitServer:
-    handler = _handler(settings)
+    access = CockpitAccess(bind_host=host)
+    handler = _handler(settings, access)
     server = ThreadingHTTPServer((host, port), handler)
     stop_event = threading.Event()
-    thread = threading.Thread(
-        target=server.serve_forever, name="ravage-cockpit", daemon=True
-    )
+    thread = threading.Thread(target=server.serve_forever, name="ravage-cockpit", daemon=True)
     thread.start()
     if settings.run_root is not None:
         reaper = threading.Thread(
@@ -470,7 +476,10 @@ def start_cockpit(
         )
         reaper.start()
     return CockpitServer(
-        server=server, thread=thread, url=f"http://{host}:{port}", stop_event=stop_event
+        server=server,
+        thread=thread,
+        url=access.launch_url(server.server_port),
+        stop_event=stop_event,
     )
 
 
@@ -743,115 +752,180 @@ def _run_docker_json_lines(command: list[str], *, timeout: int) -> list[dict[str
 _RUN_TEARDOWN_RE = re.compile(r"/api/run/(?P<run_id>[^/]*)/teardown")
 
 
-def _handler(settings: DashboardSettings) -> type[BaseHTTPRequestHandler]:
-    class DashboardHandler(BaseHTTPRequestHandler):
-        def handle(self) -> None:
-            try:
-                super().handle()
-            except ConnectionResetError:
-                return
+class _DashboardHandler(BaseHTTPRequestHandler):
+    settings: DashboardSettings
+    access: CockpitAccess
+    server: ThreadingHTTPServer
 
-        def do_GET(self) -> None:
-            path = urlparse(self.path).path
-            self._route_get(path)
-
-        def do_POST(self) -> None:
-            path = urlparse(self.path).path
-            run_id = _teardown_run_id(path)
-            if run_id is not None:
-                self._send_json(teardown_active_run(settings, run_id))
-                return
-            self.send_error(HTTPStatus.NOT_FOUND)
-
-        def log_message(self, format: str, *args: object) -> None:  # noqa: A002, ARG002
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except ConnectionResetError:
             return
 
-        def _route_get(self, path: str) -> None:
-            if path == "/api/state":
-                self._send_json(build_dashboard_state(settings))
-                return
-            if path == "/api/events/stream":
-                self._send_state_stream()
-                return
-            if path == "/assets/ravage_logo.png":
-                self._send_file(LOGO_PATH)
-                return
-            self._send_frontend_file(path)
-
-        def _send_json(self, payload: Mapping[str, Any]) -> None:
-            body = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
-            self._send_body(body, status=HTTPStatus.OK, content_type="application/json")
-
-        def _send_state_stream(self) -> None:
-            self._send_stream_headers()
-            cursor = _StreamCursor()
-            while True:
-                try:
-                    self._write_state_stream_tick(cursor)
-                    time.sleep(1.0)
-                except (BrokenPipeError, ConnectionResetError):
-                    return
-
-        def _send_stream_headers(self) -> None:
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("X-Accel-Buffering", "no")
-            self.end_headers()
-
-        def _write_state_stream_tick(self, cursor: _StreamCursor) -> None:
-            state = build_dashboard_state(settings)
-            for event_name, data in cursor.deltas(state):
-                self._write_sse(event_name, data)
-            self.wfile.write(b": keepalive\n\n")
-            self.wfile.flush()
-
-        def _write_sse(self, event_name: str, data: object) -> None:
-            body = json.dumps(data, sort_keys=True, default=str)
-            self.wfile.write(f"event: {event_name}\ndata: {body}\n\n".encode())
-
-        def _send_frontend_file(self, request_path: str) -> None:
-            path = _frontend_request_path(request_path)
-            resolved = _safe_static_path(FRONTEND_DIR, path)
-            if resolved is not None and _static_file_available(resolved):
-                self._send_file(resolved)
-                return
-            if path != "/index.html":
-                self.send_error(HTTPStatus.NOT_FOUND)
-                return
-            self._send_missing_frontend()
-
-        def _send_file(self, path: Path) -> None:
-            if not path.exists() or not path.is_file():
-                self.send_error(HTTPStatus.NOT_FOUND)
-                return
-            body = path.read_bytes()
-            content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-            self._send_body(body, status=HTTPStatus.OK, content_type=content_type)
-
-        def _send_missing_frontend(self) -> None:
-            body = _missing_frontend_body()
+    def do_GET(self) -> None:
+        if not self._valid_request():
+            return
+        path = urlparse(self.path).path
+        if path == "/":
             self._send_body(
-                body,
-                status=HTTPStatus.SERVICE_UNAVAILABLE,
-                content_type="text/plain; charset=utf-8",
+                BOOTSTRAP_HTML, status=HTTPStatus.OK, content_type="text/html; charset=utf-8"
             )
+            return
+        if path == BOOTSTRAP_PATH:
+            self._send_body(
+                BOOTSTRAP_SCRIPT,
+                status=HTTPStatus.OK,
+                content_type="text/javascript; charset=utf-8",
+            )
+            return
+        if path.startswith("/api/") and not self._authorized():
+            return
+        self._route_get(path)
 
-        def _send_body(
-            self,
-            body: bytes,
-            *,
-            status: HTTPStatus,
-            content_type: str,
-        ) -> None:
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+    def do_POST(self) -> None:
+        if not self._valid_request(mutation=True):
+            return
+        path = urlparse(self.path).path
+        if path == "/api/session":
+            if not self.access.bearer_authorized(self.headers):
+                self.send_error(HTTPStatus.UNAUTHORIZED)
+                return
+            self._send_json({"authenticated": True, "session_token": self.access.session})
+            return
+        if not self._authorized():
+            return
+        run_id = _teardown_run_id(path)
+        if run_id is not None:
+            self._send_json(teardown_active_run(self.settings, run_id))
+            return
+        self.send_error(HTTPStatus.NOT_FOUND)
 
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002, ARG002
+        return
+
+    def end_headers(self) -> None:
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", CONTENT_SECURITY_POLICY)
+        super().end_headers()
+
+    def _valid_request(self, *, mutation: bool = False) -> bool:
+        origin = self.access.request_origin(
+            self.headers,
+            local_host=str(self.connection.getsockname()[0]),
+            port=self.server.server_port,
+        )
+        if origin is None:
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return False
+        if mutation and self.headers.get_all("Origin", []) != [origin]:
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return False
+        return True
+
+    def _authorized(self) -> bool:
+        if self.access.authorized(self.headers):
+            return True
+        self.send_error(HTTPStatus.UNAUTHORIZED)
+        return False
+
+    def _route_get(self, path: str) -> None:
+        if path == "/api/session":
+            self._send_json({"authenticated": True})
+            return
+        if path == "/api/state":
+            self._send_json(build_dashboard_state(self.settings))
+            return
+        if path == "/api/events/stream":
+            self._send_state_stream()
+            return
+        if path == "/assets/ravage_logo.png":
+            self._send_file(LOGO_PATH)
+            return
+        self._send_frontend_file(path)
+
+    def _send_json(self, payload: Mapping[str, Any]) -> None:
+        body = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        self._send_body(body, status=HTTPStatus.OK, content_type="application/json")
+
+    def _send_state_stream(self) -> None:
+        self._send_stream_headers()
+        cursor = _StreamCursor()
+        while True:
+            try:
+                self._write_state_stream_tick(cursor)
+                time.sleep(1.0)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+
+    def _send_stream_headers(self) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+    def _write_state_stream_tick(self, cursor: _StreamCursor) -> None:
+        state = build_dashboard_state(self.settings)
+        for event_name, data in cursor.deltas(state):
+            self._write_sse(event_name, data)
+        self.wfile.write(b": keepalive\n\n")
+        self.wfile.flush()
+
+    def _write_sse(self, event_name: str, data: object) -> None:
+        body = json.dumps(data, sort_keys=True, default=str)
+        self.wfile.write(f"event: {event_name}\ndata: {body}\n\n".encode())
+
+    def _send_frontend_file(self, request_path: str) -> None:
+        path = _frontend_request_path(request_path)
+        resolved = _safe_static_path(FRONTEND_DIR, path)
+        if resolved is not None and _static_file_available(resolved):
+            self._send_file(resolved)
+            return
+        if path != "/index.html":
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        self._send_missing_frontend()
+
+    def _send_file(self, path: Path) -> None:
+        if not path.exists() or not path.is_file():
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        body = path.read_bytes()
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        self._send_body(body, status=HTTPStatus.OK, content_type=content_type)
+
+    def _send_missing_frontend(self) -> None:
+        body = _missing_frontend_body()
+        self._send_body(
+            body,
+            status=HTTPStatus.SERVICE_UNAVAILABLE,
+            content_type="text/plain; charset=utf-8",
+        )
+
+    def _send_body(
+        self,
+        body: bytes,
+        *,
+        status: HTTPStatus,
+        content_type: str,
+    ) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def _handler(settings: DashboardSettings, access: CockpitAccess) -> type[BaseHTTPRequestHandler]:
+    class DashboardHandler(_DashboardHandler):
+        pass
+
+    DashboardHandler.settings = settings
+    DashboardHandler.access = access
     return DashboardHandler
 
 
@@ -875,10 +949,7 @@ def _static_file_available(path: Path) -> bool:
 
 
 def _missing_frontend_body() -> bytes:
-    message = (
-        "Ravage cockpit frontend is missing. Expected files under "
-        f"{FRONTEND_DIR}."
-    )
+    message = f"Ravage cockpit frontend is missing. Expected files under {FRONTEND_DIR}."
     return message.encode()
 
 

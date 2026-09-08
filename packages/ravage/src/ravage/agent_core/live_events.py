@@ -6,6 +6,7 @@ from html import unescape
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlparse
 
+from ravage.agent_core.source_context import SOURCE_CONTEXT_ACTION
 from ravage.traffic.redaction import REDACTED, redact_headers, redact_text, sanitize_url
 
 MASK = "••••"
@@ -82,6 +83,13 @@ def mask_command_string(text: str) -> str:
 
 def describe_action(action: dict[str, Any]) -> dict[str, Any]:  # noqa: PLR0911
     kind = str(action.get("action") or "")
+    if kind == SOURCE_CONTEXT_ACTION:
+        operation = str(action.get("operation") or "inspect")
+        return {
+            "summary": "Inspect source snapshot",
+            "detail": _clip(operation),
+            "params": {"operation": operation},
+        }
     if kind == "http_request":
         step = _describe_http_step(action)
         method = str(step.get("method") or "GET")

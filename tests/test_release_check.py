@@ -152,11 +152,6 @@ def test_workspace_version_check_rejects_stale_manifest(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    root_pyproject = tmp_path / "pyproject.toml"
-    root_pyproject.write_text(
-        '[project]\nname = "pentest-agent"\nversion = "0.6.0"\n',
-        encoding="utf-8",
-    )
     citation = tmp_path / "CITATION.cff"
     citation.write_text("version: 0.6.0\n", encoding="utf-8")
     manifest = tmp_path / "manifest.json"
@@ -164,9 +159,6 @@ def test_workspace_version_check_rejects_stale_manifest(
     lock = tmp_path / "uv.lock"
     lock.write_text(
         """
-[[package]]
-name = "pentest-agent"
-version = "0.6.0"
 [[package]]
 name = "ravage"
 version = "0.6.0"
@@ -176,11 +168,54 @@ version = "0.6.0"
 """.lstrip(),
         encoding="utf-8",
     )
-    monkeypatch.setattr(check_release, "ROOT_PYPROJECT", root_pyproject)
     monkeypatch.setattr(check_release, "CITATION_FILE", citation)
     monkeypatch.setattr(check_release, "RELEASE_MANIFEST", manifest)
     monkeypatch.setattr(check_release, "LOCK_FILE", lock)
 
     assert check_release._workspace_version_errors("0.6.0") == [  # noqa: SLF001
         "release-please manifest version '0.5.0' does not match package version '0.6.0'"
+    ]
+
+
+def test_workspace_configuration_rejects_a_duplicate_root_distribution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root_pyproject = tmp_path / "pyproject.toml"
+    root_pyproject.write_text(
+        check_release.ROOT_PYPROJECT.read_text(encoding="utf-8")
+        + '\n[project]\nname = "pentest-agent"\nversion = "0.5.0"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(check_release, "ROOT_PYPROJECT", root_pyproject)
+
+    assert check_release._workspace_configuration_errors() == [  # noqa: SLF001
+        "root pyproject.toml must remain a virtual, non-distributable workspace"
+    ]
+
+
+def test_workspace_configuration_rejects_active_mcp_scaffolds(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root_pyproject = tmp_path / "pyproject.toml"
+    root_pyproject.write_text(
+        check_release.ROOT_PYPROJECT.read_text(encoding="utf-8").replace(
+            'exclude = ["packages/mcp_servers/*"]', "exclude = []"
+        ),
+        encoding="utf-8",
+    )
+    lock = tmp_path / "uv.lock"
+    lock.write_text(
+        check_release.LOCK_FILE.read_text(encoding="utf-8")
+        + '\n[[package]]\nname = "ffuf-mcp"\nversion = "0.1.0"\n'
+        'source = { editable = "packages/mcp_servers/ffuf_mcp" }\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(check_release, "ROOT_PYPROJECT", root_pyproject)
+    monkeypatch.setattr(check_release, "LOCK_FILE", lock)
+
+    assert check_release._workspace_configuration_errors() == [  # noqa: SLF001
+        "unimplemented MCP scaffolds must be excluded from the UV workspace",
+        "uv.lock must install only the two real workspace packages",
     ]

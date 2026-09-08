@@ -13,6 +13,10 @@ from ravage.agent_core.agent_strategy import (
 )
 from ravage.agent_core.recovery_action_contract import RECOVERY_OBJECTIVE_ACTION_STRATEGY
 from ravage.agent_core.semantic_routes import semantic_action_fingerprint, semantic_action_route
+from ravage.agent_core.source_context import (
+    SOURCE_CONTEXT_ACTION,
+    sanitize_source_context_action,
+)
 from ravage.traffic.redaction import redact_headers, redact_text, sanitize_url
 
 if TYPE_CHECKING:
@@ -194,7 +198,9 @@ def attempt_record_payload(  # noqa: PLR0913 - mirrors the turn boundary.
             "stop": outcome.get("stop"),
             "classification": classification,
             "repeat_count": outcome.get("repeat_count"),
+            **({"source_informed": True} if outcome.get("source_informed") is True else {}),
         },
+        **({"source_informed": True} if outcome.get("source_informed") is True else {}),
         "novel": novel,
         "status": _attempt_status(
             classification=classification,
@@ -233,10 +239,12 @@ def turn_trace_payload(  # noqa: PLR0913 - flat fields define the trace schema.
             "repeat_count": outcome.get("repeat_count"),
             "classification": outcome.get("outcome"),
             "flag_captured": bool(outcome.get("flag")),
+            **({"source_informed": True} if outcome.get("source_informed") is True else {}),
             "observation_digest": observation_digest(sanitized_observation)
             if sanitized_observation
             else {},
         },
+        **({"source_informed": True} if outcome.get("source_informed") is True else {}),
         "pre_state": dict(pre_state),
         "post_state": dict(post_state),
         "state_delta": state_trace_delta(pre_state, post_state),
@@ -245,6 +253,8 @@ def turn_trace_payload(  # noqa: PLR0913 - flat fields define the trace schema.
 
 def sanitize_action(action: Mapping[str, object]) -> dict[str, object]:
     kind = str(action.get("action") or "")
+    if kind == SOURCE_CONTEXT_ACTION:
+        return sanitize_source_context_action(action)
     if kind == "http_request":
         return _sanitize_http_step(action)
     sanitized: dict[str, object] = {}

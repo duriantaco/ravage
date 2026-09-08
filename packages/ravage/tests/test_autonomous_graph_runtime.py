@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shlex
+import sys
 import time
 from typing import TYPE_CHECKING
 
@@ -25,6 +27,16 @@ if TYPE_CHECKING:
 TARGET_URL = "http://127.0.0.1:8765"
 OUTPUT_CAP = 128
 CONTAINER_PID_PATH = "/tmp/ravage-process-scanner.pid"  # noqa: S108
+HOST_PROCESS_TIMEOUT_SECONDS = 10.0
+_FAILED_PROCESS_STATUSES = frozenset(
+    {
+        ProcessStatus.FAILED,
+        ProcessStatus.LOST,
+        ProcessStatus.STOPPED,
+        ProcessStatus.TIMED_OUT,
+        ProcessStatus.OUTPUT_LIMIT,
+    }
+)
 
 
 def _runtime(
@@ -36,7 +48,7 @@ def _runtime(
         backend=HostGraphProcessBackend(tmp_path / "workspace"),
         target_url=TARGET_URL,
         manifest_path=tmp_path / "process-manifest.json",
-        limits=limits,
+        limits=limits or PersistentRuntimeLimits(max_process_seconds=HOST_PROCESS_TIMEOUT_SECONDS),
     )
 
 
@@ -46,28 +58,49 @@ def _read_until(
     name: str,
     owner_node_id: str,
     predicate: Callable[[ProcessStatus, str, str], bool],
-    timeout_seconds: float = 3.0,
+    timeout_seconds: float | None = None,
 ) -> tuple[ProcessStatus, str, str]:
+    # Follow the process's remaining watchdog budget instead of imposing a
+    # separate three-second startup assumption on loaded CI hosts. This wait
+    # never extends the process lifetime, and watchdog failures fail immediately.
+    if timeout_seconds is None:
+        session = runtime.state.sessions[name]
+        age_seconds = max(time.time() - session.started_at_epoch, 0.0)
+        remaining_seconds = max(session.timeout_seconds - age_seconds, 0.0)
+        timeout_seconds = remaining_seconds + runtime.limits.stop_grace_seconds
     deadline = time.monotonic() + timeout_seconds
     stdout = ""
     stderr = ""
     status = ProcessStatus.RUNNING
+    reason = "not_polled"
+    exit_code: int | None = None
     while time.monotonic() < deadline:
         result = runtime.read_process(
             name=name,
             owner_node_id=owner_node_id,
         )
         status = result.status
+        reason = result.reason
+        exit_code = result.exit_code
         stdout += result.stdout
         stderr += result.stderr
         if predicate(status, stdout, stderr):
             return status, stdout, stderr
+        if status in _FAILED_PROCESS_STATUSES:
+            break
         time.sleep(0.01)
     message = (
         f"process {name} did not reach expected state; "
-        f"status={status.value}, stdout={stdout!r}, stderr={stderr!r}"
+        f"status={status.value}, reason={reason}, exit_code={exit_code}, "
+        f"stdout={stdout!r}, stderr={stderr!r}"
     )
     raise AssertionError(message)
+
+
+def _python_command(code: str) -> str:
+    # A login shell can resolve `python3` to an unsupported system interpreter
+    # (macOS 3.9 in the reproduced environment). Exercise the test interpreter.
+    return shlex.join([sys.executable, "-I", "-u", "-c", code])
 
 
 def test_named_process_survives_turns_and_accepts_input(tmp_path: Path) -> None:
@@ -76,11 +109,11 @@ def test_named_process_survives_turns_and_accepts_input(tmp_path: Path) -> None:
         session = runtime.start_process(
             name="interactive",
             owner_node_id="node-001",
-            command=(
-                "python3 -u -c 'import sys; "
+            command=_python_command(
+                "import sys; "
                 'print("ready", flush=True); '
                 "line=sys.stdin.readline(); "
-                'print("echo:"+line.strip(), flush=True)\''
+                'print("echo:"+line.strip(), flush=True)'
             ),
         )
         assert session.status is ProcessStatus.RUNNING
@@ -121,9 +154,9 @@ def test_workers_share_files_but_not_process_namespaces(
         runtime.start_process(
             name="writer",
             owner_node_id="node-001",
-            command=(
-                "python3 -c 'from pathlib import Path; "
-                'Path("shared.txt").write_text("cookie=abc")\''
+            command=_python_command(
+                "from pathlib import Path; "
+                'Path("shared.txt").write_text("cookie=abc")'
             ),
         )
         _read_until(
@@ -135,7 +168,7 @@ def test_workers_share_files_but_not_process_namespaces(
         runtime.start_process(
             name="reader",
             owner_node_id="node-002",
-            command="python3 -c 'print(open(\"shared.txt\").read())'",
+            command=_python_command('print(open("shared.txt").read())'),
         )
         _, output, _ = _read_until(
             runtime,
@@ -215,6 +248,16 @@ def test_watchdog_enforces_timeout_without_agent_polling(
 
         assert result.status is ProcessStatus.TIMED_OUT
         assert result.reason == "process_wall_time_limit_reached"
+        with pytest.raises(
+            AssertionError,
+            match="status=timed_out, reason=process_wall_time_limit_reached",
+        ):
+            _read_until(
+                runtime,
+                name="slow",
+                owner_node_id="node-001",
+                predicate=lambda _status, stdout, _stderr: "never-ready" in stdout,
+            )
     finally:
         runtime.close()
 
@@ -228,7 +271,7 @@ def test_watchdog_enforces_output_cap(tmp_path: Path) -> None:
         runtime.start_process(
             name="noisy",
             owner_node_id="node-001",
-            command="python3 -c 'print(\"x\" * 10000)'",
+            command=_python_command('print("x" * 10000)'),
         )
         status, stdout, _ = _read_until(
             runtime,

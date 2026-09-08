@@ -26,6 +26,12 @@ Core runtime:
 
 - `packages/ravage/src/ravage/__main__.py`: CLI parser and command dispatch.
 - `packages/ravage/src/ravage/agent_core/ai_agent.py`: base `ai-web` runtime loop.
+- `packages/ravage/src/ravage/repository_context.py`: bounded, immutable local
+  text capture, literal search, and exact excerpts.
+- `packages/ravage/src/ravage/repository_review.py`: closed read-only model loop
+  for repository review candidates.
+- `packages/ravage/src/ravage/repository_review_cli.py`: `ravage review` command
+  and model-transport adapter.
 - `packages/ravage/src/ravage/agent_core/autonomous_graph/`: bounded graph
   coordinator, workers, budgets, scoped HTTP, evidence, and durable state.
 - `packages/ravage/src/ravage/dast_scan.py`: deterministic scan runtime.
@@ -67,7 +73,10 @@ Agent internals:
 Benchmark and evaluation:
 
 - `ravage xben`: command-line wrapper for XBEN.
-- `scripts/run_memory_eval.py`: memory A/B runner.
+- `scripts/run_memory_eval.py`: retired memory evaluation compatibility command;
+  exits 2 without model calls or generated results.
+- `scripts/eval_proof_bundles.py`: offline recorded-verdict fixture scorer;
+  exits 0 for passing cases, 1 for disagreements, and 2 for invalid or empty input.
 - `scripts/grade_xben_failures.py`: failure taxonomy report generator.
 - `proof_bundle*.py`: proof bundle candidate, verifier, and evaluation logic.
 - `trace_quality.py`: trace-quality diagnostics.

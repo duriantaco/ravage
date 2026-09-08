@@ -211,9 +211,36 @@ def test_successful_agent_http_exchange_excludes_model_authored_request_metadata
         assert model_authored_value not in serialized
 
 
+def test_successful_source_informed_http_exchange_retains_lineage_only() -> None:
+    exchange = build_captured_http_exchange(
+        capture_session_id="source-informed-http-success",
+        source="agent_http",
+        source_observation_id="source-informed-observation",
+        method="GET",
+        url=f"{TARGET}/source-route?fabricated_query=value",
+        resource_type="source_informed_agent_http",
+        request_headers={"X-Fabricated-Header": "value"},
+        request_sent=True,
+        response_status=200,
+        response_final_url=f"{TARGET}/source-route",
+        scope_decision="allowed",
+    ).with_store_identity(exchange_id="rq_0001", sequence=1)
+    graph = SurfaceGraphState.for_target(TARGET)
+
+    operation = graph.ingest_exchange(exchange)
+
+    assert operation.provenance == ("source_informed_agent_http_response",)
+    assert operation.actionable is True
+    assert operation.parameters == ()
+    assert operation.header_names == ()
+    assert operation.hints == ()
+
+
 @pytest.mark.parametrize("response_status", [None, 199, 400, 599])
+@pytest.mark.parametrize("resource_type", ["", "source_informed_agent_http"])
 def test_agent_http_without_successful_response_remains_non_actionable(
     response_status: int | None,
+    resource_type: str,
 ) -> None:
     exchange = build_captured_http_exchange(
         capture_session_id="agent-http-failure",
@@ -221,6 +248,7 @@ def test_agent_http_without_successful_response_remains_non_actionable(
         source_observation_id="agent-http-observation",
         method="GET",
         url=f"{TARGET}/unconfirmed-route?fabricated_query=value",
+        resource_type=resource_type,
         request_headers={"X-Fabricated-Header": "value"},
         request_sent=True,
         response_status=response_status,

@@ -1,38 +1,12 @@
-[project]
-name = "pentest-agent"
-version = "0.5.0"
-description = "Ravage source checkout workspace"
-requires-python = ">=3.12,<3.13"
-dependencies = [
-    "cryptography>=42.0",
-    "pydantic>=2.8",
-    "pyyaml>=6.0",
-    "rich>=14.1",
-]
-license = "Apache-2.0"
-
-[project.optional-dependencies]
-browser = ["playwright>=1.48"]
-
-[project.scripts]
-ravage = "ravage.__main__:main"
-
+# Virtual workspace: build and install the two real packages, never a second
+# root distribution containing duplicate imports or a duplicate ravage command.
 [tool.uv.workspace]
 members = [
     "packages/ravage",
     "packages/schemas",
-    "packages/mcp_servers/*",
 ]
-
-[tool.setuptools.packages.find]
-where = [
-    "packages/ravage/src",
-    "packages/schemas/src",
-]
-include = [
-    "ravage*",
-    "pentest_schemas*",
-]
+# These directories contain unimplemented scaffolds, not supported MCP servers.
+exclude = ["packages/mcp_servers/*"]
 
 [dependency-groups]
 dev = [
@@ -60,7 +34,3 @@ testpaths = [
     "packages/ravage/tests",
     "tests",
 ]
-
-[build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"

@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import sqlite3
 import stat
 import sys
+from contextlib import closing
+from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING
 from uuid import UUID
 
 import pytest
 import ravage.report as report_module
 from ravage import __main__ as cli
+from ravage import report_io
 from ravage.agent_core.action_executor import ActionResult
 from ravage.agent_core.ai_agent import AIWebAgentSettings
 from ravage.agent_core.autonomous_graph.evidence import EvidenceBlackboard
-from ravage.report import ProFeatureRequiredError, write_pentest_report
+from ravage.report import ProFeatureRequiredError, build_pentest_report, write_pentest_report
 from ravage.report_artifact import write_json_report_artifact
 from ravage.run_data.audit import AuditStore
 from ravage.run_data.workspace import AgentWorkspace
@@ -35,10 +39,6 @@ from ravage.traffic.policy import (
 )
 from ravage.traffic.provenance import TrafficProvenanceError
 from ravage.traffic.store import TrafficStore
-
-if TYPE_CHECKING:
-    from pathlib import Path
-
 
 BRIEF_YAML = """
 engagement_id: "88888888-8888-4888-8888-888888888888"
@@ -67,6 +67,577 @@ _PRIVATE_ARTIFACT_MODE = 0o600
 _DUAL_TRAFFIC_REQUEST_COUNT = 2
 _REPORT_IN_SCOPE = ("http://127.0.0.1:8765",)
 _REPORT_OUT_OF_SCOPE = ("http://127.0.0.1:9999",)
+
+
+@pytest.mark.parametrize("source_state", ["missing", "corrupt", "wrong_schema", "directory"])
+def test_report_marks_unavailable_expected_audit_evidence_incomplete(
+    tmp_path: Path, source_state: str
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    audit_path = workspace.root.parent / "audit.db"
+    if source_state == "corrupt":
+        audit_path.write_bytes(b"corrupt database containing token=do-not-expose")
+    elif source_state == "wrong_schema":
+        with closing(sqlite3.connect(audit_path)) as connection:
+            connection.execute("CREATE TABLE unrelated (id INTEGER)")
+    elif source_state == "directory":
+        audit_path.mkdir()
+
+    report = write_json_report_artifact(
+        brief_path=brief_path,
+        target_url="http://127.0.0.1:8765",
+        workspace_dir=workspace.root,
+        output_path=workspace.root.parent / "report.json",
+        status="completed",
+        completed=True,
+        audit_db_path=audit_path,
+    )
+
+    assert report["status"] == "completed"  # Run state remains distinct from evidence health.
+    assert report["source_quality"]["status"] == "incomplete"
+    source = report["source_quality"]["audit_source"]
+    assert source["expected"] is True
+    assert source["status"] == ("missing" if source_state == "missing" else "unreadable")
+    assert report["executive_summary"]["overall_risk"] == "Unknown"
+    assert (
+        "missing findings cannot be interpreted as a clean assessment"
+        in (report["executive_summary"]["summary"])
+    )
+    markdown = report_module.render_markdown_report(report)
+    assert "Overall Risk: Unknown" in markdown
+    assert "Evidence completeness: incomplete" in markdown
+    assert "does not establish the absence of vulnerabilities" in markdown
+    assert "do-not-expose" not in json.dumps(report)
+    if source_state == "missing":
+        assert not audit_path.exists()
+
+
+@pytest.mark.parametrize("payload", ["{broken", "[]", '{"status":"confirmed"}'])
+def test_report_marks_rejected_audit_rows_incomplete(tmp_path: Path, payload: str) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    audit_path = workspace.root.parent / "audit.db"
+    AuditStore(audit_path).close()
+    with closing(sqlite3.connect(audit_path)) as connection:
+        connection.execute(
+            "INSERT INTO findings VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "malformed",
+                "88888888-8888-4888-8888-888888888888",
+                "information_disclosure",
+                "confirmed",
+                "confirm",
+                payload,
+            ),
+        )
+        connection.commit()
+
+    report = build_pentest_report(
+        brief_path=brief_path,
+        target_url="http://127.0.0.1:8765",
+        workspace_dir=workspace.root,
+        status="completed",
+        completed=True,
+        audit_db_path=audit_path,
+    )
+
+    assert report["findings"] == []
+    assert report["source_quality"]["status"] == "incomplete"
+    assert report["source_quality"]["audit_source"] == {
+        "expected": True,
+        "status": "invalid_records",
+        "confirmed_rows_loaded": 1,
+        "accepted_findings": 0,
+        "rejected_rows": 1,
+    }
+    assert report["executive_summary"]["overall_risk"] == "Unknown"
+
+
+def test_report_keeps_valid_findings_when_expected_audit_is_missing(tmp_path: Path) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = _workspace_with_report_events(tmp_path)
+    report = build_pentest_report(
+        brief_path=brief_path,
+        target_url="http://127.0.0.1:8765",
+        workspace_dir=workspace.root,
+        status="completed",
+        completed=True,
+        audit_db_path=workspace.root.parent / "missing.db",
+    )
+
+    assert report["source_quality"]["status"] == "incomplete"
+    assert report["executive_summary"]["finding_count"] == 1
+    assert report["executive_summary"]["overall_risk"] == "High"
+    assert (
+        "Available evidence retains 1 confirmed finding(s)"
+        in (report["executive_summary"]["summary"])
+    )
+    assert report["findings"][0]["recommendation"]
+
+
+def test_report_marks_unreadable_expected_audit_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    audit_path = workspace.root.parent / "audit.db"
+    AuditStore(audit_path).close()
+
+    def deny_database_access(*_args: object, **_kwargs: object) -> None:
+        message = "simulated permission denial"
+        raise PermissionError(message)
+
+    monkeypatch.setattr(report_module.sqlite3, "connect", deny_database_access)
+    report = build_pentest_report(
+        brief_path=brief_path,
+        target_url="http://127.0.0.1:8765",
+        workspace_dir=workspace.root,
+        status="completed",
+        completed=True,
+        audit_db_path=audit_path,
+    )
+
+    assert report["source_quality"]["audit_source"]["status"] == "unreadable"
+    assert report["source_quality"]["status"] == "incomplete"
+    assert report["executive_summary"]["overall_risk"] == "Unknown"
+
+
+def test_report_retains_valid_audit_findings_alongside_rejected_rows(tmp_path: Path) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    audit_path = workspace.root.parent / "audit.db"
+    AuditStore(audit_path).close()
+    valid = _confirmed_finding_payload(
+        finding_id="valid-finding", vuln_class="xss", severity="Medium"
+    )
+    with closing(sqlite3.connect(audit_path)) as connection:
+        for finding_id, raw in (("valid-finding", json.dumps(valid)), ("broken", "{broken")):
+            connection.execute(
+                "INSERT INTO findings VALUES (?, ?, ?, ?, ?, ?)",
+                (finding_id, valid["engagement_id"], "xss", "confirmed", "confirm", raw),
+            )
+        connection.commit()
+    original_database = audit_path.read_bytes()
+
+    report = build_pentest_report(
+        brief_path=brief_path,
+        target_url="http://127.0.0.1:8765",
+        workspace_dir=workspace.root,
+        status="completed",
+        completed=True,
+        audit_db_path=audit_path,
+    )
+
+    assert [finding["finding_id"] for finding in report["findings"]] == ["valid-finding"]
+    assert report["source_quality"]["audit_source"]["rejected_rows"] == 1
+    assert report["source_quality"]["status"] == "incomplete"
+    assert report["executive_summary"]["overall_risk"] == "Medium"
+    assert audit_path.read_bytes() == original_database
+
+
+@pytest.mark.parametrize("audit_requested", [False, True])
+def test_report_distinguishes_empty_audit_from_optional_events_only_source(
+    tmp_path: Path, *, audit_requested: bool
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    audit_path = workspace.root.parent / "audit?literal#name.db" if audit_requested else None
+    if audit_path is not None:
+        AuditStore(audit_path).close()
+    else:
+        workspace.events_path.touch()
+    report = build_pentest_report(
+        brief_path=brief_path,
+        target_url="http://127.0.0.1:8765",
+        workspace_dir=workspace.root,
+        status="completed",
+        completed=True,
+        audit_db_path=audit_path,
+    )
+
+    assert report["source_quality"]["status"] == "complete"
+    source = report["source_quality"]["audit_source"]
+    assert source["expected"] is audit_requested
+    assert source["status"] == ("available" if audit_requested else "not_requested")
+    assert report["executive_summary"]["overall_risk"] == "Low"
+
+
+def test_report_without_any_evidence_is_incomplete(tmp_path: Path) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    report = build_pentest_report(
+        brief_path=brief_path,
+        target_url="http://127.0.0.1:8765",
+        workspace_dir=workspace.root,
+        status="completed",
+        completed=True,
+    )
+    assert report["source_quality"]["status"] == "incomplete"
+    assert report["source_quality"]["event_sources"][0] == {
+        "events_path": str(workspace.events_path),
+        "expected": True,
+        "status": "missing",
+        "events_loaded": 0,
+        "parse_errors": 0,
+    }
+    assert report["executive_summary"]["overall_risk"] == "Unknown"
+
+
+@pytest.mark.parametrize("persisted_state", [False, True])
+def test_cli_report_does_not_turn_lost_event_evidence_into_a_clean_assessment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, persisted_state: bool
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = _workspace_with_report_events(tmp_path)
+    if persisted_state:
+        workspace.write_state({"status": "completed"})
+    monkeypatch.setattr(report_module, "_run_hosting_layer_report_agent", lambda **_: None)
+    command = ["report", str(workspace.root.parent), "--brief", str(brief_path)]
+    cli.main(command)
+    output = workspace.root.parent / "report.json"
+    before = json.loads(output.read_text(encoding="utf-8"))
+    assert before["executive_summary"]["overall_risk"] == "High"
+    assert before["executive_summary"]["finding_count"] == 1
+
+    saved_events = workspace.events_path.with_suffix(".saved")
+    workspace.events_path.rename(saved_events)
+    try:
+        cli.main(command)
+        after = json.loads(output.read_text(encoding="utf-8"))
+        assert after["source_quality"]["event_paths"] == []
+        assert after["source_quality"]["status"] == "incomplete"
+        assert after["executive_summary"]["overall_risk"] == "Unknown"
+        assert after["executive_summary"]["finding_count"] == 0
+        markdown = output.with_suffix(".md").read_text(encoding="utf-8")
+        assert f"Event source: {workspace.events_path} (missing)" in markdown
+        assert "does not establish the absence of vulnerabilities" in markdown
+    finally:
+        saved_events.rename(workspace.events_path)
+    cli.main(command)
+    restored = json.loads(output.read_text(encoding="utf-8"))
+    assert restored["source_quality"]["status"] == "complete"
+    assert restored["executive_summary"]["overall_risk"] == "High"
+    assert restored["executive_summary"]["finding_count"] == 1
+
+
+@pytest.mark.parametrize("marker", ["working_state.json", "transcript.jsonl", "scan-summary.json"])
+def test_report_marks_expected_event_log_missing_even_with_a_healthy_audit(
+    tmp_path: Path, marker: str
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    (workspace.root / marker).write_text("{}\n", encoding="utf-8")
+    audit_path = workspace.root.parent / "audit.db"
+    AuditStore(audit_path).close()
+    report = build_pentest_report(
+        brief_path=brief_path,
+        target_url="http://127.0.0.1:8765",
+        workspace_dir=workspace.root,
+        status="completed",
+        completed=True,
+        audit_db_path=audit_path,
+    )
+    assert report["source_quality"]["audit_source"]["status"] == "available"
+    assert report["source_quality"]["event_sources"][0]["status"] == "missing"
+    assert report["source_quality"]["status"] == "incomplete"
+    assert report["executive_summary"]["overall_risk"] == "Unknown"
+
+
+@pytest.mark.parametrize("damage", ["directory", "broken_symlink", "utf8", "permission", "race"])
+def test_report_marks_unreadable_or_disappearing_event_sources_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    audit_path = workspace.root.parent / "audit.db"
+    AuditStore(audit_path).close()
+    if damage == "directory":
+        workspace.events_path.mkdir()
+    elif damage == "broken_symlink":
+        workspace.events_path.symlink_to(workspace.root / "absent-events")
+    elif damage == "utf8":
+        workspace.events_path.write_bytes(b"\xff\xfe\n")
+    else:
+        workspace.events_path.touch()
+        read_text = Path.read_text
+
+        def unavailable_events(
+            path: Path, encoding: str | None = None, errors: str | None = None
+        ) -> str:
+            if path == workspace.events_path:
+                error = PermissionError if damage == "permission" else FileNotFoundError
+                raise error
+            return read_text(path, encoding=encoding, errors=errors)
+
+        monkeypatch.setattr(Path, "read_text", unavailable_events)
+    report = build_pentest_report(
+        brief_path=brief_path,
+        target_url="http://127.0.0.1:8765",
+        workspace_dir=workspace.root,
+        status="completed",
+        completed=True,
+        audit_db_path=audit_path,
+    )
+    expected_status = "missing" if damage in {"broken_symlink", "race"} else "unreadable"
+    assert report["source_quality"]["event_sources"][0]["status"] == expected_status
+    assert report["source_quality"]["status"] == "incomplete"
+    assert report["executive_summary"]["overall_risk"] == "Unknown"
+
+
+def test_report_retains_available_findings_when_a_nested_event_log_is_missing(
+    tmp_path: Path,
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = _workspace_with_report_events(tmp_path)
+    nested = workspace.root / "autonomous-route" / "agent-graph"
+    nested.mkdir(parents=True)
+    (nested / "working_state.json").write_text("{}\n", encoding="utf-8")
+    report = build_pentest_report(
+        brief_path=brief_path,
+        target_url="http://127.0.0.1:8765",
+        workspace_dir=workspace.root,
+        status="completed",
+        completed=True,
+    )
+    assert report["source_quality"]["status"] == "incomplete"
+    assert report["source_quality"]["event_sources"][-1]["status"] == "missing"
+    assert report["executive_summary"]["finding_count"] == 1
+    assert report["executive_summary"]["overall_risk"] == "High"
+
+
+def test_report_accepts_nested_events_without_an_optional_primary_log(tmp_path: Path) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    nested = AgentWorkspace.open(workspace.root / "autonomous-route" / "agent-graph")
+    nested.record_event(
+        kind="finding_confirmed",
+        payload=_confirmed_finding_payload(
+            finding_id="nested-finding", vuln_class="information_disclosure", severity="High"
+        ),
+    )
+    report = build_pentest_report(
+        brief_path=brief_path,
+        target_url="http://127.0.0.1:8765",
+        workspace_dir=workspace.root,
+        status="completed",
+        completed=True,
+    )
+    assert report["source_quality"]["event_sources"][0]["status"] == "not_requested"
+    assert report["source_quality"]["status"] == "complete"
+    assert report["executive_summary"]["finding_count"] == 1
+
+
+@pytest.mark.parametrize("event_line", ["{broken", "[]"])
+def test_report_does_not_label_malformed_event_sources_clean(
+    tmp_path: Path, event_line: str
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    workspace.events_path.write_text(event_line + "\n", encoding="utf-8")
+    report = build_pentest_report(
+        brief_path=brief_path,
+        target_url="http://127.0.0.1:8765",
+        workspace_dir=workspace.root,
+        status="completed",
+        completed=True,
+    )
+    assert report["source_quality"]["event_parse_errors"] == 1
+    assert report["source_quality"]["status"] == "incomplete"
+    assert report["executive_summary"]["overall_risk"] == "Unknown"
+
+
+@pytest.mark.parametrize("invalid_field", ["proof", "engagement_id", "status"])
+def test_report_marks_rejected_confirmed_events_incomplete(
+    tmp_path: Path, invalid_field: str
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    finding = _confirmed_finding_payload(
+        finding_id="incomplete-event", vuln_class="xss", severity="Medium"
+    )
+    finding.pop(invalid_field)
+    workspace.record_event(kind="finding_confirmed", payload=finding)
+    report = build_pentest_report(
+        brief_path=brief_path,
+        target_url="http://127.0.0.1:8765",
+        workspace_dir=workspace.root,
+        status="completed",
+        completed=True,
+    )
+    assert report["source_quality"]["rejected_confirmed_events"] == 1
+    assert report["source_quality"]["status"] == "incomplete"
+    assert report["executive_summary"]["overall_risk"] == "Unknown"
+    assert "Rejected confirmed events: 1" in report_module.render_markdown_report(report)
+
+
+def test_report_excludes_other_engagement_events_without_marking_source_incomplete(
+    tmp_path: Path,
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    workspace.record_event(
+        kind="finding_confirmed",
+        payload={"engagement_id": "99999999-9999-4999-8999-999999999999", "status": "confirmed"},
+    )
+    report = build_pentest_report(
+        brief_path=brief_path,
+        target_url="http://127.0.0.1:8765",
+        workspace_dir=workspace.root,
+        status="completed",
+        completed=True,
+    )
+    assert report["source_quality"]["rejected_confirmed_events"] == 0
+    assert report["source_quality"]["status"] == "complete"
+
+
+@pytest.mark.parametrize(
+    "damage", ["missing_table", "wrong_columns", "malformed_row", "nontext_row"]
+)
+def test_report_marks_damaged_audit_log_incomplete_with_valid_findings_table(
+    tmp_path: Path, damage: str
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = AgentWorkspace.open(tmp_path / "run" / "workspace")
+    audit_path = workspace.root.parent / "audit.db"
+    _seed_audit_only_proof(audit_path)
+    with closing(sqlite3.connect(audit_path)) as connection:
+        if damage == "malformed_row":
+            connection.execute("UPDATE audit_log SET payload_json = '{broken'")
+        elif damage == "nontext_row":
+            connection.execute("UPDATE audit_log SET payload_json = ?", (b"{}",))
+        else:
+            connection.execute("DROP TABLE audit_log")
+            if damage == "wrong_columns":
+                connection.execute("CREATE TABLE audit_log (id INTEGER)")
+        connection.commit()
+    original_database = audit_path.read_bytes()
+
+    report = build_pentest_report(
+        brief_path=brief_path,
+        target_url="http://127.0.0.1:8765",
+        workspace_dir=workspace.root,
+        status="completed",
+        completed=True,
+        audit_db_path=audit_path,
+    )
+
+    assert report["source_quality"]["audit_source"]["status"] == "available"
+    assert report["source_quality"]["audit_log_source"]["status"] == (
+        "invalid_records" if damage in {"malformed_row", "nontext_row"} else "unreadable"
+    )
+    assert report["source_quality"]["status"] == "incomplete"
+    assert report["executive_summary"]["overall_risk"] == "Unknown"
+    assert audit_path.read_bytes() == original_database
+
+
+def _seed_audit_only_proof(audit_path: Path) -> None:
+    proof = "flag{report-source-health-fixture}"
+    with closing(AuditStore(audit_path)) as audit:
+        for action, payload in (
+            (
+                "tool_run_probe",
+                {
+                    "observation_id": "recorded-observation",
+                    "action_id": "recorded-action",
+                    "recognized_proofs": [proof],
+                },
+            ),
+            (
+                "flag_captured",
+                {
+                    "flag": proof,
+                    "source_observation_id": "recorded-observation",
+                    "source_kind": "tool_run_probe",
+                    "action_id": "recorded-action",
+                },
+            ),
+        ):
+            audit.record(
+                engagement_id=UUID("88888888-8888-4888-8888-888888888888"),
+                actor="report-test",
+                action=action,
+                payload=payload,
+            )
+
+
+@pytest.mark.parametrize("suffix", [".md", ".json", ""])
+def test_explicit_reports_are_private_complete_atomic_and_redact_late_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = _workspace_with_report_events(tmp_path)
+    output_path = tmp_path / "token=artifact-secret-value" / f"report{suffix}"
+    output_path.parent.mkdir()
+    markdown_path = output_path if suffix != ".json" else output_path.with_suffix(".md")
+    json_path = output_path.with_suffix(".json")
+    for path in (markdown_path, json_path):
+        path.write_text("old complete output", encoding="utf-8")
+        path.chmod(0o644)
+    synced_files: list[str] = []
+    replaced_files: list[Path] = []
+    original_fsync = os.fsync
+    original_replace = Path.replace
+
+    def record_fsync(descriptor: int) -> None:
+        if stat.S_ISREG(os.fstat(descriptor).st_mode):
+            synced_files.append("synced")
+        original_fsync(descriptor)
+
+    def inspect_replace(path: Path, target: Path) -> Path:
+        assert stat.S_IMODE(path.stat().st_mode) == _PRIVATE_ARTIFACT_MODE
+        assert len(synced_files) > len(replaced_files)
+        assert target.read_text(encoding="utf-8") == "old complete output"
+        assert "artifact-secret-value" not in path.read_text(encoding="utf-8")
+        replaced_files.append(target)
+        return original_replace(path, target)
+
+    monkeypatch.setattr(report_io.os, "fsync", record_fsync)
+    monkeypatch.setattr(Path, "replace", inspect_replace)
+    monkeypatch.setattr(report_module, "_run_hosting_layer_report_agent", lambda **_: None)
+    report = write_pentest_report(
+        brief_path=brief_path,
+        target_url="http://127.0.0.1:8765",
+        workspace_dir=workspace.root,
+        output_path=output_path,
+        status="completed",
+        completed=True,
+    )
+
+    assert replaced_files == [markdown_path, json_path]
+    assert json.loads(json_path.read_text(encoding="utf-8")) == report
+    assert report["artifacts"]["json_report_path"].endswith("token=<SECRET_REDACTED>/report.json")
+    for path in (markdown_path, json_path):
+        assert stat.S_IMODE(path.stat().st_mode) == _PRIVATE_ARTIFACT_MODE
+        assert not list(path.parent.glob(f".{path.name}.*.tmp"))
+
+
+def test_report_write_failure_preserves_existing_output_and_removes_temporary_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = _workspace_with_report_events(tmp_path)
+    output_path = workspace.root.parent / "report.md"
+    output_path.write_text("previous complete report", encoding="utf-8")
+
+    def fail_fsync(_: int) -> None:
+        message = "simulated persistence failure"
+        raise OSError(message)
+
+    monkeypatch.setattr(report_io.os, "fsync", fail_fsync)
+    monkeypatch.setattr(report_module, "_run_hosting_layer_report_agent", lambda **_: None)
+    with pytest.raises(OSError, match="simulated persistence failure"):
+        write_pentest_report(
+            brief_path=brief_path,
+            target_url="http://127.0.0.1:8765",
+            workspace_dir=workspace.root,
+            output_path=output_path,
+            status="completed",
+            completed=True,
+        )
+
+    assert output_path.read_text(encoding="utf-8") == "previous complete report"
+    assert not list(output_path.parent.glob(f".{output_path.name}.*.tmp"))
 
 
 def test_json_report_artifact_is_private_atomic_and_has_no_report_side_effects(
@@ -164,7 +735,8 @@ def test_json_report_artifact_does_not_promote_stale_manifest_proof_status(
 
     assert report["captured_proofs"]["count"] == 0
     assert report["executive_summary"]["captured_proof_count"] == 0
-    assert report["executive_summary"]["overall_risk"] == "Low"
+    assert report["executive_summary"]["overall_risk"] == "Unknown"
+    assert report["source_quality"]["status"] == "incomplete"
     assert report["run"]["flag_found"] is False
     assert report["run"]["manifest_flag_found"] is True
 
@@ -474,7 +1046,7 @@ def test_report_revalidates_scan_lane_attribution_after_resolution(
     monkeypatch.setattr(
         report_module,
         "_agent_http_evidence_summary",
-        lambda *_args, **_kwargs: report_module._empty_agent_http_evidence_summary(),
+        lambda *_args, **_kwargs: report_module._empty_agent_http_evidence_summary(),  # noqa: SLF001
     )
     monkeypatch.setattr(report_module, "resolve_workspaces", resolve_then_tamper)
     output_path = tmp_path / "run" / "tampered-scan-lanes.md"
@@ -1398,6 +1970,190 @@ def test_cli_report_command_writes_report_for_existing_run(
 
     assert output_path.exists()
     assert "report written" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("location", ["run", "workspace", "manifest", "manifest_relative"])
+@pytest.mark.parametrize("workspace_argument", [False, True])
+def test_cli_report_resolves_audit_only_evidence_without_mutating_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    location: str,
+    *,
+    workspace_argument: bool,
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace_dir = tmp_path / "run" / "workspace"
+    workspace_dir.mkdir(parents=True)
+    run_dir = workspace_dir.parent
+    if location == "run":
+        audit_path = run_dir / "audit.db"
+    elif location == "workspace":
+        audit_path = workspace_dir / "audit.db"
+    else:
+        # Literal URI-reserved characters must not hide audit-only captured proofs.
+        audit_path = tmp_path / "custom" / "audit?literal#source.db"
+        if location == "manifest_relative":
+            monkeypatch.chdir(tmp_path)
+            audit_path = audit_path.relative_to(tmp_path)
+        (run_dir / "run.json").write_text(
+            json.dumps({"run_id": "custom-audit", "db_path": str(audit_path)}),
+            encoding="utf-8",
+        )
+        # A healthy default cannot take precedence over the declared source.
+        AuditStore(run_dir / "audit.db").close()
+    _seed_audit_only_proof(audit_path)
+    original_database = audit_path.read_bytes()
+    monkeypatch.setattr(report_module, "_run_hosting_layer_report_agent", lambda **_: None)
+    output_path = run_dir / "report.json"
+
+    cli.main(
+        [
+            "report",
+            str(workspace_dir if workspace_argument else run_dir),
+            "--brief",
+            str(brief_path),
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    assert report["source_quality"]["audit_db_path"] == str(audit_path)
+    assert report["source_quality"]["status"] == "complete"
+    assert report["source_quality"]["audit_log_source"]["status"] == "available"
+    assert report["captured_proofs"]["count"] == 1
+    assert report["outcome"]["stage"] == "flag_captured"
+    assert report["executive_summary"]["overall_risk"] == "High"
+    assert audit_path.read_bytes() == original_database
+
+
+def test_cli_report_does_not_fallback_from_declared_missing_audit_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace_dir = tmp_path / "run" / "workspace"
+    workspace_dir.mkdir(parents=True)
+    run_dir = workspace_dir.parent
+    missing_path = tmp_path / "declared-but-missing.db"
+    (run_dir / "run.json").write_text(
+        json.dumps({"run_id": "missing-audit", "db_path": str(missing_path)}),
+        encoding="utf-8",
+    )
+    _seed_audit_only_proof(run_dir / "audit.db")
+    monkeypatch.setattr(report_module, "_run_hosting_layer_report_agent", lambda **_: None)
+
+    cli.main(["report", str(run_dir), "--brief", str(brief_path)])
+
+    report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+    assert report["source_quality"]["audit_db_path"] == str(missing_path)
+    assert report["source_quality"]["status"] == "incomplete"
+    assert report["source_quality"]["audit_source"]["status"] == "missing"
+    assert report["captured_proofs"]["count"] == 0
+    assert report["executive_summary"]["overall_risk"] == "Unknown"
+    assert not missing_path.exists()
+
+
+@pytest.mark.parametrize("audit_location", ["run", "workspace"])
+@pytest.mark.parametrize("recorded_absolute", [False, True])
+@pytest.mark.parametrize("source_present", [False, True])
+def test_cli_report_relocates_declared_internal_audit_paths_after_cwd_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    audit_location: str,
+    *,
+    recorded_absolute: bool,
+    source_present: bool,
+) -> None:
+    brief_path = _brief(tmp_path)
+    run_dir = tmp_path / "relocated" / "run"
+    workspace_dir = run_dir / "workspace"
+    workspace_dir.mkdir(parents=True)
+    recorded_workspace = Path("runs/original/workspace")
+    if recorded_absolute:
+        recorded_workspace = tmp_path / "original-cwd" / recorded_workspace
+    recorded_root = (
+        recorded_workspace if audit_location == "workspace" else recorded_workspace.parent
+    )
+    actual_root = workspace_dir if audit_location == "workspace" else run_dir
+    audit_suffix = Path("state/evidence?literal#source.db")
+    audit_path = actual_root / audit_suffix
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": "original",
+                "workspace_dir": str(recorded_workspace),
+                "db_path": str(recorded_root / audit_suffix),
+            }
+        ),
+        encoding="utf-8",
+    )
+    # A default containing proof must never substitute for a declared missing source.
+    _seed_audit_only_proof(run_dir / "audit.db")
+    if source_present:
+        _seed_audit_only_proof(audit_path)
+    other_cwd = tmp_path / "unrelated-cwd"
+    other_cwd.mkdir()
+    monkeypatch.chdir(other_cwd)
+    monkeypatch.setattr(report_module, "_run_hosting_layer_report_agent", lambda **_: None)
+
+    cli.main(["report", str(run_dir), "--brief", str(brief_path)])
+
+    report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+    assert report["source_quality"]["audit_db_path"] == str(audit_path)
+    assert report["source_quality"]["status"] == ("complete" if source_present else "incomplete")
+    assert report["captured_proofs"]["count"] == int(source_present)
+    assert audit_path.exists() is source_present
+
+
+def test_cli_report_keeps_missing_external_relative_audit_path_declared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    brief_path = _brief(tmp_path)
+    run_dir = tmp_path / "relocated" / "run"
+    workspace_dir = run_dir / "workspace"
+    workspace_dir.mkdir(parents=True)
+    declared_path = Path("external/custom-audit.db")
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": "original",
+                "workspace_dir": "runs/original/workspace",
+                "db_path": str(declared_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    _seed_audit_only_proof(run_dir / "audit.db")
+    other_cwd = tmp_path / "unrelated-cwd"
+    other_cwd.mkdir()
+    monkeypatch.chdir(other_cwd)
+    monkeypatch.setattr(report_module, "_run_hosting_layer_report_agent", lambda **_: None)
+
+    cli.main(["report", str(run_dir), "--brief", str(brief_path)])
+
+    report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+    assert report["source_quality"]["audit_db_path"] == str(declared_path)
+    assert report["source_quality"]["status"] == "incomplete"
+    assert report["source_quality"]["audit_source"]["status"] == "missing"
+    assert report["captured_proofs"]["count"] == 0
+    assert not declared_path.exists()
+
+
+def test_cli_report_preserves_legitimate_events_only_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    brief_path = _brief(tmp_path)
+    workspace = _workspace_with_report_events(tmp_path)
+    monkeypatch.setattr(report_module, "_run_hosting_layer_report_agent", lambda **_: None)
+
+    cli.main(["report", str(workspace.root), "--brief", str(brief_path)])
+
+    report = json.loads((workspace.root.parent / "report.json").read_text(encoding="utf-8"))
+    assert report["source_quality"]["audit_source"]["status"] == "not_requested"
+    assert report["source_quality"]["audit_log_source"]["status"] == "not_requested"
+    assert report["source_quality"]["status"] == "complete"
+    assert not (workspace.root.parent / "audit.db").exists()
+    assert not (workspace.root / "audit.db").exists()
 
 
 def test_cli_report_pdf_requires_pro_before_rendering(

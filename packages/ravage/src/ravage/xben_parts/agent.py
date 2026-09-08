@@ -25,6 +25,7 @@ def _run_agent_subprocess(  # noqa: C901, PLR0913 - explicit subprocess boundary
     db_path: Path,
     workspace_path: Path,
     stdout: TextIO,
+    source_root: Path | None = None,
     live_stdout: TextIO | None = None,
     tool_network_evidence_path: Path | None = None,
 ) -> None:
@@ -55,6 +56,8 @@ def _run_agent_subprocess(  # noqa: C901, PLR0913 - explicit subprocess boundary
         "--tool-image",
         settings.tool_image,
     ]
+    if source_root is not None:
+        cmd.extend(["--source-root", str(source_root)])
     if settings.knowledge_pack_path is not None:
         metadata = describe_knowledge_pack(
             settings.knowledge_pack_path,

@@ -5,14 +5,17 @@ import os
 import re
 import sqlite3
 import stat
+from contextlib import closing
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from importlib import import_module
-from typing import TYPE_CHECKING, Any, Self, cast
+from typing import TYPE_CHECKING, Any, Literal, Self, cast
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from ravage.finding_evidence import confirmed_finding_evidence_failures
 from ravage.hosting_layer import HOSTING_LAYER_EVENT_KIND, run_configured_hosting_layer_agent
 from ravage.outcome_evidence import load_run_outcome, load_validated_captured_flags
+from ravage.report_io import atomic_write_private_report
 from ravage.run_data.brief import load_engagement_brief
 from ravage.run_data.run_manifest import read_manifest
 from ravage.traffic.manifest import (
@@ -34,12 +37,13 @@ if TYPE_CHECKING:
 
     from ravage.traffic.provenance import AgentHttpEvidenceLink
 
-REPORT_SCHEMA_VERSION = "2026-09-04"
+REPORT_SCHEMA_VERSION = "2026-09-05"
 PRO_REPORT_MODULE = "ravage_pro.report"
 PRO_REPORT_SUFFIXES = frozenset({".pdf", ".docx"})
 CORE_REPORT_SUFFIXES = frozenset({"", ".md", ".json"})
 
 _PROOF_RE = re.compile(r"\b(?:flag|FLAG|HTB|CTF)\{[^}\r\n]{1,512}\}")
+_PATH_SEPARATOR_RE = re.compile(r"([/\\\\]+)")
 _SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
     re.compile(
@@ -51,6 +55,13 @@ _SECRET_PATTERNS = (
 
 _MIN_SECRET_REPLACEMENT_GROUPS = 5
 _GRAPH_MARKER_MAX_BYTES = 262_144
+_EVENT_WORKSPACE_MARKERS = (
+    "working_state.json",
+    "transcript.jsonl",
+    "scan-summary.json",
+    "graph-state.json",
+    "remote-graph-state.json",
+)
 type _ExpectedTrafficBoundary = tuple[
     str,
     str | None,
@@ -136,6 +147,60 @@ _REMEDIATIONS = {
 }
 
 
+@dataclass(frozen=True)
+class _AuditSourceHealth:
+    status: Literal["not_requested", "available", "missing", "unreadable", "invalid_records"]
+    rows_loaded: int = 0
+    rejected_rows: int = 0
+
+    @property
+    def complete(self) -> bool:
+        return self.status in {"not_requested", "available"}
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "expected": self.status != "not_requested",
+            "status": self.status,
+            "rows_loaded": self.rows_loaded,
+            "rejected_rows": self.rejected_rows,
+        }
+
+
+@dataclass(frozen=True)
+class _AuditFindingsSource(_AuditSourceHealth):
+    findings: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "expected": self.status != "not_requested",
+            "status": self.status,
+            "confirmed_rows_loaded": self.rows_loaded,
+            "accepted_findings": len(self.findings),
+            "rejected_rows": self.rejected_rows,
+        }
+
+
+@dataclass(frozen=True)
+class _EventSourceHealth:
+    path: Path
+    status: Literal["not_requested", "available", "missing", "unreadable", "invalid_records"]
+    events: list[dict[str, Any]] = field(default_factory=list)
+    parse_errors: int = 0
+
+    @property
+    def complete(self) -> bool:
+        return self.status in {"not_requested", "available"}
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "events_path": str(self.path),
+            "expected": self.status != "not_requested",
+            "status": self.status,
+            "events_loaded": len(self.events),
+            "parse_errors": self.parse_errors,
+        }
+
+
 class ProFeatureRequiredError(RuntimeError):
     """Raised when a report output requires a separately licensed Pro package."""
 
@@ -193,8 +258,6 @@ def write_pentest_report(  # noqa: PLR0913
         audit_db_path=audit_db_path,
         error=error,
     )
-    markdown = render_markdown_report(report)
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
     suffix = output_path.suffix.lower()
     json_path = output_path.with_suffix(".json")
@@ -213,13 +276,15 @@ def write_pentest_report(  # noqa: PLR0913
         "markdown_report_path": str(markdown_path),
         "professional_report_path": str(pro_path) if pro_path else "",
     }
-
-    markdown_path.write_text(markdown, encoding="utf-8")
+    report = redact_report_payload(report)
+    markdown = render_markdown_report(report)
+    atomic_write_private_report(markdown_path, markdown)
     if pro_path is not None:
         report["artifacts"].update(
             _write_professional_report(report=report, markdown=markdown, output_path=pro_path)
         )
-    json_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    report = redact_report_payload(report)
+    atomic_write_private_report(json_path, json.dumps(report, indent=2, sort_keys=True) + "\n")
     return report
 
 
@@ -299,29 +364,31 @@ def build_pentest_report(  # noqa: PLR0913
     error: str | None = None,
 ) -> dict[str, Any]:
     brief = load_engagement_brief(brief_path)
-    events, parse_errors, event_paths = _load_run_events(workspace_dir)
+    event_sources = _load_run_events(workspace_dir, audit_requested=audit_db_path is not None)
+    events = [event for source in event_sources for event in source.events]
+    parse_errors = sum(source.parse_errors for source in event_sources)
+    event_paths = [
+        source.path for source in event_sources if source.status in {"available", "invalid_records"}
+    ]
     manifest = read_manifest(workspace_dir.parent)
     flags = load_validated_captured_flags(
         db_path=audit_db_path,
         workspace_path=workspace_dir,
         engagement_id=brief.engagement_id,
     )
-    findings = (
-        _audit_findings(
-            audit_db_path,
-            scope=brief.scope,
-            engagement_id=brief.engagement_id,
-        )
-        if audit_db_path is not None
-        else []
+    audit_source = _audit_findings(
+        audit_db_path,
+        scope=brief.scope,
+        engagement_id=brief.engagement_id,
     )
-    findings.extend(
-        _confirmed_findings(
-            events,
-            scope=brief.scope,
-            engagement_id=brief.engagement_id,
-        )
+    audit_log_source = _audit_log_health(audit_db_path, engagement_id=brief.engagement_id)
+    findings = list(audit_source.findings)
+    event_findings, rejected_confirmed_events = _confirmed_findings(
+        events,
+        scope=brief.scope,
+        engagement_id=brief.engagement_id,
     )
+    findings.extend(event_findings)
     findings = _dedupe_findings(findings)
     outcome = load_run_outcome(
         db_path=audit_db_path,
@@ -333,7 +400,15 @@ def build_pentest_report(  # noqa: PLR0913
     hosting_layer = _hosting_layer_summary(events)
     proof_observations = _proof_observations(events)
     severity_counts = _severity_counts(findings)
-    overall_risk = _overall_risk(findings=findings, flags=flags, status=status)
+    evidence_complete = (
+        audit_source.complete
+        and audit_log_source.complete
+        and all(source.complete for source in event_sources)
+        and rejected_confirmed_events == 0
+    )
+    overall_risk = _overall_risk(
+        findings=findings, flags=flags, status=status, evidence_complete=evidence_complete
+    )
     recommendations = _recommendations(findings=findings, flags=flags)
 
     generated_at = datetime.now(UTC).isoformat()
@@ -377,6 +452,7 @@ def build_pentest_report(  # noqa: PLR0913
                 finding_count=len(findings),
                 flag_count=len(flags),
                 error=error,
+                evidence_complete=evidence_complete,
             ),
         },
         "reconnaissance": recon,
@@ -405,20 +481,27 @@ def build_pentest_report(  # noqa: PLR0913
             "The report does not expand truncated artifacts into full response bodies.",
         ],
         "source_quality": {
+            "status": "complete" if evidence_complete else "incomplete",
+            "audit_source": audit_source.to_json(),
+            "audit_log_source": audit_log_source.to_json(),
+            "event_sources": [source.to_json() for source in event_sources],
             "events_path": str(workspace_dir / "events.jsonl"),
             "event_paths": [str(path) for path in event_paths],
             "events_loaded": len(events),
             "event_parse_errors": parse_errors,
+            "rejected_confirmed_events": rejected_confirmed_events,
             "audit_db_path": str(audit_db_path) if audit_db_path else "",
         },
     }
-    return cast("dict[str, Any]", _redact_recursive(report))
+    return redact_report_payload(report)
 
 
 def render_markdown_report(report: dict[str, Any]) -> str:  # noqa: PLR0915
     engagement = _dict(report.get("engagement"))
     summary = _dict(report.get("executive_summary"))
     proofs = _dict(report.get("captured_proofs"))
+    source_quality = _dict(report.get("source_quality"))
+    evidence_complete = source_quality.get("status") != "incomplete"
     scope = _dict(engagement.get("scope"))
     rules = _dict(engagement.get("rules_of_engagement"))
     outcome = _dict(report.get("outcome"))
@@ -449,6 +532,7 @@ def render_markdown_report(report: dict[str, Any]) -> str:  # noqa: PLR0915
         f"- Physical target requests: {traffic_count}",
         f"- Request accounting status: {traffic_status}",
         f"- Completion status: {report.get('status', '')}",
+        f"- Evidence completeness: {source_quality.get('status', 'unknown')}",
         "",
         "## Scope and Engagement",
         "",
@@ -474,7 +558,13 @@ def render_markdown_report(report: dict[str, Any]) -> str:  # noqa: PLR0915
     if not findings:
         lines.extend(
             [
-                "No confirmed vulnerability findings were recorded in the run artifacts.",
+                (
+                    "No confirmed vulnerability findings were recorded in the run artifacts."
+                    if evidence_complete
+                    else "No confirmed findings could be recovered from the available evidence. "
+                    "Evidence is incomplete; this does not establish the absence "
+                    "of vulnerabilities."
+                ),
                 "",
             ]
         )
@@ -535,8 +625,34 @@ def render_markdown_report(report: dict[str, Any]) -> str:  # noqa: PLR0915
     lines.extend(f"- {item}" for item in _list(report.get("limitations")))
     lines.extend(["", "## Evidence Handling", ""])
     lines.extend(f"- {item}" for item in _list(report.get("evidence_handling")))
+    lines.extend(_source_quality_markdown(source_quality))
     lines.append("")
     return "\n".join(lines)
+
+
+def _source_quality_markdown(source_quality: dict[str, Any]) -> list[str]:
+    audit_source = _dict(source_quality.get("audit_source"))
+    audit_log_source = _dict(source_quality.get("audit_log_source"))
+    lines = [
+        "",
+        "## Source Quality",
+        "",
+        f"- Evidence completeness: {source_quality.get('status', 'unknown')}",
+        f"- Audit findings source: {audit_source.get('status', 'unknown')}",
+        f"- Rejected audit rows: {audit_source.get('rejected_rows', 0)}",
+        f"- Audit log source: {audit_log_source.get('status', 'unknown')}",
+        f"- Rejected audit log rows: {audit_log_source.get('rejected_rows', 0)}",
+        f"- Event parse errors: {source_quality.get('event_parse_errors', 0)}",
+        f"- Rejected confirmed events: {source_quality.get('rejected_confirmed_events', 0)}",
+    ]
+    for source in _list(source_quality.get("event_sources")):
+        event_source = _dict(source)
+        if event_source.get("expected"):
+            lines.append(
+                f"- Event source: {event_source.get('events_path', '')} "
+                f"({event_source.get('status', 'unknown')})"
+            )
+    return lines
 
 
 def _recon_markdown(recon: dict[str, Any]) -> list[str]:
@@ -894,8 +1010,7 @@ def _validated_agent_http_lane(
         message = "traffic artifacts are present but could not be validated"
         raise TrafficProvenanceError(message) from exc
     if any(
-        exchange.capture_session_id != traffic_manifest.capture_session_id
-        for exchange in exchanges
+        exchange.capture_session_id != traffic_manifest.capture_session_id for exchange in exchanges
     ) or any(
         receipt.capture_session_id != traffic_manifest.capture_session_id
         for receipt in replay_receipts
@@ -976,9 +1091,7 @@ def _expected_traffic_manifest_boundary(
     persisted_target = sanitize_url(raw_target)
     expected_identity = (
         None
-        if (
-            raw_target in (REDACTED_URL, persisted_target) or "[redacted" in decoded_target
-        )
+        if (raw_target in (REDACTED_URL, persisted_target) or "[redacted" in decoded_target)
         else expected.target_identity
     )
     return (
@@ -1116,12 +1229,23 @@ def _agent_http_evidence_markdown(summary: dict[str, Any]) -> list[str]:
     return lines
 
 
-def _load_events(path: Path) -> tuple[list[dict[str, Any]], int]:
-    if not path.exists():
-        return [], 0
+def _load_events(path: Path) -> _EventSourceHealth:
+    expected = False
+    try:
+        expected = path.is_symlink() or any(
+            (path.parent / marker).exists() for marker in _EVENT_WORKSPACE_MARKERS
+        )
+        if not stat.S_ISREG(path.stat().st_mode):
+            return _EventSourceHealth(path, status="unreadable")
+        expected = True
+        content = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _EventSourceHealth(path, status="missing" if expected else "not_requested")
+    except (OSError, UnicodeError):
+        return _EventSourceHealth(path, status="unreadable")
     events: list[dict[str, Any]] = []
     parse_errors = 0
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in content.splitlines():
         if not line.strip():
             continue
         try:
@@ -1131,28 +1255,32 @@ def _load_events(path: Path) -> tuple[list[dict[str, Any]], int]:
             continue
         if isinstance(event, dict):
             events.append(event)
-    return events, parse_errors
+        else:
+            parse_errors += 1
+    return _EventSourceHealth(
+        path,
+        status="invalid_records" if parse_errors else "available",
+        events=events,
+        parse_errors=parse_errors,
+    )
 
 
 def _load_run_events(
     workspace_dir: Path,
-) -> tuple[list[dict[str, Any]], int, tuple[Path, ...]]:
+    *,
+    audit_requested: bool,
+) -> tuple[_EventSourceHealth, ...]:
     candidates = (
         workspace_dir / "events.jsonl",
         workspace_dir / "autonomous-route" / "events.jsonl",
         workspace_dir / "autonomous-route" / "agent-graph" / "events.jsonl",
     )
-    events: list[dict[str, Any]] = []
-    parse_errors = 0
-    present: list[Path] = []
-    for path in candidates:
-        if not path.is_file():
-            continue
-        loaded, errors = _load_events(path)
-        events.extend(loaded)
-        parse_errors += errors
-        present.append(path)
-    return events, parse_errors, tuple(present)
+    sources = tuple(_load_events(path) for path in candidates)
+    if not audit_requested and all(source.status == "not_requested" for source in sources):
+        # With neither events nor an audit source there is no evidence to assess.
+        # An existing empty stream or a legitimate audit-only export remains valid.
+        sources = (replace(sources[0], status="missing"), *sources[1:])
+    return sources
 
 
 def _confirmed_findings(
@@ -1160,32 +1288,76 @@ def _confirmed_findings(
     *,
     engagement_id: UUID | str,
     scope: Scope | None = None,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], int]:
     findings: list[dict[str, Any]] = []
+    rejected_events = 0
     for event in events:
         if event.get("kind") != "finding_confirmed":
             continue
         payload = _dict(event.get("payload"))
-        if str(payload.get("engagement_id") or "") != str(engagement_id):
+        payload_engagement = str(payload.get("engagement_id") or "")
+        if payload_engagement and payload_engagement != str(engagement_id):
+            # Events belonging to another engagement are outside this report's input.
             continue
-        if str(payload.get("status") or "") != "confirmed":
-            continue
-        if confirmed_finding_evidence_failures(payload, scope=scope):
+        if (
+            not payload_engagement
+            or str(payload.get("status") or "") != "confirmed"
+            or confirmed_finding_evidence_failures(payload, scope=scope)
+        ):
+            rejected_events += 1
             continue
         findings.append(_normalize_finding(payload))
-    return findings
+    return findings, rejected_events
+
+
+def _audit_log_health(db_path: Path | None, *, engagement_id: UUID | str) -> _AuditSourceHealth:
+    if db_path is None:
+        return _AuditSourceHealth(status="not_requested")
+    try:
+        if not stat.S_ISREG(db_path.stat().st_mode):
+            return _AuditSourceHealth(status="unreadable")
+        with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+            rows = conn.execute(
+                "SELECT action, payload_json FROM audit_log WHERE engagement_id = ? ORDER BY id",
+                (str(engagement_id),),
+            ).fetchall()
+    except FileNotFoundError:
+        return _AuditSourceHealth(status="missing")
+    except (OSError, sqlite3.Error):
+        return _AuditSourceHealth(status="unreadable")
+    rejected_rows = 0
+    for action, raw_payload in rows:
+        if not isinstance(raw_payload, str):
+            rejected_rows += 1
+            continue
+        try:
+            payload = json.loads(raw_payload)
+        except json.JSONDecodeError:
+            rejected_rows += 1
+            continue
+        if not isinstance(action, str) or not action.strip() or not isinstance(payload, dict):
+            rejected_rows += 1
+    return _AuditSourceHealth(
+        status="invalid_records" if rejected_rows else "available",
+        rows_loaded=len(rows),
+        rejected_rows=rejected_rows,
+    )
 
 
 def _audit_findings(
-    db_path: Path,
+    db_path: Path | None,
     *,
     scope: Scope | None = None,
     engagement_id: UUID | str | None = None,
-) -> list[dict[str, Any]]:
-    if not db_path.exists():
-        return []
+) -> _AuditFindingsSource:
+    if db_path is None:
+        return _AuditFindingsSource(status="not_requested")
     try:
-        with sqlite3.connect(db_path) as conn:
+        if not stat.S_ISREG(db_path.stat().st_mode):
+            return _AuditFindingsSource(status="unreadable")
+        # Read-only mode prevents a missing/raced-away evidence source from becoming
+        # a new empty database. URI escaping preserves literal '?' and '#' in paths.
+        with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
             if engagement_id is None:
                 rows = conn.execute(
                     """
@@ -1205,20 +1377,37 @@ def _audit_findings(
                     """,
                     (str(engagement_id),),
                 ).fetchall()
-    except sqlite3.Error:
-        return []
+    except FileNotFoundError:
+        return _AuditFindingsSource(status="missing")
+    except (OSError, sqlite3.Error):
+        return _AuditFindingsSource(status="unreadable")
     findings: list[dict[str, Any]] = []
+    rejected_rows = 0
     for row in rows:
         try:
             payload = json.loads(str(row[0]))
         except json.JSONDecodeError:
+            rejected_rows += 1
             continue
-        if isinstance(payload, dict) and not confirmed_finding_evidence_failures(
-            payload,
-            scope=scope,
+        if (
+            not isinstance(payload, dict)
+            or payload.get("status") != "confirmed"
+            or (
+                engagement_id is not None
+                and payload.get("engagement_id") is not None
+                and str(payload["engagement_id"]) != str(engagement_id)
+            )
+            or confirmed_finding_evidence_failures(payload, scope=scope)
         ):
-            findings.append(_normalize_finding(payload))
-    return findings
+            rejected_rows += 1
+            continue
+        findings.append(_normalize_finding(payload))
+    return _AuditFindingsSource(
+        status="invalid_records" if rejected_rows else "available",
+        findings=findings,
+        rows_loaded=len(rows),
+        rejected_rows=rejected_rows,
+    )
 
 
 def _normalize_finding(raw: dict[str, Any]) -> dict[str, Any]:
@@ -1786,7 +1975,15 @@ def _executive_summary_text(  # noqa: PLR0913
     finding_count: int,
     flag_count: int,
     error: str | None,
+    evidence_complete: bool,
 ) -> str:
+    if not evidence_complete:
+        return _incomplete_evidence_summary(
+            finding_count=finding_count,
+            flag_count=flag_count,
+            overall_risk=overall_risk,
+            error=error,
+        )
     if error:
         return (
             "The assessment ended with an error before normal completion. "
@@ -1815,12 +2012,29 @@ def _executive_summary_text(  # noqa: PLR0913
             "of an in-scope path. "
             "No structured confirmed finding record was present in the run artifacts."
         )
-    if completed or status == "completed":
-        return (
-            "The assessment completed without a captured proof string or confirmed "
-            "finding in the run artifacts."
+    return (
+        "The assessment completed without a captured proof string or confirmed "
+        "finding in the run artifacts."
+    )
+
+
+def _incomplete_evidence_summary(
+    *, finding_count: int, flag_count: int, overall_risk: str, error: str | None
+) -> str:
+    summary = (
+        "Evidence sources are incomplete or unreadable. Results should be treated as partial; "
+        "missing findings cannot be interpreted as a clean assessment."
+    )
+    if finding_count:
+        summary += (
+            f" Available evidence retains {finding_count} confirmed finding(s); "
+            f"the highest observed risk level is {overall_risk}."
         )
-    return "The assessment did not reach normal completion. Results should be treated as partial."
+    elif flag_count:
+        summary += " Validated target proof material was retained."
+    if error:
+        summary += " The assessment also ended with an error before normal completion."
+    return summary
 
 
 def _severity_counts(findings: list[dict[str, Any]]) -> dict[str, int]:
@@ -1836,6 +2050,7 @@ def _overall_risk(
     findings: list[dict[str, Any]],
     flags: list[str],
     status: str,
+    evidence_complete: bool,
 ) -> str:
     if findings:
         return max(
@@ -1844,6 +2059,8 @@ def _overall_risk(
         )
     if flags:
         return "High"
+    if not evidence_complete:
+        return "Unknown"
     if status not in {"completed", "max_turns_reached"}:
         return "Informational"
     return "Low"
@@ -1961,14 +2178,27 @@ def _finding_markdown(index: int, finding: dict[str, Any]) -> list[str]:
     return lines
 
 
-def _redact_recursive(value: object) -> object:
+def redact_report_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Redact report contents and late metadata while preserving path separators."""
+    return cast("dict[str, Any]", _redact_recursive(payload))
+
+
+def _redact_recursive(value: object, *, path_context: bool = False) -> object:
     if isinstance(value, dict):
-        return {redact_sensitive(str(key)): _redact_recursive(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_redact_recursive(item) for item in value]
-    if isinstance(value, tuple):
-        return [_redact_recursive(item) for item in value]
+        return {
+            redact_sensitive(str(key)): _redact_recursive(
+                item, path_context=str(key).endswith(("_path", "_paths", "_dir"))
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_recursive(item, path_context=path_context) for item in value]
     if isinstance(value, str):
+        if path_context:
+            return "".join(
+                part if _PATH_SEPARATOR_RE.fullmatch(part) else redact_sensitive(part)
+                for part in _PATH_SEPARATOR_RE.split(value)
+            )
         return redact_sensitive(value)
     return value
 

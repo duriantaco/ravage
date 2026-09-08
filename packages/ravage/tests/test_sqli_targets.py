@@ -6,6 +6,7 @@ import sqlite3
 from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 
 from ravage.agent_core.agent_state import AgentState
+from ravage.agent_core.surface_graph import SurfaceGraphState
 from ravage.probe_suite_parts.sqli.sqli import (
     _target_looks_auth_bypass_candidate,
     probe_filtered_query_bypass,
@@ -13,6 +14,7 @@ from ravage.probe_suite_parts.sqli.sqli import (
     probe_sqli_exploit_runner,
 )
 from ravage.probe_suite_parts.sqli.sqli_targets import _sqli_targets
+from ravage.probe_suite_parts.sqli.sqli_transport import _send_sqli_target
 from ravage.probes.sqli_extractor.auth import _auth_bypass_cases
 from ravage.web_core.http_probe import ProbeResponse
 
@@ -126,6 +128,293 @@ def test_sqli_targets_prioritize_observed_json_request_template() -> None:
     assert targets[0]["method"] == "POST"
     assert targets[0]["encoding"] == "application/json"
     assert targets[0]["form"] == {"job_type": "premium"}
+
+
+def test_sqli_targets_do_not_invent_post_replay_from_source_only_template() -> None:
+    state = AgentState()
+    state.surface = {
+        "target_url": "http://localhost:64221/",
+        "origin": "http://localhost:64221",
+        "request_templates": [
+            {
+                "source": "source_code",
+                "method": "POST",
+                "url": "http://localhost:64221/internal/search",
+                "fields": {"term": ""},
+            }
+        ],
+    }
+
+    targets = _sqli_targets(state)
+
+    assert not any(
+        target["url"] == "http://localhost:64221/internal/search" for target in targets
+    )
+
+
+def test_sqli_targets_use_observed_post_template_not_source_only_hint() -> None:
+    state = AgentState()
+    state.surface = {
+        "target_url": "http://localhost:64221/",
+        "origin": "http://localhost:64221",
+        "request_templates": [
+            {
+                "source": "surface_graph",
+                "method": "POST",
+                "url": "http://localhost:64221/visible/search",
+                "fields": {"query": ""},
+            },
+            {
+                "source": "source_code",
+                "method": "POST",
+                "url": "http://localhost:64221/internal/search",
+                "fields": {"term": ""},
+            },
+        ],
+    }
+
+    targets = _sqli_targets(state)
+
+    assert targets[0]["url"] == "http://localhost:64221/visible/search"
+    assert targets[0]["input"] == "query"
+    assert not any(
+        target["url"] == "http://localhost:64221/internal/search" for target in targets
+    )
+
+
+def test_sqli_targets_build_exact_get_replay_with_required_source_query_shape() -> None:
+    state = AgentState()
+    state.surface_graph = SurfaceGraphState.for_target("http://localhost:64221/")
+    state.surface = {
+        "target_url": "http://localhost:64221/",
+        "origin": "http://localhost:64221",
+        "source_candidates": [
+            {
+                "candidate_id": "source-candidate-1",
+                "family": "sql_injection",
+                "method": "GET",
+                "route": "/unlinked/search",
+                "input_name": "term",
+                "input_location": "query",
+                "route_binding": "direct",
+                "live_validation": "automatic_get_query",
+                "query_fields": [
+                    {"name": "term", "required": True, "value_kind": "string"},
+                    {"name": "tenant", "required": True, "value_kind": "string"},
+                ],
+                "relative_file": "app.py",
+                "line": 17,
+                "sink_kind": "sql_execute",
+            }
+        ],
+    }
+
+    targets = _sqli_targets(state)
+
+    assert targets[0] == {
+        "kind": "replay",
+        "url": "http://localhost:64221/unlinked/search?tenant=ravage",
+        "input": "term",
+        "payload_field": "term",
+        "input_location": "query",
+        "method": "GET",
+        "encoding": "application/x-www-form-urlencoded",
+        "required_fields": ["tenant", "term"],
+        "hints": ["source_code", "source_family:sql_injection"],
+        "source_candidate_ids": ["source-candidate-1"],
+        "priority": 360,
+    }
+
+
+def test_source_validation_limits_sqli_to_source_candidates() -> None:
+    state = AgentState()
+    state.surface_graph = SurfaceGraphState.for_target("http://localhost:64221/")
+    state.surface = {
+        "target_url": "http://localhost:64221/",
+        "origin": "http://localhost:64221",
+        "source_validation_probe": "sqli_differential",
+        "source_validation_candidate_ids": ["source-candidate-1"],
+        "source_candidates": [
+            {
+                "candidate_id": "source-candidate-1",
+                "family": "sql_injection",
+                "method": "GET",
+                "route": "/unlinked/search",
+                "input_name": "term",
+                "input_location": "query",
+                "route_binding": "direct",
+                "live_validation": "automatic_get_query",
+                "query_fields": [
+                    {"name": "term", "required": True, "value_kind": "string"}
+                ],
+                "relative_file": "app.py",
+                "line": 17,
+            }
+        ],
+        "parameters": [
+            {
+                "name": "visible",
+                "locations": ["http://localhost:64221/?visible=1"],
+                "priority": 999,
+            }
+        ],
+    }
+
+    targets = _sqli_targets(state)
+
+    assert [(target["url"], target["input"]) for target in targets] == [
+        ("http://localhost:64221/unlinked/search", "term")
+    ]
+
+
+def test_source_validation_deduplicates_repeated_sink_lines() -> None:
+    state = AgentState()
+    state.surface_graph = SurfaceGraphState.for_target("http://localhost:64221/")
+    state.surface = {
+        "target_url": "http://localhost:64221/",
+        "origin": "http://localhost:64221",
+        "source_validation_probe": "sqli_differential",
+        "source_validation_candidate_ids": ["source-line-1", "source-line-2"],
+        "source_candidates": [
+            {
+                "candidate_id": candidate_id,
+                "family": "sql_injection",
+                "method": "GET",
+                "route": "/unlinked/search",
+                "input_name": "term",
+                "input_location": "query",
+                "route_binding": "direct",
+                "live_validation": "automatic_get_query",
+                "query_fields": [
+                    {"name": "term", "required": True, "value_kind": "string"}
+                ],
+                "relative_file": "app.py",
+                "line": line,
+            }
+            for candidate_id, line in (("source-line-1", 17), ("source-line-2", 18))
+        ],
+    }
+
+    targets = _sqli_targets(state)
+
+    assert len(targets) == 1
+    assert targets[0]["source_candidate_ids"] == ["source-line-1", "source-line-2"]
+
+
+def test_source_validation_uses_graph_origin_when_surface_origin_is_stale() -> None:
+    state = AgentState()
+    state.surface_graph = SurfaceGraphState.for_target("http://localhost:9001/")
+    state.surface = {
+        "target_url": "http://localhost:9002/",
+        "origin": "http://localhost:9002",
+        "source_validation_probe": "sqli_differential",
+        "source_validation_candidate_ids": ["source-candidate-1"],
+        "source_candidates": [
+            {
+                "candidate_id": "source-candidate-1",
+                "family": "sql_injection",
+                "method": "GET",
+                "route": "/unlinked/search",
+                "input_name": "term",
+                "input_location": "query",
+                "route_binding": "direct",
+                "live_validation": "automatic_get_query",
+                "query_fields": [
+                    {"name": "term", "required": True, "value_kind": "string"}
+                ],
+                "relative_file": "app.py",
+                "line": 17,
+            }
+        ],
+    }
+
+    targets = _sqli_targets(state)
+
+    assert [target["url"] for target in targets] == [
+        "http://localhost:9001/unlinked/search"
+    ]
+
+
+def test_post_query_replay_transport_keeps_payload_in_url() -> None:
+    target = {
+        "kind": "replay",
+        "method": "POST",
+        "url": "http://localhost:64221/unlinked/search",
+        "input": "term",
+        "input_location": "query",
+    }
+    session = _PostQuerySession()
+
+    _send_sqli_target(session, target, "quoted'value")  # type: ignore[arg-type]
+
+    assert target["input_location"] == "query"
+    assert "form" not in target
+    assert session.method == "POST"
+    assert parse_qs(urlsplit(session.url).query) == {"term": ["quoted'value"]}
+    assert session.data is None
+
+
+def test_source_validation_detects_hidden_string_boolean_sqli_in_five_requests() -> None:
+    state = AgentState()
+    state.surface_graph = SurfaceGraphState.for_target("http://localhost:64221/")
+    state.surface = {
+        "source_validation_probe": "sqli_differential",
+        "source_validation_candidate_ids": ["source-candidate-1"],
+        "source_candidates": [
+            {
+                "candidate_id": "source-candidate-1",
+                "family": "sql_injection",
+                "method": "GET",
+                "route": "/search",
+                "input_name": "term",
+                "input_location": "query",
+                "route_binding": "direct",
+                "live_validation": "automatic_get_query",
+                "query_fields": [
+                    {"name": "term", "required": True, "value_kind": "string"}
+                ],
+            }
+        ],
+    }
+    session = _HiddenSourceBooleanSession()
+
+    result = probe_sqli_differential(session, state)  # type: ignore[arg-type]
+
+    assert result.ok
+    assert len(result.requests) == 5
+    assert result.findings[0]["type"] == "blind_sql_injection_boolean_signal"
+    assert "' OR '1'='1' -- " in str(result.findings[0]["true_payload"])
+
+
+def test_clean_source_validation_uses_seven_requests() -> None:
+    state = AgentState()
+    state.surface_graph = SurfaceGraphState.for_target("http://localhost:64221/")
+    state.surface = {
+        "source_validation_probe": "sqli_differential",
+        "source_validation_candidate_ids": ["source-candidate-1"],
+        "source_candidates": [
+            {
+                "candidate_id": "source-candidate-1",
+                "family": "sql_injection",
+                "method": "GET",
+                "route": "/search",
+                "input_name": "term",
+                "input_location": "query",
+                "route_binding": "direct",
+                "live_validation": "automatic_get_query",
+                "query_fields": [
+                    {"name": "term", "required": True, "value_kind": "string"}
+                ],
+            }
+        ],
+    }
+    session = _CleanSourceSession()
+
+    result = probe_sqli_differential(session, state)  # type: ignore[arg-type]
+
+    assert not result.ok
+    assert len(result.requests) == 7
+    assert session.request_count == 7
 
 
 def test_sqli_targets_only_demote_replays_that_received_auth_prepass() -> None:
@@ -460,6 +749,76 @@ def test_sqli_exploit_continues_unclosed_error_based_flag_chunks() -> None:
         for row in _finding_rows(finding)
     )
     assert max(session.substring_starts) > _MIN_LONG_EXTRACTION_OFFSET
+
+
+class _PostQuerySession:
+    target_url = "http://localhost:64221/"
+
+    def __init__(self) -> None:
+        self.method = ""
+        self.url = ""
+        self.data: bytes | None = None
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        data: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> ProbeResponse:
+        _ = headers
+        self.method = method
+        self.url = url
+        self.data = data
+        return ProbeResponse(
+            method=method,
+            url=url,
+            status=200,
+            final_url=url,
+            elapsed_ms=1,
+            body="ok",
+        )
+
+
+class _HiddenSourceBooleanSession:
+    target_url = "http://localhost:64221/"
+
+    def get(self, url: str, *, headers: dict[str, str] | None = None) -> ProbeResponse:
+        _ = headers
+        value = parse_qs(urlsplit(url).query, keep_blank_values=True).get("term", [""])[0]
+        body = (
+            "matching database rows: " + ("result " * 8)
+            if "' OR '1'='1' -- " in value
+            else "no matching rows"
+        )
+        return ProbeResponse(
+            method="GET",
+            url=url,
+            status=200,
+            final_url=url,
+            elapsed_ms=1,
+            body=body,
+        )
+
+
+class _CleanSourceSession:
+    target_url = "http://localhost:64221/"
+
+    def __init__(self) -> None:
+        self.request_count = 0
+
+    def get(self, url: str, *, headers: dict[str, str] | None = None) -> ProbeResponse:
+        _ = headers
+        self.request_count += 1
+        return ProbeResponse(
+            method="GET",
+            url=url,
+            status=200,
+            final_url=url,
+            elapsed_ms=1,
+            body="no matching rows",
+        )
 
 
 class _ParenthesizedSqliteUnionSession:
