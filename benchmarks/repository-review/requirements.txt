@@ -1,0 +1,5 @@
+cryptography==48.0.0
+pathspec==1.1.1
+pydantic==2.13.4
+PyYAML==6.0.3
+rich==15.0.0
