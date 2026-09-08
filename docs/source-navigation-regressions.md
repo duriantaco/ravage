@@ -82,8 +82,8 @@ incomplete accounting after a failed call. The model snapshot and reasoning
 options are documented in the [official model reference](https://developers.openai.com/api/docs/models/gpt-5.4).
 
 The paid run evaluates this bounded fixture reader and gate. It does not measure
-the full agent's search breadth, runtime framework behavior, vulnerability recall,
-or performance against Strix. The offline corpus supplies all captured source;
-it tests structural coverage, not whether a model would choose the right files.
+the full agent's search breadth, runtime framework behavior, or vulnerability
+recall. The offline corpus supplies all captured source; it tests structural
+coverage, not whether a model would choose the right files.
 
 Reports never overwrite an existing output file. Use a new filename for each run.

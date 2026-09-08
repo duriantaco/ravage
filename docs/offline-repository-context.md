@@ -207,8 +207,8 @@ references are separate from the reader.
 
 The Python source analyzer reads three of these eight files, as its
 documented contract requires. This reader exposes all eight. That difference
-measures file-context breadth; it is not a vulnerability-detection score, a
-semantic retrieval evaluation, or a Strix comparison. The review regressions
+measures file-context breadth; it is not a vulnerability-detection score or a
+semantic retrieval evaluation. The review regressions
 prove that model-selected searches and excerpts reach the model and that final
 candidates bind to captured evidence. They do not establish improved vulnerability
 detection. Attack regressions separately verify consent, transient source

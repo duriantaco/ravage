@@ -158,10 +158,10 @@ Avoid claims that the evidence does not support:
 - the only benchmark or the only cost-aware benchmark;
 - nobody else reports cost;
 - state of the art;
-- better than Strix, MAPTA, or another system without a controlled comparison;
+- better than another system without a controlled comparison;
 - plural "agents" before stage two exists.
 
-XBEN, MAPTA, Strix, BountyBench, HAL, and other evaluation projects already
+XBEN, MAPTA, BountyBench, HAL, and other evaluation projects already
 publish benchmark, evidence, or cost artifacts. Ravage's prospective
 differentiator is the declared web-agent execution contract and interoperable
 row-level evidence—not the invention of benchmarks, scoreboards, or cost
