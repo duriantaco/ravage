@@ -182,6 +182,10 @@ EOF and reports that adjustment; a request that starts past EOF still fails.
 
 ## Regression cases
 
+The [source navigation regression runner](source-navigation-regressions.md)
+adds a labelled route corpus, a bounded local receipt canary, and an optional
+GPT-5.4 adapter. CI runs the offline corpus and scripted regressions.
+
 Run the offline suite:
 
 ```bash
