@@ -68,6 +68,7 @@ from ravage.agent_core.autonomous_graph.traffic_lifecycle import (
     GraphTrafficTerminal,
     graph_traffic_session_id,
 )
+from ravage.agent_core.autonomous_graph.work_planner import InvestigationPlannerMode
 from ravage.agent_core.autonomous_graph.worker import (
     GraphRunner,
     GraphRunResult,
@@ -159,6 +160,11 @@ def run_remote_http_graph_route(
     remains unchanged. This route has its own manifest, state, budget, evidence,
     sessions, and request-policy receipts.
     """
+    if config.planner_mode is not InvestigationPlannerMode.LEGACY:
+        raise RemoteGraphProductionError(
+            "feedback planner requires catalog-attributed campaigns; "
+            "remote HTTP-only execution is not supported"
+        )
     brief = load_engagement_brief(brief_path)
     if not settings.allow_remote_target:
         raise RemoteGraphProductionError(
@@ -421,6 +427,8 @@ async def _run_owned_remote_http_graph(
             workspace_dir=workspace_dir,
             objectives=tuple(node.objective for node in coordinator.state.nodes.values()),
             evidence_validator=blackboard,
+            planner_mode=config.planner_mode,
+            planner_policy_version=config.planner_policy_version,
         )
         if config.investigation_enabled
         else None

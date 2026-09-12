@@ -19,11 +19,13 @@ from ravage.agent_core.agent_state import AgentState, save_agent_state
 from ravage.agent_core.autonomous_graph.operational_profile import (
     GraphOperationalProfileName,
 )
+from ravage.agent_core.autonomous_graph.work_planner import InvestigationPlannerMode
 from ravage.probe_suite_parts.result import ProbeRunResult
 from ravage.setup_checks import SetupDiagnostic
 from ravage.traffic import TrafficPolicyConfig, TrafficPolicyController
 
 EXPECTED_MODEL_REQUESTS = 4
+ARGPARSE_ERROR_EXIT = 2
 MANUAL_INSTALL_NO_COMMANDS_EXIT = 2
 INSTALL_FAILURE_EXIT = 13
 RESULT_ENGAGEMENT_ID = "88888888-8888-4888-8888-888888888888"
@@ -1258,6 +1260,65 @@ def test_cli_attack_help_points_to_brief_template(
     assert "challenge descriptions and" in output
     assert "--authorized-remote-target" in output
     assert "--operational-profile" in output
+    assert "--graph-planner-mode" in output
+
+
+@pytest.mark.parametrize(
+    "route_args",
+    [
+        ["--autonomous-route-engine", "agent-graph"],
+        ["--autonomous-route"],
+    ],
+)
+def test_cli_attack_rejects_graph_planner_mode_outside_agent_graph_route(
+    route_args: list[str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    brief_path = tmp_path / "brief.yaml"
+    brief_path.write_text(BRIEF_YAML, encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "attack",
+                str(brief_path),
+                "--graph-planner-mode",
+                "shadow",
+                *route_args,
+            ]
+        )
+
+    assert exc_info.value.code == ARGPARSE_ERROR_EXIT
+    assert (
+        "--graph-planner-mode requires --autonomous-route --autonomous-route-engine agent-graph"
+    ) in capsys.readouterr().err
+
+
+def test_cli_attack_does_not_expose_online_graph_planner_mode(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    brief_path = tmp_path / "brief.yaml"
+    brief_path.write_text(BRIEF_YAML, encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "attack",
+                str(brief_path),
+                "--autonomous-route",
+                "--autonomous-route-engine",
+                "agent-graph",
+                "--graph-planner-mode",
+                "online",
+            ]
+        )
+
+    assert exc_info.value.code == ARGPARSE_ERROR_EXIT
+    error = capsys.readouterr().err
+    assert "invalid choice: 'online'" in error
+    assert "choose from legacy, shadow" in error
 
 
 def test_cli_attack_remote_target_stays_blocked_without_explicit_authorization(
@@ -1284,6 +1345,41 @@ def test_cli_attack_remote_target_stays_blocked_without_explicit_authorization(
         )
 
     assert exc_info.value.code == 2
+
+
+@pytest.mark.parametrize("public_cli", [False, True])
+def test_cli_attack_rejects_shadow_planner_for_remote_targets(
+    public_cli: bool,  # noqa: FBT001 - parametrized interface selector.
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    remote_url = "https://authorized.example/app"
+    brief_path = tmp_path / "remote-brief.yaml"
+    brief_path.write_text(
+        BRIEF_YAML.replace("http://127.0.0.1:8765", remote_url),
+        encoding="utf-8",
+    )
+    route_args = [
+        "--authorized-remote-target",
+        "--autonomous-route",
+        "--autonomous-route-engine",
+        "agent-graph",
+        "--graph-planner-mode",
+        "shadow",
+    ]
+    args = (
+        ["attack", str(brief_path), "--target-url", remote_url, *route_args]
+        if public_cli
+        else ["--brief", str(brief_path), "--target-url", remote_url, *route_args]
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(args)
+
+    assert exc_info.value.code == ARGPARSE_ERROR_EXIT
+    error = capsys.readouterr().err
+    assert "shadow is unavailable for remote targets" in error
+    assert "HTTP-only actions lack catalog campaign attribution" in error
 
 
 def test_cli_scan_runs_explicitly_authorized_remote_target(
@@ -1413,6 +1509,7 @@ def test_cli_attack_routes_explicit_remote_target_to_full_low_noise_agent_graph(
     assert seen["operational_profile"] is GraphOperationalProfileName.LOW_NOISE
     assert seen["max_model_requests"] == 8
     assert seen["engine"] == "agent-graph"
+    assert seen["planner_mode"] is InvestigationPlannerMode.LEGACY
 
 
 def test_cli_attack_blocks_missing_description(

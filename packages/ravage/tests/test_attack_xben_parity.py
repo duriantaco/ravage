@@ -14,6 +14,7 @@ from ravage import __main__ as cli
 from ravage.agent_core.action_executor import execute_action
 from ravage.agent_core.agent_state import AgentState
 from ravage.agent_core.ai_agent import AIWebAgentSettings
+from ravage.agent_core.autonomous_graph.work_planner import InvestigationPlannerMode
 from ravage.run_data.audit import AuditStore
 from ravage.run_data.workspace import AgentWorkspace
 from ravage.runtime import FakeToolRuntime, ToolResult
@@ -444,6 +445,7 @@ def test_public_attack_wires_the_opt_in_autonomous_route_without_changing_base_t
     assert isinstance(settings, AIWebAgentSettings)
     assert captured["engine"] == "frontier"
     assert captured["max_model_requests"] == ROUTE_REQUEST_BUDGET
+    assert captured["planner_mode"] is InvestigationPlannerMode.LEGACY
     assert settings.max_turns == BASE_TURN_BUDGET
     assert settings.recovery_profile == "off"
 
@@ -477,6 +479,8 @@ def test_public_attack_selects_agent_graph_without_changing_base_turns(
             "--autonomous-route",
             "--autonomous-route-engine",
             "agent-graph",
+            "--graph-planner-mode",
+            "shadow",
             "--autonomous-route-max-requests",
             str(ROUTE_REQUEST_BUDGET),
         ]
@@ -486,6 +490,7 @@ def test_public_attack_selects_agent_graph_without_changing_base_turns(
     assert isinstance(settings, AIWebAgentSettings)
     assert captured["engine"] == "agent-graph"
     assert captured["max_model_requests"] == ROUTE_REQUEST_BUDGET
+    assert captured["planner_mode"] is InvestigationPlannerMode.SHADOW
     assert settings.max_turns == BASE_TURN_BUDGET
 
 

@@ -31,6 +31,10 @@ from ravage.agent_core.autonomous_graph.operational_profile import (
 from ravage.agent_core.autonomous_graph.runtime_binding import GraphRuntimeResolver
 from ravage.agent_core.autonomous_graph.scheduler import ProgressiveGraphScheduler
 from ravage.agent_core.autonomous_graph.sessions import GraphSessionStore
+from ravage.agent_core.autonomous_graph.work_planner import (
+    ONLINE_PLANNER_POLICY_VERSION,
+    InvestigationPlannerMode,
+)
 from ravage.agent_core.autonomous_graph.worker import (
     GraphComplete,
     GraphExecute,
@@ -86,11 +90,17 @@ class GraphRouteConfig:
     max_race_lanes: int = _SELECTIVE_RACE_LANES
     max_race_groups: int = 0
     investigation_enabled: bool = True
+    planner_mode: InvestigationPlannerMode = InvestigationPlannerMode.LEGACY
+    planner_policy_version: str = ONLINE_PLANNER_POLICY_VERSION
     operational_profile: GraphOperationalProfileName = GraphOperationalProfileName.STANDARD
 
     def __post_init__(self) -> None:
         if not isinstance(self.investigation_enabled, bool):
             raise GraphRouteAdapterError("investigation_enabled must be a boolean")
+        if not isinstance(self.planner_mode, InvestigationPlannerMode):
+            raise GraphRouteAdapterError("planner_mode must be an InvestigationPlannerMode")
+        if self.planner_policy_version != ONLINE_PLANNER_POLICY_VERSION:
+            raise GraphRouteAdapterError("planner_policy_version is unsupported")
         if not isinstance(
             self.operational_profile,
             GraphOperationalProfileName,
@@ -122,7 +132,7 @@ class GraphRouteConfig:
         )
 
     def to_json(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "limits": self.limits.to_json(),
             "root_lease_limit": self.root_lease_limit,
             "child_lease_limit": self.child_lease_limit,
@@ -132,6 +142,16 @@ class GraphRouteConfig:
             "investigation_enabled": self.investigation_enabled,
             "operational_profile": self.operational_profile.value,
         }
+        # Omitting the legacy default preserves the config identity of graphs
+        # created before feedback-driven planning existed. Any shadow/online
+        # route is explicitly bound and therefore cannot silently change mode
+        # or scoring policy across resume.
+        if self.planner_mode is not InvestigationPlannerMode.LEGACY:
+            payload["planner"] = {
+                "mode": self.planner_mode.value,
+                "policy_version": self.planner_policy_version,
+            }
+        return payload
 
 
 @dataclass(frozen=True)
@@ -388,6 +408,8 @@ class GraphRouteContext:
                 workspace_dir=self.workspace_dir,
                 objectives=tuple(node.objective for node in self.coordinator.state.nodes.values()),
                 evidence_validator=self.blackboard,
+                planner_mode=self.config.planner_mode,
+                planner_policy_version=self.config.planner_policy_version,
             )
             if self.config.investigation_enabled
             else None
