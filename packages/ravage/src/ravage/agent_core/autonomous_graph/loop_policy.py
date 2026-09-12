@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from ravage.agent_core.autonomous_graph.branch_search import (
+    MAX_PLANNER_ATTEMPTS_PER_CELL,
+)
+
 if TYPE_CHECKING:
     from ravage.agent_core.autonomous_graph.coverage_ledger import CoverageCellState
     from ravage.agent_core.autonomous_graph.work_planner import PlannedCampaign
@@ -59,7 +63,7 @@ class LoopDecision:
 @dataclass(frozen=True)
 class LoopPolicyConfig:
     plateau_limit: int = 2
-    max_campaigns_per_cell: int = 8
+    max_campaigns_per_cell: int = MAX_PLANNER_ATTEMPTS_PER_CELL
 
     def __post_init__(self) -> None:
         if self.plateau_limit <= 0:
