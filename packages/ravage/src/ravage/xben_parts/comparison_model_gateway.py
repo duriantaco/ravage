@@ -27,7 +27,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from decimal import Decimal, ROUND_FLOOR
+from decimal import Context, Decimal, ROUND_FLOOR, localcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Protocol
@@ -46,6 +46,19 @@ _MAX_HEADER_VALUE_CHARS = 512
 _MAX_REASONING_EFFORT_CHARS = 50
 _MAX_REQUESTS_PER_ROW = 4096
 _MAX_RECEIPT_BYTES = 8 * 1024 * 1024
+_MAX_COMPLETION_TOKENS_PER_REQUEST = 1_000_000
+_MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
+_MAX_UPSTREAM_RESPONSE_BYTES = 256 * 1024 * 1024
+_MAX_UPSTREAM_TIMEOUT_SECONDS = 3600
+_MAX_PARALLEL_REQUESTS = 256
+_MONEY_CONTEXT = Context(prec=256, rounding=ROUND_FLOOR)
+_MAX_INPUT_MONEY_TEXT_CHARS = 100
+_MAX_INPUT_MONEY_ADJUSTED_EXPONENT = 28
+# Evidence must be closed over the largest admitted price, provider token
+# count, per-row request count, and 999 row IDs. These bounds leave margin
+# beyond that derived maximum while keeping serialization finite.
+_MAX_EVIDENCE_MONEY_TEXT_CHARS = 256
+_MAX_EVIDENCE_MONEY_ADJUSTED_EXPONENT = 64
 
 
 class ModelGatewayError(RuntimeError):
@@ -72,9 +85,9 @@ class ModelPricing:
     def from_numbers(
         cls,
         *,
-        input_per_million: float | str | Decimal,
-        cached_input_per_million: float | str | Decimal,
-        output_per_million: float | str | Decimal,
+        input_per_million: int | str | Decimal,
+        cached_input_per_million: int | str | Decimal,
+        output_per_million: int | str | Decimal,
     ) -> ModelPricing:
         return cls(
             input_per_million=_decimal(input_per_million, "input price"),
@@ -84,9 +97,11 @@ class ModelPricing:
 
     def to_json(self) -> dict[str, str]:
         return {
-            "input_per_million": _money(self.input_per_million),
-            "cached_input_per_million": _money(self.cached_input_per_million),
-            "output_per_million": _money(self.output_per_million),
+            "input_per_million": _input_money(self.input_per_million, "input price"),
+            "cached_input_per_million": _input_money(
+                self.cached_input_per_million, "cached-input price"
+            ),
+            "output_per_million": _input_money(self.output_per_million, "output price"),
         }
 
 
@@ -109,7 +124,7 @@ class ModelGatewayPolicy:
         model: str,
         reasoning_effort: str,
         pricing: ModelPricing,
-        campaign_max_cost_usd: float | str | Decimal,
+        campaign_max_cost_usd: int | str | Decimal,
         max_completion_tokens_per_request: int = 8192,
         max_request_body_bytes: int = 8 * 1024 * 1024,
         max_upstream_response_bytes: int = 64 * 1024 * 1024,
@@ -131,50 +146,71 @@ class ModelGatewayPolicy:
         return policy
 
     def validate(self) -> None:
-        if not self.model.strip() or self.model != self.model.strip() or len(self.model) > 200:
+        if (
+            not isinstance(self.model, str)
+            or not self.model.strip()
+            or self.model != self.model.strip()
+            or len(self.model) > 200
+        ):
             raise ValueError("gateway model must be nonempty and normalized")
         if (
-            not self.reasoning_effort.strip()
+            not isinstance(self.reasoning_effort, str)
+            or not self.reasoning_effort.strip()
             or self.reasoning_effort != self.reasoning_effort.strip()
             or len(self.reasoning_effort) > _MAX_REASONING_EFFORT_CHARS
         ):
             raise ValueError("gateway reasoning effort must be nonempty and normalized")
+        if not isinstance(self.pricing, ModelPricing):
+            raise ValueError("gateway pricing is invalid")
         for label, value in (
             ("input price", self.pricing.input_per_million),
             ("cached-input price", self.pricing.cached_input_per_million),
             ("output price", self.pricing.output_per_million),
             ("campaign cost ceiling", self.campaign_max_cost_usd),
         ):
-            if (
-                not value.is_finite()
-                or value < 0
-                or (label == "campaign cost ceiling" and value <= 0)
-            ):
+            try:
+                _input_money(value, label)
+            except ValueError as exc:
+                raise ValueError(f"{label} is invalid") from exc
+            if label == "campaign cost ceiling" and value <= 0:
                 raise ValueError(f"{label} is invalid")
         if self.pricing.input_per_million <= 0 or self.pricing.output_per_million <= 0:
             raise ValueError("input and output prices must both be positive")
-        for label, integer_value in (
-            ("completion-token cap", self.max_completion_tokens_per_request),
-            ("request-body cap", self.max_request_body_bytes),
-            ("response-body cap", self.max_upstream_response_bytes),
-            ("upstream timeout", self.upstream_timeout_seconds),
-            ("parallel-request cap", self.max_parallel_requests),
+        for label, integer_value, maximum in (
+            (
+                "completion-token cap",
+                self.max_completion_tokens_per_request,
+                _MAX_COMPLETION_TOKENS_PER_REQUEST,
+            ),
+            ("request-body cap", self.max_request_body_bytes, _MAX_REQUEST_BODY_BYTES),
+            (
+                "response-body cap",
+                self.max_upstream_response_bytes,
+                _MAX_UPSTREAM_RESPONSE_BYTES,
+            ),
+            ("upstream timeout", self.upstream_timeout_seconds, _MAX_UPSTREAM_TIMEOUT_SECONDS),
+            ("parallel-request cap", self.max_parallel_requests, _MAX_PARALLEL_REQUESTS),
         ):
             if (
                 isinstance(integer_value, bool)
                 or not isinstance(integer_value, int)
-                or integer_value <= 0
+                or not 0 < integer_value <= maximum
             ):
-                raise ValueError(f"gateway {label} must be a positive integer")
+                raise ValueError(
+                    f"gateway {label} must be a positive integer no greater than {maximum}"
+                )
 
     def to_json(self) -> dict[str, object]:
+        self.validate()
         return {
             "schema_version": MODEL_GATEWAY_POLICY_SCHEMA,
             "upstream": f"https://{OPENAI_HOST}{OPENAI_CHAT_PATH}",
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
             "pricing_usd_per_million_tokens": self.pricing.to_json(),
-            "campaign_max_cost_usd": _money(self.campaign_max_cost_usd),
+            "campaign_max_cost_usd": _input_money(
+                self.campaign_max_cost_usd, "campaign cost ceiling"
+            ),
             "max_completion_tokens_per_request": self.max_completion_tokens_per_request,
             "max_request_body_bytes": self.max_request_body_bytes,
             "max_upstream_response_bytes": self.max_upstream_response_bytes,
@@ -273,6 +309,7 @@ class _RowState:
     known_actual_cost_usd: Decimal = _ZERO
     invalid: bool = False
     closing: bool = False
+    sealing: bool = False
     sealed: bool = False
     records: list[dict[str, object]] = field(default_factory=list)
     active_ordinals: set[int] = field(default_factory=set)
@@ -430,7 +467,7 @@ class ComparisonModelGateway:
         row_id: str,
         *,
         max_requests: int,
-        max_cost_usd: float | str | Decimal,
+        max_cost_usd: int | str | Decimal,
     ) -> str:
         if _ROW_ID_RE.fullmatch(row_id) is None:
             raise RowRegistrationError("model gateway row ID is invalid")
@@ -503,20 +540,28 @@ class ComparisonModelGateway:
                 raise RowSealError("model gateway row is unknown")
             if row.sealed:
                 raise RowSealError("model gateway row is already sealed")
-            if row.closing:
+            if row.sealing:
                 raise RowSealError("model gateway row is already closing")
             row.closing = True
-            while row.active_requests:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    self._terminalize_active_requests(row)
-                    break
-                self._condition.wait(timeout=remaining)
-            if row.active_requests or row.active_reserved_cost_usd != 0:
-                raise RowSealError("model gateway row did not become terminal")
-            receipt = self._row_receipt(row)
-            _write_json_exclusive(output_path, receipt)
+            row.sealing = True
+            try:
+                while row.active_requests:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._terminalize_active_requests(row)
+                        break
+                    self._condition.wait(timeout=remaining)
+                if row.active_requests or row.active_reserved_cost_usd != 0:
+                    raise RowSealError("model gateway row did not become terminal")
+                receipt = self._row_receipt(row)
+                _write_json_exclusive(output_path, receipt)
+            except BaseException:
+                row.sealing = False
+                self._condition.notify_all()
+                raise
             row.sealed = True
+            row.sealing = False
+            self._condition.notify_all()
             return receipt
 
     def _terminalize_active_requests(self, row: _RowState) -> None:
@@ -548,10 +593,16 @@ class ComparisonModelGateway:
                 }
             else:
                 charged = reservation.reserved_cost_usd
-                row.active_reserved_cost_usd -= charged
-                self._campaign_active_reserved_cost_usd -= charged
-                row.charged_cost_usd += charged
-                self._campaign_charged_cost_usd += charged
+                row.active_reserved_cost_usd = _subtract_money(
+                    row.active_reserved_cost_usd, charged
+                )
+                self._campaign_active_reserved_cost_usd = _subtract_money(
+                    self._campaign_active_reserved_cost_usd, charged
+                )
+                row.charged_cost_usd = _add_money(row.charged_cost_usd, charged)
+                self._campaign_charged_cost_usd = _add_money(
+                    self._campaign_charged_cost_usd, charged
+                )
                 replacement = {
                     "request_ordinal": ordinal,
                     "status": "failed",
@@ -802,8 +853,12 @@ class ComparisonModelGateway:
                     started_at=started_at,
                     started_monotonic=started_monotonic,
                 )
-                row.active_reserved_cost_usd += reservation_cost
-                self._campaign_active_reserved_cost_usd += reservation_cost
+                row.active_reserved_cost_usd = _add_money(
+                    row.active_reserved_cost_usd, reservation_cost
+                )
+                self._campaign_active_reserved_cost_usd = _add_money(
+                    self._campaign_active_reserved_cost_usd, reservation_cost
+                )
                 row.reservations[ordinal] = reservation
                 self._replace_record(
                     row,
@@ -842,25 +897,32 @@ class ComparisonModelGateway:
         requested_output_cap: int,
     ) -> tuple[int, Decimal]:
         with self._lock:
-            row_available = row.max_cost_usd - row.charged_cost_usd - row.active_reserved_cost_usd
-            campaign_available = (
-                self.policy.campaign_max_cost_usd
-                - self._campaign_charged_cost_usd
-                - self._campaign_active_reserved_cost_usd
+            row_available = _subtract_money(
+                row.max_cost_usd,
+                row.charged_cost_usd,
+                row.active_reserved_cost_usd,
+            )
+            campaign_available = _subtract_money(
+                self.policy.campaign_max_cost_usd,
+                self._campaign_charged_cost_usd,
+                self._campaign_active_reserved_cost_usd,
             )
             available = min(row_available, campaign_available)
             output_price = self.policy.pricing.output_per_million
             if available <= input_reservation:
                 raise _GatewayHTTPFailure(429, "model_cost_limit_reached")
-            affordable = int(
-                ((available - input_reservation) * _MILLION / output_price).to_integral_value(
-                    rounding=ROUND_FLOOR
-                )
+            affordable = _affordable_output_tokens(
+                available=available,
+                input_reservation=input_reservation,
+                output_price=output_price,
             )
             output_cap = min(requested_output_cap, affordable)
             if output_cap <= 0:
                 raise _GatewayHTTPFailure(429, "model_cost_limit_reached")
-            reserved = input_reservation + _token_cost(output_cap, output_price)
+            reserved = _add_money(
+                input_reservation,
+                _token_cost(output_cap, output_price),
+            )
             if reserved > available:
                 raise _GatewayHTTPFailure(429, "model_cost_reservation_failed")
             return output_cap, reserved
@@ -903,19 +965,19 @@ class ComparisonModelGateway:
                 cached_tokens = _usage_integer(details, "cached_tokens", default=0)
             if cached_tokens > prompt_tokens:
                 raise ModelGatewayError("cached input tokens exceed input tokens")
-            actual_cost = (
+            actual_cost = _add_money(
                 _token_cost(
                     prompt_tokens - cached_tokens,
                     self.policy.pricing.input_per_million,
-                )
-                + _token_cost(
+                ),
+                _token_cost(
                     cached_tokens,
                     self.policy.pricing.cached_input_per_million,
-                )
-                + _token_cost(
+                ),
+                _token_cost(
                     completion_tokens,
                     self.policy.pricing.output_per_million,
-                )
+                ),
             )
         except Exception as exc:  # noqa: BLE001 - any accounting ambiguity fails closed.
             self._finalize_failure(
@@ -949,9 +1011,11 @@ class ComparisonModelGateway:
             if reservation.ordinal in row.abandoned_ordinals or row.sealed:
                 return False, {"failure_code": "row_sealed_before_upstream_completed"}
             self._release_reservation(row, reservation)
-            row.charged_cost_usd += actual_cost
-            row.known_actual_cost_usd += actual_cost
-            self._campaign_charged_cost_usd += actual_cost
+            row.charged_cost_usd = _add_money(row.charged_cost_usd, actual_cost)
+            row.known_actual_cost_usd = _add_money(row.known_actual_cost_usd, actual_cost)
+            self._campaign_charged_cost_usd = _add_money(
+                self._campaign_charged_cost_usd, actual_cost
+            )
             self._replace_record(
                 row,
                 reservation.ordinal,
@@ -1009,8 +1073,8 @@ class ComparisonModelGateway:
             charged = reservation.reserved_cost_usd if charge_reservation else _ZERO
             if observed_usage_cost_usd is not None:
                 charged = max(charged, observed_usage_cost_usd)
-            row.charged_cost_usd += charged
-            self._campaign_charged_cost_usd += charged
+            row.charged_cost_usd = _add_money(row.charged_cost_usd, charged)
+            self._campaign_charged_cost_usd = _add_money(self._campaign_charged_cost_usd, charged)
             row.invalid = True
             record: dict[str, object] = {
                 "request_ordinal": reservation.ordinal,
@@ -1054,8 +1118,10 @@ class ComparisonModelGateway:
         if retained != reservation:
             raise ModelGatewayError("model gateway active reservation disappeared")
         row.active_requests -= 1
-        row.active_reserved_cost_usd -= amount
-        self._campaign_active_reserved_cost_usd -= amount
+        row.active_reserved_cost_usd = _subtract_money(row.active_reserved_cost_usd, amount)
+        self._campaign_active_reserved_cost_usd = _subtract_money(
+            self._campaign_active_reserved_cost_usd, amount
+        )
         row.active_ordinals.discard(reservation.ordinal)
         row.admitted_monotonic.pop(reservation.ordinal, None)
         if (
@@ -1124,7 +1190,7 @@ def validate_model_gateway_receipt(
     expected_row_id: str,
     expected_policy_sha256: str,
     expected_max_requests: int,
-    expected_max_cost_usd: float | str | Decimal,
+    expected_max_cost_usd: int | str | Decimal,
 ) -> dict[str, object]:
     """Recompute a sealed row receipt and its request/cost accounting."""
 
@@ -1172,7 +1238,10 @@ def validate_model_gateway_receipt(
         or limits.get("max_requests") != expected_max_requests
     ):
         raise ModelGatewayError("model gateway receipt request limit is invalid")
-    expected_cost = _receipt_money(expected_max_cost_usd, "expected row cost ceiling")
+    try:
+        expected_cost = _money(_decimal(expected_max_cost_usd, "expected row cost ceiling"))
+    except ValueError as exc:
+        raise ModelGatewayError("expected row cost ceiling is invalid") from exc
     if limits.get("max_cost_usd") != expected_cost:
         raise ModelGatewayError("model gateway receipt cost limit is invalid")
 
@@ -1203,8 +1272,8 @@ def validate_model_gateway_receipt(
             expected_ordinal=expected_ordinal,
             policy=policy,
         )
-        charged_total += charged
-        actual_total += actual
+        charged_total = _add_money(charged_total, charged)
+        actual_total = _add_money(actual_total, actual)
         all_records_valid = all_records_valid and record_valid
     maximum_cost = _decimal(expected_cost, "row cost ceiling")
     if totals.get("charged_cost_usd") != _money(charged_total):
@@ -1277,14 +1346,16 @@ def _validate_policy_receipt(value: object) -> dict[str, object]:
     ):
         raise ModelGatewayError("input and output model prices must be positive")
     _receipt_money(value.get("campaign_max_cost_usd"), "campaign cost ceiling")
-    for name in (
-        "max_completion_tokens_per_request",
-        "max_request_body_bytes",
-        "max_upstream_response_bytes",
-        "upstream_timeout_seconds",
-        "max_parallel_requests",
+    for name, maximum in (
+        ("max_completion_tokens_per_request", _MAX_COMPLETION_TOKENS_PER_REQUEST),
+        ("max_request_body_bytes", _MAX_REQUEST_BODY_BYTES),
+        ("max_upstream_response_bytes", _MAX_UPSTREAM_RESPONSE_BYTES),
+        ("upstream_timeout_seconds", _MAX_UPSTREAM_TIMEOUT_SECONDS),
+        ("max_parallel_requests", _MAX_PARALLEL_REQUESTS),
     ):
-        _receipt_positive_integer(value.get(name), f"gateway policy {name}")
+        observed = _receipt_positive_integer(value.get(name), f"gateway policy {name}")
+        if observed > maximum:
+            raise ModelGatewayError(f"gateway policy {name} exceeds its supported maximum")
     reservation = value.get("input_token_reservation")
     if reservation != {
         "algorithm": "utf8_body_bytes_plus_fixed_overhead",
@@ -1368,22 +1439,23 @@ def _validate_request_receipt(
         prices = policy.get("pricing_usd_per_million_tokens")
         if not isinstance(prices, Mapping):
             raise ModelGatewayError("model request pricing is unavailable")
-        expected_reserved = _token_cost(
-            input_upper, _decimal(prices["input_per_million"], "input price")
-        ) + _token_cost(output_cap, _decimal(prices["output_per_million"], "output price"))
-        expected_actual = (
+        expected_reserved = _add_money(
+            _token_cost(input_upper, _decimal(prices["input_per_million"], "input price")),
+            _token_cost(output_cap, _decimal(prices["output_per_million"], "output price")),
+        )
+        expected_actual = _add_money(
             _token_cost(
                 input_tokens - cached_tokens,
                 _decimal(prices["input_per_million"], "input price"),
-            )
-            + _token_cost(
+            ),
+            _token_cost(
                 cached_tokens,
                 _decimal(prices["cached_input_per_million"], "cached-input price"),
-            )
-            + _token_cost(
+            ),
+            _token_cost(
                 output_tokens,
                 _decimal(prices["output_per_million"], "output price"),
-            )
+            ),
         )
         if value.get("reserved_cost_usd") != _money(expected_reserved):
             raise ModelGatewayError("model request reservation cost is inconsistent")
@@ -1442,9 +1514,10 @@ def _validate_request_receipt(
         prices = policy.get("pricing_usd_per_million_tokens")
         if not isinstance(prices, Mapping):
             raise ModelGatewayError("model request pricing is unavailable")
-        reservation = _token_cost(
-            input_upper, _decimal(prices["input_per_million"], "input price")
-        ) + _token_cost(output_cap, _decimal(prices["output_per_million"], "output price"))
+        reservation = _add_money(
+            _token_cost(input_upper, _decimal(prices["input_per_million"], "input price")),
+            _token_cost(output_cap, _decimal(prices["output_per_million"], "output price")),
+        )
         if value.get("reserved_cost_usd") != _money(reservation):
             raise ModelGatewayError("failed model request reservation is inconsistent")
         if accounting == "provider_usage_out_of_bounds":
@@ -1473,19 +1546,19 @@ def _validate_request_receipt(
             )
             if cached_tokens > input_tokens:
                 raise ModelGatewayError("observed cached input exceeds observed input")
-            observed_cost = (
+            observed_cost = _add_money(
                 _token_cost(
                     input_tokens - cached_tokens,
                     _decimal(prices["input_per_million"], "input price"),
-                )
-                + _token_cost(
+                ),
+                _token_cost(
                     cached_tokens,
                     _decimal(prices["cached_input_per_million"], "cached-input price"),
-                )
-                + _token_cost(
+                ),
+                _token_cost(
                     output_tokens,
                     _decimal(prices["output_per_million"], "output price"),
-                )
+                ),
             )
             if value.get("observed_usage_cost_usd") != _money(observed_cost):
                 raise ModelGatewayError("observed model usage cost is inconsistent")
@@ -1549,7 +1622,7 @@ def _receipt_timestamp(value: object, label: str) -> str:
 
 
 def _receipt_nonnegative_integer(value: object, label: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= (1 << 63) - 1:
         raise ModelGatewayError(f"{label} is invalid")
     return value
 
@@ -1567,7 +1640,7 @@ def _receipt_money(
     *,
     allow_zero: bool = False,
 ) -> str:
-    if not isinstance(value, str | float | int | Decimal) or isinstance(value, bool):
+    if not isinstance(value, str | int | Decimal) or isinstance(value, bool):
         raise ModelGatewayError(f"{label} is invalid")
     try:
         parsed = _decimal(value, label)
@@ -1693,29 +1766,93 @@ def _safe_content_type(value: str) -> str:
     return value[:200]
 
 
-def _decimal(value: float | str | Decimal, label: str) -> Decimal:
-    if isinstance(value, bool):
+def _decimal(value: int | str | Decimal, label: str) -> Decimal:
+    if isinstance(value, bool) or isinstance(value, float):
         raise ValueError(f"{label} is invalid")
     try:
         result = Decimal(str(value))
     except Exception as exc:  # noqa: BLE001 - normalized into a public validation error.
         raise ValueError(f"{label} is invalid") from exc
-    if not result.is_finite() or result < 0:
-        raise ValueError(f"{label} is invalid")
+    _input_money(result, label)
     return result
 
 
+def _input_money(value: Decimal, label: str) -> str:
+    if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
+        raise ValueError(f"{label} is invalid")
+    try:
+        return _format_money(
+            value,
+            maximum_text_chars=_MAX_INPUT_MONEY_TEXT_CHARS,
+            maximum_adjusted_exponent=_MAX_INPUT_MONEY_ADJUSTED_EXPONENT,
+        )
+    except ValueError as exc:
+        raise ValueError(f"{label} is invalid") from exc
+
+
 def _token_cost(tokens: int, price_per_million: Decimal) -> Decimal:
-    if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+    if isinstance(tokens, bool) or not isinstance(tokens, int) or not 0 <= tokens <= (1 << 63) - 1:
         raise ValueError("token count is invalid")
-    return Decimal(tokens) * price_per_million / _MILLION
+    with localcontext(_MONEY_CONTEXT):
+        return Decimal(tokens) * price_per_million / _MILLION
+
+
+def _add_money(*values: Decimal) -> Decimal:
+    with localcontext(_MONEY_CONTEXT):
+        total = _ZERO
+        for value in values:
+            total += value
+        return total
+
+
+def _subtract_money(value: Decimal, *subtrahends: Decimal) -> Decimal:
+    with localcontext(_MONEY_CONTEXT):
+        result = value
+        for subtrahend in subtrahends:
+            result -= subtrahend
+        return result
+
+
+def _affordable_output_tokens(
+    *,
+    available: Decimal,
+    input_reservation: Decimal,
+    output_price: Decimal,
+) -> int:
+    with localcontext(_MONEY_CONTEXT):
+        return int(
+            ((available - input_reservation) * _MILLION / output_price).to_integral_value(
+                rounding=ROUND_FLOOR
+            )
+        )
 
 
 def _money(value: Decimal) -> str:
+    return _format_money(
+        value,
+        maximum_text_chars=_MAX_EVIDENCE_MONEY_TEXT_CHARS,
+        maximum_adjusted_exponent=_MAX_EVIDENCE_MONEY_ADJUSTED_EXPONENT,
+    )
+
+
+def _format_money(
+    value: Decimal,
+    *,
+    maximum_text_chars: int,
+    maximum_adjusted_exponent: int,
+) -> str:
     if not value.is_finite():
         raise ValueError("non-finite cost cannot enter evidence")
-    text = format(value.normalize(), "f")
-    return "0" if text in {"-0", ""} else text
+    if value.is_zero():
+        return "0"
+    if abs(value.adjusted()) > maximum_adjusted_exponent:
+        raise ValueError("cost exponent is outside the supported range")
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    if len(text) > maximum_text_chars:
+        raise ValueError("cost is too long")
+    return "0" if text == "-0" else text
 
 
 def _canonical_json(value: object) -> bytes:

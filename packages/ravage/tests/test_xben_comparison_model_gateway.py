@@ -6,6 +6,7 @@ import json
 import socket
 import threading
 from dataclasses import dataclass, field
+from decimal import Decimal, localcontext
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -488,6 +489,60 @@ def test_out_of_bounds_provider_usage_charges_the_greater_observed_cost(
     )
 
 
+def test_largest_bounded_provider_usage_still_seals_terminal_cost_evidence(
+    tmp_path: Path,
+) -> None:
+    maximum_usage = (1 << 63) - 1
+    policy = ModelGatewayPolicy.build(
+        model=MODEL,
+        reasoning_effort=REASONING,
+        pricing=ModelPricing.from_numbers(
+            input_per_million="1e28",
+            cached_input_per_million="0",
+            output_per_million="1e28",
+        ),
+        campaign_max_cost_usd="1e28",
+        max_completion_tokens_per_request=100,
+        upstream_timeout_seconds=10,
+    )
+    gateway = ComparisonModelGateway(
+        policy=policy,
+        upstream_api_key="secret",
+        transport=FakeTransport(
+            [
+                _json_response(
+                    prompt_tokens=maximum_usage,
+                    completion_tokens=maximum_usage,
+                )
+            ]
+        ),
+    )
+    gateway.start()
+    token = gateway.register_row("primary-017", max_requests=1, max_cost_usd="1e28")
+    try:
+        status, body = _post(gateway, token, _request("maximum bounded usage"))
+    finally:
+        gateway.close()
+
+    assert status == 502
+    assert json.loads(body)["error"]["code"] == "upstream_accounting_invalid"
+    receipt = gateway.seal_row("primary-017", tmp_path / "maximum-usage.json")
+    record = receipt["records"][0]
+    assert record["status"] == "failed"
+    assert record["failure_code"] == "provider_usage_out_of_bounds"
+    assert Decimal(record["charged_cost_usd"]) > Decimal(receipt["limits"]["max_cost_usd"])
+    assert (
+        validate_model_gateway_receipt(
+            receipt,
+            expected_row_id="primary-017",
+            expected_policy_sha256=gateway.policy_digest,
+            expected_max_requests=1,
+            expected_max_cost_usd="1e28",
+        )
+        == receipt
+    )
+
+
 @pytest.mark.parametrize(
     ("framing_headers", "failure_code"),
     [
@@ -587,6 +642,22 @@ def test_receipt_is_create_only_and_row_cannot_be_registered_or_sealed_twice(
     assert receipt_path.is_file()
 
 
+def test_row_can_retry_sealing_to_a_fresh_path_after_output_collision(tmp_path: Path) -> None:
+    gateway = ComparisonModelGateway(
+        policy=_policy(), upstream_api_key="secret", transport=FakeTransport([])
+    )
+    gateway.register_row("primary-018", max_requests=1, max_cost_usd="0.05")
+    occupied_path = tmp_path / "occupied.json"
+    occupied_path.write_text("keep me", encoding="utf-8")
+
+    with pytest.raises(RowSealError, match="refusing to replace"):
+        gateway.seal_row("primary-018", occupied_path)
+
+    receipt = gateway.seal_row("primary-018", tmp_path / "retry.json")
+    assert receipt["valid"] is True
+    assert occupied_path.read_text(encoding="utf-8") == "keep me"
+
+
 @pytest.mark.parametrize(
     ("row_id", "max_requests"),
     [
@@ -631,6 +702,152 @@ def test_gateway_rejects_overlong_reasoning_effort() -> None:
             ),
             campaign_max_cost_usd="1",
         )
+
+
+def test_gateway_rejects_inexact_float_money_inputs() -> None:
+    with pytest.raises(ValueError, match="invalid"):
+        ModelPricing.from_numbers(
+            input_per_million=0.1,  # type: ignore[arg-type]
+            cached_input_per_million="0.01",
+            output_per_million="1",
+        )
+    with pytest.raises(ValueError, match="invalid"):
+        ModelGatewayPolicy.build(
+            model=MODEL,
+            reasoning_effort=REASONING,
+            pricing=ModelPricing.from_numbers(
+                input_per_million="0.1",
+                cached_input_per_million="0.01",
+                output_per_million="1",
+            ),
+            campaign_max_cost_usd=0.1,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    ("pricing", "campaign_cost"),
+    [
+        (
+            ModelPricing(
+                input_per_million=Decimal("1e64"),
+                cached_input_per_million=Decimal("0"),
+                output_per_million=Decimal("1"),
+            ),
+            Decimal("10"),
+        ),
+        (
+            ModelPricing(
+                input_per_million=Decimal("1"),
+                cached_input_per_million=Decimal("0"),
+                output_per_million=Decimal("1"),
+            ),
+            Decimal("1e64"),
+        ),
+    ],
+)
+def test_gateway_rejects_direct_policy_money_outside_supported_bounds(
+    pricing: ModelPricing,
+    campaign_cost: Decimal,
+) -> None:
+    policy = ModelGatewayPolicy(
+        model=MODEL,
+        reasoning_effort=REASONING,
+        pricing=pricing,
+        campaign_max_cost_usd=campaign_cost,
+    )
+
+    with pytest.raises(ValueError, match="invalid"):
+        ComparisonModelGateway(
+            policy=policy,
+            upstream_api_key="secret",
+            transport=FakeTransport([]),
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("max_completion_tokens_per_request", 1_000_001),
+        ("max_request_body_bytes", 64 * 1024 * 1024 + 1),
+        ("max_upstream_response_bytes", 256 * 1024 * 1024 + 1),
+        ("upstream_timeout_seconds", 3601),
+        ("max_parallel_requests", 257),
+    ],
+)
+def test_gateway_policy_rejects_unbounded_integer_controls(name: str, value: int) -> None:
+    values = {
+        "max_completion_tokens_per_request": 100,
+        "max_request_body_bytes": 1024,
+        "max_upstream_response_bytes": 1024,
+        "upstream_timeout_seconds": 10,
+        "max_parallel_requests": 2,
+    }
+    values[name] = value
+    with pytest.raises(ValueError, match="no greater than"):
+        ModelGatewayPolicy.build(
+            model=MODEL,
+            reasoning_effort=REASONING,
+            pricing=ModelPricing.from_numbers(
+                input_per_million="0.1",
+                cached_input_per_million="0.01",
+                output_per_million="1",
+            ),
+            campaign_max_cost_usd="10",
+            **values,
+        )
+
+
+def test_gateway_money_evidence_is_independent_of_ambient_decimal_precision(
+    tmp_path: Path,
+) -> None:
+    def run(precision: int, row_id: str) -> tuple[object, ...]:
+        with localcontext() as context:
+            context.prec = precision
+            policy = ModelGatewayPolicy.build(
+                model=MODEL,
+                reasoning_effort=REASONING,
+                pricing=ModelPricing.from_numbers(
+                    input_per_million=Decimal("0.123456789012345678901234567890123456789"),
+                    cached_input_per_million=Decimal("0.0123456789012345678901234567890123456789"),
+                    output_per_million=Decimal("1.23456789012345678901234567890123456789"),
+                ),
+                campaign_max_cost_usd=Decimal("10.0000000000000000000000000000000000001"),
+                max_completion_tokens_per_request=100,
+                upstream_timeout_seconds=10,
+            )
+            gateway = ComparisonModelGateway(
+                policy=policy,
+                upstream_api_key="secret",
+                transport=FakeTransport(
+                    [_json_response(prompt_tokens=120, cached_tokens=20, completion_tokens=30)]
+                ),
+            )
+            gateway.start()
+            token = gateway.register_row(
+                row_id,
+                max_requests=1,
+                max_cost_usd=Decimal("1.00000000000000000000000000000000000001"),
+            )
+            try:
+                assert _post(gateway, token, _request("precision"))[0] == 200
+            finally:
+                gateway.close()
+            receipt = gateway.seal_row(row_id, tmp_path / f"{row_id}.json")
+            record = receipt["records"][0]
+            return (
+                policy.to_json(),
+                gateway.policy_digest,
+                receipt["limits"]["max_cost_usd"],
+                receipt["totals"]["charged_cost_usd"],
+                receipt["totals"]["known_actual_cost_usd"],
+                record["reserved_cost_usd"],
+                record["actual_cost_usd"],
+            )
+
+    low_precision = run(6, "primary-020")
+    high_precision = run(80, "primary-021")
+
+    assert low_precision == high_precision
 
 
 def _policy(
