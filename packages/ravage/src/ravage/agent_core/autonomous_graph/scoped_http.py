@@ -37,6 +37,10 @@ from uuid import uuid4
 
 from ravage.agent_core.action_executor import ActionResult
 from ravage.agent_core.autonomous_graph.action_bridge import ActionExecution
+from ravage.agent_core.autonomous_graph.effort_policy import (
+    GRAPH_ROUTE_TARGET_REQUEST_LIMIT,
+    GRAPH_TARGET_REQUEST_LIMIT_ARGUMENT,
+)
 from ravage.agent_core.autonomous_graph.operational_profile import (
     GraphOperationalProfile,
 )
@@ -754,6 +758,22 @@ class _RequestGate:
             return self._request_count
 
 
+@dataclass
+class _ActionRequestBudget:
+    """Cap physical dispatches made by one investigation action."""
+
+    limit: int | None
+    used: int = 0
+
+    def require_available(self) -> None:
+        if self.limit is not None and self.used >= self.limit:
+            raise ScopedHttpError("authorized target-request grant exhausted")
+
+    def commit(self) -> None:
+        self.require_available()
+        self.used += 1
+
+
 class ScopedGraphHttpExecutor:
     """
     Execute one structured HTTP action under brief scope and low-noise controls.
@@ -945,6 +965,7 @@ class ScopedGraphHttpExecutor:
         _deadline_monotonic: float | None,
     ) -> ActionExecution:
         _remaining_deadline(_deadline_monotonic, clock=self._clock)
+        action_budget = _action_request_budget(arguments)
         authored_proofs = _request_authored_proofs(arguments)
         method, url, headers, body, timeout = _request_from_arguments(
             arguments,
@@ -974,6 +995,7 @@ class ScopedGraphHttpExecutor:
                     lambda method, request_url: self._account_managed_request(
                         method,
                         request_url,
+                        action_budget=action_budget,
                         _deadline_monotonic=_deadline_monotonic,
                     ),
                 )
@@ -1010,6 +1032,7 @@ class ScopedGraphHttpExecutor:
                             body=body,
                             timeout=timeout,
                             attempt_index=attempt_index,
+                            action_budget=action_budget,
                             _deadline_monotonic=_deadline_monotonic,
                         )
                     except BaseException as exc:
@@ -1168,6 +1191,11 @@ class ScopedGraphHttpExecutor:
                 "error": response.error,
             },
         }
+        if action_budget.limit is not None:
+            observation_payload["graph_target_request_budget"] = {
+                "limit": action_budget.limit,
+                "used": action_budget.used,
+            }
         if source_informed:
             observation_payload["source_informed"] = True
         evidence_observation = json.dumps(
@@ -1225,6 +1253,7 @@ class ScopedGraphHttpExecutor:
         body: bytes | None,
         timeout: float,
         attempt_index: int,
+        action_budget: _ActionRequestBudget,
         _deadline_monotonic: float | None,
     ) -> _ScopedDispatch:
         self._managed_request_acquisitions.clear()
@@ -1251,11 +1280,14 @@ class ScopedGraphHttpExecutor:
                 body=body,
                 timeout=timeout,
                 attempt_index=attempt_index,
+                action_budget=action_budget,
                 _deadline_monotonic=_deadline_monotonic,
             )
+        action_budget.require_available()
         sequence, delay = self._gate.acquire(
             _deadline_monotonic=_deadline_monotonic,
         )
+        action_budget.commit()
         request_timeout = _deadline_bounded_timeout(
             timeout,
             _deadline_monotonic,
@@ -1275,6 +1307,7 @@ class ScopedGraphHttpExecutor:
         body: bytes | None,
         timeout: float,
         attempt_index: int,
+        action_budget: _ActionRequestBudget,
         _deadline_monotonic: float | None,
     ) -> _ScopedDispatch:
         policy = self.traffic_policy
@@ -1333,6 +1366,7 @@ class ScopedGraphHttpExecutor:
             )
             raise
         try:
+            action_budget.require_available()
             if _deadline_monotonic is None:
                 policy_sequence = policy.begin_dispatch(lease)
             else:
@@ -1364,6 +1398,7 @@ class ScopedGraphHttpExecutor:
                 message="whole-run traffic policy could not cancel failed graph dispatch",
             )
             raise
+        action_budget.commit()
         try:
             request_timeout = _deadline_bounded_timeout(
                 timeout,
@@ -1429,9 +1464,11 @@ class ScopedGraphHttpExecutor:
         method: str,
         url: str,
         *,
+        action_budget: _ActionRequestBudget,
         _deadline_monotonic: float | None = None,
     ) -> Callable[[], None]:
         del method, url
+        action_budget.require_available()
         delay = self._gate.wait_until_available(
             _deadline_monotonic=_deadline_monotonic,
         )
@@ -1443,6 +1480,7 @@ class ScopedGraphHttpExecutor:
                 return
             committed = True
             sequence, _ = self._gate.acquire(pace=False)
+            action_budget.commit()
             self._managed_request_acquisitions.append((sequence, delay))
 
         return commit
@@ -1810,6 +1848,17 @@ def _request_from_arguments(
     if not 0 < timeout <= _MAX_TIMEOUT_SECONDS:
         raise ScopedHttpError("http_request timeout_seconds must be between 0 and 30")
     return method, url, headers, body, timeout
+
+
+def _action_request_budget(arguments: Mapping[str, object]) -> _ActionRequestBudget:
+    raw_limit = arguments.get(GRAPH_TARGET_REQUEST_LIMIT_ARGUMENT)
+    if raw_limit is None:
+        return _ActionRequestBudget(limit=None)
+    if isinstance(raw_limit, bool) or not isinstance(raw_limit, int):
+        raise ScopedHttpError("authorized target-request grant is invalid")
+    if not 1 <= raw_limit <= GRAPH_ROUTE_TARGET_REQUEST_LIMIT:
+        raise ScopedHttpError("authorized target-request grant is out of range")
+    return _ActionRequestBudget(limit=raw_limit)
 
 
 def _request_headers(  # noqa: C901 - validates each header trust boundary.

@@ -738,6 +738,11 @@ class GraphWorker:
             )
             raise
         try:
+            investigation_hypothesis_path = (
+                _node_hypothesis_path(self.coordinator.state.nodes, node_id)
+                if ticket is not None and self.investigation_engine is not None
+                else ()
+            )
             self.assert_owned("scheduler_action_registration")
             registered_fingerprint = await self.scheduler.register_action(node_id, action)
             _assert_matching_action_fingerprint(
@@ -774,7 +779,7 @@ class GraphWorker:
                 )
             raise
         execution_arguments = dict(arguments)
-        if ticket is not None and tool == "run_probe":
+        if ticket is not None and tool in {"http_request", "run_probe"}:
             execution_arguments[GRAPH_TARGET_REQUEST_LIMIT_ARGUMENT] = (
                 ticket.effort.target_request_limit
             )
@@ -964,7 +969,11 @@ class GraphWorker:
                 )
             if ticket is not None and self.investigation_engine is not None:
                 await asyncio.to_thread(
-                    self.investigation_engine.cancel_action,
+                    (
+                        self.investigation_engine.cancel_action
+                        if result is None
+                        else self.investigation_engine.record_discarded_execution
+                    ),
                     ticket,
                 )
             group = self.coordinator.state.race_group_for(node_id)
@@ -998,7 +1007,7 @@ class GraphWorker:
         if self.coordinator.state.status is not GraphStatus.RUNNING:
             if ticket is not None and self.investigation_engine is not None:
                 await asyncio.to_thread(
-                    self.investigation_engine.cancel_action,
+                    self.investigation_engine.record_discarded_execution,
                     ticket,
                 )
             terminal_result = self._result(
@@ -1038,6 +1047,7 @@ class GraphWorker:
                 agent_spec=self.coordinator.state.nodes[node_id].agent_spec,
                 evidence_epoch=self.coordinator.state.evidence_epoch,
                 progress_batch=progress_batch,
+                hypothesis_path=investigation_hypothesis_path,
             )
             await self._append_feedback(
                 node_id,
@@ -1952,6 +1962,33 @@ def _validate_routed_counterfactual(result: GraphToolResult) -> bool:
         message = "routing directive does not match its counterfactual objective"
         raise GraphProtocolError(message)
     return True
+
+
+def _node_hypothesis_path(
+    nodes: Mapping[str, GraphNode],
+    node_id: str,
+) -> tuple[str, ...]:
+    """Return a deterministic leaf-to-root hypothesis path from graph-owned state."""
+    path: list[str] = []
+    seen_nodes: set[str] = set()
+    seen_hypotheses: set[str] = set()
+    current_id: str | None = node_id
+    while current_id is not None:
+        if current_id in seen_nodes:
+            message = "graph node ancestry contains a cycle"
+            raise GraphProtocolError(message)
+        seen_nodes.add(current_id)
+        current = nodes.get(current_id)
+        if current is None:
+            message = "graph node ancestry references a missing parent"
+            raise GraphProtocolError(message)
+        if current.hypothesis is not None:
+            fingerprint = current.hypothesis.fingerprint
+            if fingerprint not in seen_hypotheses:
+                seen_hypotheses.add(fingerprint)
+                path.append(fingerprint)
+        current_id = current.parent_id
+    return tuple(path)
 
 
 def _validated_tool_result(value: object) -> GraphToolResult:

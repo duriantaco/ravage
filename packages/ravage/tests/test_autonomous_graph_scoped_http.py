@@ -13,6 +13,9 @@ from urllib.parse import quote
 import pytest
 from pentest_schemas import Scope
 from ravage.agent_core.autonomous_graph import scoped_http
+from ravage.agent_core.autonomous_graph.effort_policy import (
+    GRAPH_TARGET_REQUEST_LIMIT_ARGUMENT,
+)
 from ravage.agent_core.autonomous_graph.operational_profile import (
     GraphOperationalProfileName,
     graph_operational_profile,
@@ -1379,6 +1382,46 @@ def test_scoped_redirect_is_counted_and_sensitive_headers_do_not_cross_origin() 
     assert len(payload["requests"]) == 2
     assert clock.sleeps
     assert clock.sleeps[0] >= 1.15
+
+
+def test_investigation_grant_stops_redirect_before_second_physical_request() -> None:
+    transport = QueuedTransport(
+        [
+            _response(status=302, headers={"Location": "/app/final"}),
+            _response(url=f"{TARGET_URL}/final"),
+        ]
+    )
+    executor = _executor(transport)
+
+    with pytest.raises(ScopedHttpError, match="target-request grant exhausted"):
+        executor(
+            node_id="node-budgeted",
+            arguments={
+                "path": "/app/start",
+                GRAPH_TARGET_REQUEST_LIMIT_ARGUMENT: 1,
+            },
+            action_id="action-budgeted",
+        )
+
+    assert len(transport.calls) == 1
+    assert executor.request_count == 1
+
+
+def test_investigation_http_result_receipts_its_physical_request_count() -> None:
+    transport = QueuedTransport([_response(body=b"bounded")])
+    executor = _executor(transport)
+
+    execution = executor(
+        node_id="node-budgeted",
+        arguments={
+            "path": "/app/status",
+            GRAPH_TARGET_REQUEST_LIMIT_ARGUMENT: 3,
+        },
+        action_id="action-budgeted",
+    )
+
+    payload = json.loads(execution.result.evidence_observation)
+    assert payload["graph_target_request_budget"] == {"limit": 3, "used": 1}
 
 
 def test_transport_timeout_is_rebounded_after_deadline_aware_pacing() -> None:
