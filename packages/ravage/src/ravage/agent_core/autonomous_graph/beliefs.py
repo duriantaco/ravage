@@ -265,6 +265,18 @@ class BeliefLedgerState:
                 raise BeliefLedgerError("belief chain head does not reference its latest revision")
 
 
+@dataclass(frozen=True)
+class PreparedBeliefRevision:
+    """Fully validated belief transition awaiting one compare-and-swap commit."""
+
+    expected_state_digest: str
+    prepared_state_digest: str
+    previous_state: BeliefLedgerState
+    state: BeliefLedgerState
+    revision: BeliefRevision | None
+    changed: bool
+
+
 class BeliefLedger:
     """Append-only belief history with evidence validation at the commit boundary."""
 
@@ -336,6 +348,132 @@ class BeliefLedger:
             evidence_epoch=evidence_epoch,
         )
 
+    def prepare_from_validated_batch(
+        self,
+        *,
+        hypothesis: Hypothesis,
+        agent_spec: AgentSpec,
+        batch: ValidatedProgressBatch,
+        evidence_epoch: int,
+        producer_node_id: str | None = None,
+    ) -> PreparedBeliefRevision:
+        """Validate and build one belief transition without mutating durable state."""
+        _require_canonical_batch(batch)
+        if batch.classification is ProgressBatchClass.PIVOT:
+            with self._lock:
+                state = copy.deepcopy(self.state)
+                state_digest = _digest_json(state.to_json())
+                return PreparedBeliefRevision(
+                    expected_state_digest=state_digest,
+                    prepared_state_digest=state_digest,
+                    previous_state=copy.deepcopy(state),
+                    state=state,
+                    revision=None,
+                    changed=False,
+                )
+        subject_node_id = batch.binding.node_id if producer_node_id is None else producer_node_id
+        _require_subject_binding(
+            batch.binding,
+            hypothesis=hypothesis,
+            agent_spec=agent_spec,
+            producer_node_id=subject_node_id,
+        )
+        disposition = _disposition_for_batch(batch)
+        with self._lock:
+            expected_state_digest = _digest_json(self.state.to_json())
+            next_state = copy.deepcopy(self.state)
+            previous_id = next_state.heads.get(hypothesis.fingerprint)
+            previous = (
+                next_state.revisions[previous_id] if previous_id is not None else None
+            )
+            revision: BeliefRevision | None = None
+            changed = False
+            if disposition is not None:
+                refs = _strings(batch.evidence_refs)
+                tokens = _strings(batch.progress_tokens)
+                terminal_support = bool(
+                    previous is not None
+                    and disposition is BeliefDisposition.SUPPORTED
+                    and previous.disposition
+                    in {
+                        BeliefDisposition.CONFIRMED,
+                        BeliefDisposition.DISPROVED,
+                    }
+                )
+                duplicate = bool(
+                    previous is not None
+                    and previous.disposition is disposition
+                    and previous.evidence_refs == refs
+                    and previous.receipt_tokens == tokens
+                )
+                if terminal_support or duplicate:
+                    revision = previous
+                else:
+                    if len(next_state.order) >= _MAX_REVISIONS:
+                        raise BeliefLedgerError(
+                            "belief ledger capacity reached; archive the immutable ledger "
+                            "before accepting more revisions"
+                        )
+                    revision = BeliefRevision.create(
+                        hypothesis_fingerprint=hypothesis.fingerprint,
+                        agent_spec_fingerprint=agent_spec.fingerprint,
+                        sequence=(previous.sequence + 1 if previous is not None else 1),
+                        previous_revision_id=(
+                            previous.revision_id if previous is not None else ""
+                        ),
+                        disposition=disposition,
+                        evidence_refs=refs,
+                        receipt_tokens=tokens,
+                        producer_node_id=batch.binding.node_id,
+                        evidence_epoch=evidence_epoch,
+                    )
+                    next_state.revisions[revision.revision_id] = revision
+                    next_state.order.append(revision.revision_id)
+                    next_state.heads[hypothesis.fingerprint] = revision.revision_id
+                    changed = True
+            next_state.validate_chains()
+            return PreparedBeliefRevision(
+                expected_state_digest=expected_state_digest,
+                prepared_state_digest=_digest_json(next_state.to_json()),
+                previous_state=copy.deepcopy(self.state),
+                state=next_state,
+                revision=copy.deepcopy(revision),
+                changed=changed,
+            )
+
+    def commit_prepared(
+        self,
+        prepared: PreparedBeliefRevision,
+    ) -> BeliefRevision | None:
+        """Commit a prepared belief transition iff the ledger has not changed."""
+        if not isinstance(prepared, PreparedBeliefRevision):
+            raise BeliefLedgerError("belief revision plan is invalid")
+        with self._lock:
+            if _digest_json(self.state.to_json()) != prepared.expected_state_digest:
+                raise BeliefLedgerError("belief revision plan is stale")
+            if _digest_json(prepared.state.to_json()) != prepared.prepared_state_digest:
+                raise BeliefLedgerError("belief revision plan was modified")
+            if prepared.changed:
+                next_state = copy.deepcopy(prepared.state)
+                self._persist_state(next_state)
+                self.state = next_state
+            return copy.deepcopy(prepared.revision)
+
+    def revert_prepared(self, prepared: PreparedBeliefRevision) -> None:
+        """Roll back only the still-current half of an aborted cross-ledger commit."""
+        if not isinstance(prepared, PreparedBeliefRevision):
+            raise BeliefLedgerError("belief revision plan is invalid")
+        if not prepared.changed:
+            return
+        with self._lock:
+            if _digest_json(self.state.to_json()) != prepared.prepared_state_digest:
+                raise BeliefLedgerError("committed belief revision is no longer current")
+            if _digest_json(prepared.previous_state.to_json()) != prepared.expected_state_digest:
+                raise BeliefLedgerError("belief rollback state was modified")
+            previous_state = copy.deepcopy(prepared.previous_state)
+            self._persist_state(previous_state)
+            self.state = previous_state
+
     def record_from_validated_batch(
         self,
         *,
@@ -346,61 +484,14 @@ class BeliefLedger:
         producer_node_id: str | None = None,
     ) -> BeliefRevision | None:
         """Commit one canonical progress batch bound to the supplied belief subject."""
-        _require_canonical_batch(batch)
-        if batch.classification is ProgressBatchClass.PIVOT:
-            return None
-        subject_node_id = batch.binding.node_id if producer_node_id is None else producer_node_id
-        _require_subject_binding(
-            batch.binding,
+        prepared = self.prepare_from_validated_batch(
             hypothesis=hypothesis,
             agent_spec=agent_spec,
-            producer_node_id=subject_node_id,
+            batch=batch,
+            evidence_epoch=evidence_epoch,
+            producer_node_id=producer_node_id,
         )
-        disposition = _disposition_for_batch(batch)
-        if disposition is None:
-            return None
-        with self._lock:
-            previous = self.head(hypothesis.fingerprint)
-            if (
-                previous is not None
-                and disposition is BeliefDisposition.SUPPORTED
-                and previous.disposition
-                in {
-                    BeliefDisposition.CONFIRMED,
-                    BeliefDisposition.DISPROVED,
-                }
-            ):
-                return previous
-            refs = _strings(batch.evidence_refs)
-            tokens = _strings(batch.progress_tokens)
-            if (
-                previous is not None
-                and previous.disposition is disposition
-                and previous.evidence_refs == refs
-                and previous.receipt_tokens == tokens
-            ):
-                return previous
-            if len(self.state.order) >= _MAX_REVISIONS:
-                raise BeliefLedgerError(
-                    "belief ledger capacity reached; archive the immutable ledger "
-                    "before accepting more revisions"
-                )
-            revision = BeliefRevision.create(
-                hypothesis_fingerprint=hypothesis.fingerprint,
-                agent_spec_fingerprint=agent_spec.fingerprint,
-                sequence=(previous.sequence + 1 if previous is not None else 1),
-                previous_revision_id=(previous.revision_id if previous is not None else ""),
-                disposition=disposition,
-                evidence_refs=refs,
-                receipt_tokens=tokens,
-                producer_node_id=batch.binding.node_id,
-                evidence_epoch=evidence_epoch,
-            )
-            self.state.revisions[revision.revision_id] = revision
-            self.state.order.append(revision.revision_id)
-            self.state.heads[hypothesis.fingerprint] = revision.revision_id
-            self._persist()
-            return copy.deepcopy(revision)
+        return self.commit_prepared(prepared)
 
     def _compatibility_binding(
         self,
@@ -458,11 +549,14 @@ class BeliefLedger:
             return copy.deepcopy(self.state)
 
     def _persist(self) -> None:
-        self.state.validate_chains()
+        self._persist_state(self.state)
+
+    def _persist_state(self, state: BeliefLedgerState) -> None:
+        state.validate_chains()
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.state_path.with_name(f".{self.state_path.name}.{os.getpid()}.tmp")
         temporary.write_text(
-            json.dumps(self.state.to_json(), indent=2, sort_keys=True) + "\n",
+            json.dumps(state.to_json(), indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
         temporary.replace(self.state_path)
@@ -566,4 +660,5 @@ __all__ = [
     "BeliefLedgerError",
     "BeliefLedgerState",
     "BeliefRevision",
+    "PreparedBeliefRevision",
 ]

@@ -32,6 +32,7 @@ def test_autonomous_route_writes_one_final_report_after_route_findings(
 
     def fake_route(**kwargs: object) -> object:
         phases.append("route")
+        assert kwargs["planner_mode"] is cli.InvestigationPlannerMode.LEGACY
         settings = kwargs["settings"]
         assert isinstance(settings, cli.AIWebAgentSettings)
         assert settings.report_agent is False

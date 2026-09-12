@@ -13,6 +13,12 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from ravage.agent_core.autonomous_graph.branch_search import (
+    BranchOutcomeIndex,
+    BranchSearchError,
+    seal_planner_feedback_attempt,
+)
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -20,10 +26,18 @@ if TYPE_CHECKING:
 
 _STATE_VERSION = 1
 _MAX_ATTEMPTS = 500
+_MAX_STATE_BYTES = 16 * 1024 * 1024
+_MAX_CELLS = 2_048
+_MAX_RESERVATIONS = 256
+_MAX_ROUTE_TARGET_REQUESTS = 96
 
 
 class InvestigationCoverageError(RuntimeError):
     """Raised when durable investigation coverage cannot preserve its invariants."""
+
+
+class PlannerFeedbackError(InvestigationCoverageError):
+    """Raised before mutation when optional planner feedback cannot be sealed."""
 
 
 class CoverageStage(StrEnum):
@@ -258,6 +272,7 @@ class CoverageLedgerState:
     reservations: dict[str, CampaignReservation] = field(default_factory=dict)
     attempts: list[dict[str, object]] = field(default_factory=list)
     total_target_requests: int = 0
+    pessimistic_target_request_charges: int = 0
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -269,16 +284,24 @@ class CoverageLedgerState:
             },
             "attempts": copy.deepcopy(self.attempts),
             "total_target_requests": self.total_target_requests,
+            "pessimistic_target_request_charges": (
+                self.pessimistic_target_request_charges
+            ),
         }
 
     @classmethod
-    def from_json(cls, payload: Mapping[str, object]) -> CoverageLedgerState:
+    def from_json(
+        cls,
+        payload: Mapping[str, object],
+    ) -> CoverageLedgerState:
         if payload.get("version") != _STATE_VERSION:
             raise InvestigationCoverageError("unsupported investigation coverage version")
         raw_cells = payload.get("cells")
         raw_reservations = payload.get("reservations", {})
         if not isinstance(raw_cells, Mapping) or not isinstance(raw_reservations, Mapping):
             raise InvestigationCoverageError("coverage cells and reservations must be objects")
+        if len(raw_cells) > _MAX_CELLS or len(raw_reservations) > _MAX_RESERVATIONS:
+            raise InvestigationCoverageError("coverage state exceeds its object-count limit")
         cells: dict[str, CoverageCellState] = {}
         for cell_id, raw_state in raw_cells.items():
             if not isinstance(raw_state, Mapping):
@@ -300,12 +323,38 @@ class CoverageLedgerState:
             isinstance(attempt, Mapping) for attempt in attempts
         ):
             raise InvestigationCoverageError("coverage attempts must be a list of objects")
-        return cls(
+        if len(attempts) > _MAX_ATTEMPTS:
+            raise InvestigationCoverageError("coverage attempts exceed their history limit")
+        state = cls(
             cells=cells,
             reservations=reservations,
-            attempts=[dict(attempt) for attempt in attempts[-_MAX_ATTEMPTS:]],
+            attempts=[dict(attempt) for attempt in attempts],
             total_target_requests=_non_negative_int(payload, "total_target_requests"),
+            pessimistic_target_request_charges=_non_negative_int(
+                payload,
+                "pessimistic_target_request_charges",
+            ),
         )
+        if (
+            state.total_target_requests + state.pessimistic_target_request_charges
+            > _MAX_ROUTE_TARGET_REQUESTS
+        ):
+            raise InvestigationCoverageError(
+                "coverage target-request charges exceed the route bound"
+            )
+        return state
+
+
+@dataclass(frozen=True)
+class PreparedCoverageCompletion:
+    """Fully validated coverage transition awaiting one compare-and-swap commit."""
+
+    reservation_id: str
+    route_key: str
+    cell_id: str
+    expected_state_digest: str
+    prepared_state_digest: str
+    state: CoverageLedgerState
 
 
 class InvestigationCoverageLedger:
@@ -319,6 +368,10 @@ class InvestigationCoverageLedger:
     @classmethod
     def open(cls, state_path: Path) -> InvestigationCoverageLedger:
         if state_path.exists():
+            if state_path.stat().st_size > _MAX_STATE_BYTES:
+                raise InvestigationCoverageError(
+                    "investigation coverage exceeds its file-size limit"
+                )
             try:
                 raw = json.loads(state_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
@@ -346,13 +399,18 @@ class InvestigationCoverageLedger:
         with self._lock:
             current = self.state.cells.get(cell.cell_id)
             if current is None:
+                next_state = copy.deepcopy(self.state)
                 current = CoverageCellState(cell=cell, stage=initial_stage)
-                self.state.cells[cell.cell_id] = current
-                self._persist()
+                next_state.cells[cell.cell_id] = current
+                self._persist_state(next_state)
+                self.state = next_state
             elif _STAGE_RANK[initial_stage] > _STAGE_RANK[current.stage]:
+                next_state = copy.deepcopy(self.state)
+                current = next_state.cells[cell.cell_id]
                 current.stage = initial_stage
                 current.exhausted = False
-                self._persist()
+                self._persist_state(next_state)
+                self.state = next_state
             return copy.deepcopy(current)
 
     def cell_state(self, cell_id: str) -> CoverageCellState:
@@ -375,10 +433,11 @@ class InvestigationCoverageLedger:
         if not node_id.strip() or not normalized_strategy or not normalized_dimension:
             raise InvestigationCoverageError("campaign reservation fields are required")
         with self._lock:
-            current = self.state.cells.get(cell.cell_id)
+            next_state = copy.deepcopy(self.state)
+            current = next_state.cells.get(cell.cell_id)
             if current is None:
                 current = CoverageCellState(cell=cell)
-                self.state.cells[cell.cell_id] = current
+                next_state.cells[cell.cell_id] = current
             identity = {
                 "node_id": node_id,
                 "cell_id": cell.cell_id,
@@ -395,24 +454,61 @@ class InvestigationCoverageLedger:
                 dimension=normalized_dimension,
                 evidence_version=current.evidence_version,
             )
-            existing = self.state.reservations.get(reservation.route_key)
+            existing = next_state.reservations.get(reservation.route_key)
             if existing is not None:
                 raise InvestigationCoverageError(
                     "campaign route is already reserved by "
                     f"{existing.node_id}: {normalized_strategy}/{normalized_dimension}"
                 )
-            self.state.reservations[reservation.route_key] = reservation
-            self._persist()
+            next_state.reservations[reservation.route_key] = reservation
+            self._persist_state(next_state)
+            self.state = next_state
             return reservation
 
     def cancel(self, reservation: CampaignReservation) -> None:
         with self._lock:
             stored = self.state.reservations.get(reservation.route_key)
             if stored is not None and stored.reservation_id == reservation.reservation_id:
-                del self.state.reservations[reservation.route_key]
-                self._persist()
+                next_state = copy.deepcopy(self.state)
+                del next_state.reservations[reservation.route_key]
+                self._persist_state(next_state)
+                self.state = next_state
 
-    def complete(  # noqa: PLR0913 - explicit durable attempt result.
+    def charge_failed_reservation(
+        self,
+        reservation: CampaignReservation,
+        *,
+        authorized_grant: int,
+    ) -> None:
+        """Consume an uncertain post-execution grant without inventing observations."""
+
+        if (
+            isinstance(authorized_grant, bool)
+            or not isinstance(authorized_grant, int)
+            or not 1 <= authorized_grant <= _MAX_ROUTE_TARGET_REQUESTS
+        ):
+            raise InvestigationCoverageError("failed target-request grant is invalid")
+        with self._lock:
+            next_state = copy.deepcopy(self.state)
+            stored = next_state.reservations.get(reservation.route_key)
+            if stored is None or stored.reservation_id != reservation.reservation_id:
+                raise InvestigationCoverageError("campaign reservation is not active")
+            charged = (
+                next_state.total_target_requests
+                + next_state.pessimistic_target_request_charges
+                + authorized_grant
+            )
+            if charged > _MAX_ROUTE_TARGET_REQUESTS:
+                raise InvestigationCoverageError(
+                    "route target-request charge exceeds its durable bound"
+                )
+            del next_state.reservations[reservation.route_key]
+            next_state.pessimistic_target_request_charges += authorized_grant
+            canonical_state = CoverageLedgerState.from_json(next_state.to_json())
+            self._persist_state(canonical_state)
+            self.state = canonical_state
+
+    def prepare_completion(  # noqa: PLR0913, PLR0915 - explicit durable attempt result.
         self,
         reservation: CampaignReservation,
         *,
@@ -420,6 +516,16 @@ class InvestigationCoverageLedger:
         material_progress: bool,
         evidence_changed: bool,
         outcome: str,
+        planner_feedback_enabled: bool = False,
+        planner_cell_id: str = "",
+        planner_attempt_count_before: int = 0,
+        planner_evidence_refs_before: Sequence[str] = (),
+        planner_evidence_version_before: int = 0,
+        planner_no_progress_streak_before: int = 0,
+        planner_previous_feedback_digest: str = "",
+        planner_stage_before: CoverageStage = CoverageStage.OBSERVED,
+        planner_stage_after: CoverageStage = CoverageStage.OBSERVED,
+        planner_target_requests_before: int = 0,
         evidence_refs: Sequence[str] = (),
         target_requests: int = 0,
         hypothesis_fingerprint: str = "",
@@ -427,48 +533,163 @@ class InvestigationCoverageLedger:
         belief_revision_id: str = "",
         belief_disposition: str = "",
         executor_receipt_digest: str = "",
-    ) -> CoverageCellState:
+        progress_class: str = "empty",
+        progress_kinds: Sequence[str] = (),
+        validated_batch_digest: str = "",
+        hypothesis_path: Sequence[str] = (),
+        repeated_observation: bool = False,
+        planner_attributed: bool = False,
+        planner_state_attributed: bool = False,
+    ) -> PreparedCoverageCompletion:
         if target_requests < 0:
             raise InvestigationCoverageError("target request count cannot be negative")
+        if planner_feedback_enabled and target_requests > _MAX_ROUTE_TARGET_REQUESTS:
+            raise InvestigationCoverageError("target request count exceeds the route bound")
+        normalized_progress_class = _normalized_token(progress_class) or "empty"
+        if normalized_progress_class not in {
+            "empty",
+            "support",
+            "confirm",
+            "disprove",
+            "pivot",
+            "proof",
+        }:
+            raise InvestigationCoverageError("planner progress class is unsupported")
+        normalized_hypothesis = _normalized_text(hypothesis_fingerprint)
+        normalized_hypothesis_path = _clean_identity_path(hypothesis_path)
+        if not normalized_hypothesis_path and normalized_hypothesis:
+            normalized_hypothesis_path = (normalized_hypothesis,)
+        if normalized_hypothesis and normalized_hypothesis_path[0] != normalized_hypothesis:
+            raise InvestigationCoverageError(
+                "hypothesis path does not start at the attempt hypothesis"
+            )
+        normalized_progress_kinds = _clean_strings(progress_kinds)
+        normalized_batch_digest = validated_batch_digest.strip()
+        normalized_outcome = _normalized_text(outcome)
+        normalized_evidence_refs = _clean_strings(evidence_refs)
+        normalized_planner_evidence_refs_before = _clean_strings(
+            planner_evidence_refs_before
+        )
+        normalized_planner_evidence_refs_after = _clean_strings(
+            (*normalized_planner_evidence_refs_before, *normalized_evidence_refs)
+        )
         with self._lock:
-            stored = self.state.reservations.get(reservation.route_key)
+            expected_state_digest = _digest_json(self.state.to_json())
+            next_state = copy.deepcopy(self.state)
+            if (
+                next_state.total_target_requests
+                + next_state.pessimistic_target_request_charges
+                + target_requests
+                > _MAX_ROUTE_TARGET_REQUESTS
+            ):
+                raise InvestigationCoverageError(
+                    "route target request count exceeds its durable bound"
+                )
+            stored = next_state.reservations.get(reservation.route_key)
             if stored is None or stored.reservation_id != reservation.reservation_id:
                 raise InvestigationCoverageError("campaign reservation is not active")
-            current = self.state.cells.get(reservation.cell_id)
+            current = next_state.cells.get(reservation.cell_id)
             if current is None:
                 raise InvestigationCoverageError("campaign coverage cell disappeared")
-            current.attempt_count += 1
-            current.target_requests += target_requests
-            current.last_dimension = reservation.dimension
-            current.last_outcome = _normalized_text(outcome)
-            current.attempted_dimensions[f"{reservation.strategy}:{reservation.dimension}"] = (
-                reservation.evidence_version
+            merged_evidence_refs = _clean_strings(
+                (*current.evidence_refs, *normalized_evidence_refs)
             )
-            if _STAGE_RANK[stage] > _STAGE_RANK[current.stage]:
-                current.stage = stage
-            if evidence_changed:
-                current.evidence_version += 1
-            if material_progress:
-                current.no_progress_streak = 0
-                current.exhausted = False
+            stage_before = current.stage
+            stage_after = (
+                stage if _STAGE_RANK[stage] > _STAGE_RANK[current.stage] else current.stage
+            )
+            evidence_version_before = current.evidence_version
+            evidence_version_after = evidence_version_before + int(evidence_changed)
+            if planner_feedback_enabled:
+                try:
+                    feedback_attempt = seal_planner_feedback_attempt(
+                        {
+                            "reservation_id": reservation.reservation_id,
+                            "node_id": reservation.node_id,
+                            "cell_id": reservation.cell_id,
+                            "planner_cell_id": _normalized_text(planner_cell_id),
+                            "planner_attempt_count_before": planner_attempt_count_before,
+                            "planner_attempt_count_after": planner_attempt_count_before + 1,
+                            "planner_evidence_version_before": planner_evidence_version_before,
+                            "planner_evidence_version_after": (
+                                planner_evidence_version_before + int(evidence_changed)
+                            ),
+                            "planner_evidence_refs_before": list(
+                                normalized_planner_evidence_refs_before
+                            ),
+                            "planner_evidence_refs_after": list(
+                                normalized_planner_evidence_refs_after
+                            ),
+                            "planner_no_progress_streak_before": (
+                                planner_no_progress_streak_before
+                            ),
+                            "planner_no_progress_streak_after": (
+                                0
+                                if material_progress
+                                else planner_no_progress_streak_before + 1
+                            ),
+                            "planner_previous_feedback_digest": (
+                                planner_previous_feedback_digest
+                            ),
+                            "planner_stage_before": planner_stage_before.value,
+                            "planner_stage_after": planner_stage_after.value,
+                            "planner_target_requests_before": planner_target_requests_before,
+                            "planner_target_requests_after": (
+                                planner_target_requests_before + target_requests
+                            ),
+                            "strategy": reservation.strategy,
+                            "dimension": reservation.dimension,
+                            "reservation_evidence_version": reservation.evidence_version,
+                            "evidence_version_before": evidence_version_before,
+                            "evidence_version_after": evidence_version_after,
+                            "stage_before": stage_before.value,
+                            "stage": stage_after.value,
+                            "material_progress": material_progress,
+                            "evidence_changed": evidence_changed,
+                            "outcome": normalized_outcome,
+                            "progress_class": normalized_progress_class,
+                            "progress_kinds": list(normalized_progress_kinds),
+                            "planner_attributed": planner_attributed,
+                            "planner_state_attributed": planner_state_attributed,
+                            "validated_batch_digest": normalized_batch_digest,
+                            "hypothesis_path": list(normalized_hypothesis_path),
+                            "repeated_observation": repeated_observation,
+                            "evidence_refs": list(normalized_evidence_refs),
+                            "target_requests": target_requests,
+                            "hypothesis_fingerprint": normalized_hypothesis,
+                            "agent_spec_fingerprint": _normalized_text(agent_spec_fingerprint),
+                            "belief_revision_id": _normalized_text(belief_revision_id),
+                            "belief_disposition": _normalized_text(belief_disposition),
+                            "executor_receipt_digest": _normalized_text(
+                                executor_receipt_digest
+                            ),
+                        }
+                    )
+                except BranchSearchError as exc:
+                    raise PlannerFeedbackError(
+                        f"cannot persist planner feedback: {exc}"
+                    ) from exc
+                if planner_state_attributed and sum(
+                    attempt.get("planner_state_attributed") is True
+                    for attempt in next_state.attempts
+                ) >= _MAX_ATTEMPTS:
+                    raise PlannerFeedbackError(
+                        "cannot persist planner feedback: replay history is full"
+                    )
             else:
-                current.no_progress_streak += 1
-            current.evidence_refs = _clean_strings((*current.evidence_refs, *evidence_refs))
-            self.state.total_target_requests += target_requests
-            self.state.attempts.append(
-                {
+                feedback_attempt = {
                     "reservation_id": reservation.reservation_id,
                     "node_id": reservation.node_id,
                     "cell_id": reservation.cell_id,
                     "strategy": reservation.strategy,
                     "dimension": reservation.dimension,
                     "evidence_version_before": reservation.evidence_version,
-                    "evidence_version_after": current.evidence_version,
-                    "stage": current.stage.value,
+                    "evidence_version_after": evidence_version_after,
+                    "stage": stage_after.value,
                     "material_progress": material_progress,
                     "evidence_changed": evidence_changed,
-                    "outcome": current.last_outcome,
-                    "evidence_refs": list(_clean_strings(evidence_refs)),
+                    "outcome": normalized_outcome,
+                    "evidence_refs": list(normalized_evidence_refs),
                     "target_requests": target_requests,
                     "hypothesis_fingerprint": hypothesis_fingerprint.strip(),
                     "agent_spec_fingerprint": agent_spec_fingerprint.strip(),
@@ -476,19 +697,108 @@ class InvestigationCoverageLedger:
                     "belief_disposition": belief_disposition.strip(),
                     "executor_receipt_digest": executor_receipt_digest.strip(),
                 }
+            current.attempt_count += 1
+            current.target_requests += target_requests
+            current.last_dimension = reservation.dimension
+            current.last_outcome = normalized_outcome
+            current.attempted_dimensions[f"{reservation.strategy}:{reservation.dimension}"] = (
+                reservation.evidence_version
             )
-            del self.state.attempts[:-_MAX_ATTEMPTS]
-            del self.state.reservations[reservation.route_key]
-            self._persist()
+            current.stage = stage_after
+            current.evidence_version = evidence_version_after
+            if material_progress:
+                current.no_progress_streak = 0
+                current.exhausted = False
+            else:
+                current.no_progress_streak += 1
+            current.evidence_refs = merged_evidence_refs
+            next_state.total_target_requests += target_requests
+            next_state.attempts.append(feedback_attempt)
+            while len(next_state.attempts) > _MAX_ATTEMPTS:
+                removable = next(
+                    (
+                        index
+                        for index, attempt in enumerate(next_state.attempts)
+                        if attempt.get("planner_state_attributed") is not True
+                    ),
+                    None,
+                )
+                if removable is None:
+                    raise InvestigationCoverageError(
+                        "planner feedback history cannot discard a replay root"
+                    )
+                next_state.attempts.pop(removable)
+            del next_state.reservations[reservation.route_key]
+            if planner_feedback_enabled:
+                try:
+                    BranchOutcomeIndex.from_attempts(next_state.attempts)
+                except BranchSearchError as exc:
+                    raise PlannerFeedbackError(
+                        f"cannot persist planner feedback: {exc}"
+                    ) from exc
+            canonical_state = CoverageLedgerState.from_json(next_state.to_json())
+            prepared_state_digest = _digest_json(canonical_state.to_json())
+            encoded_size = len(
+                json.dumps(canonical_state.to_json(), ensure_ascii=False, sort_keys=True).encode()
+            )
+            if encoded_size > _MAX_STATE_BYTES:
+                raise InvestigationCoverageError(
+                    "investigation coverage exceeds its file-size limit"
+                )
+            return PreparedCoverageCompletion(
+                reservation_id=reservation.reservation_id,
+                route_key=reservation.route_key,
+                cell_id=reservation.cell_id,
+                expected_state_digest=expected_state_digest,
+                prepared_state_digest=prepared_state_digest,
+                state=canonical_state,
+            )
+
+    def commit_prepared(
+        self,
+        prepared: PreparedCoverageCompletion,
+    ) -> CoverageCellState:
+        """Commit a prepared transition iff the ledger has not changed."""
+        if not isinstance(prepared, PreparedCoverageCompletion):
+            raise InvestigationCoverageError("coverage completion plan is invalid")
+        with self._lock:
+            if _digest_json(self.state.to_json()) != prepared.expected_state_digest:
+                raise InvestigationCoverageError("coverage completion plan is stale")
+            if _digest_json(prepared.state.to_json()) != prepared.prepared_state_digest:
+                raise InvestigationCoverageError("coverage completion plan was modified")
+            stored = self.state.reservations.get(prepared.route_key)
+            if stored is None or stored.reservation_id != prepared.reservation_id:
+                raise InvestigationCoverageError("campaign reservation is not active")
+            next_state = copy.deepcopy(prepared.state)
+            self._persist_state(next_state)
+            self.state = next_state
+            current = self.state.cells.get(prepared.cell_id)
+            if current is None:  # The prepared schema validation makes this unreachable.
+                raise InvestigationCoverageError("prepared coverage cell disappeared")
             return copy.deepcopy(current)
+
+    def complete(
+        self,
+        reservation: CampaignReservation,
+        **completion: object,
+    ) -> CoverageCellState:
+        """Compatibility API: validate completely, then commit once."""
+        prepared = self.prepare_completion(
+            reservation,
+            **completion,  # type: ignore[arg-type]
+        )
+        return self.commit_prepared(prepared)
 
     def mark_exhausted(self, cell_id: str) -> CoverageCellState:
         with self._lock:
             current = self.state.cells.get(cell_id)
             if current is None:
                 raise InvestigationCoverageError(f"unknown coverage cell: {cell_id}")
+            next_state = copy.deepcopy(self.state)
+            current = next_state.cells[cell_id]
             current.exhausted = True
-            self._persist()
+            self._persist_state(next_state)
+            self.state = next_state
             return copy.deepcopy(current)
 
     def projection(self, cell_id: str) -> dict[str, object]:
@@ -512,10 +822,18 @@ class InvestigationCoverageLedger:
             return copy.deepcopy(self.state)
 
     def _persist(self) -> None:
+        self._persist_state(self.state)
+
+    def _persist_state(self, state: CoverageLedgerState) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.state_path.with_name(f".{self.state_path.name}.{os.getpid()}.tmp")
+        content = json.dumps(state.to_json(), indent=2, sort_keys=True) + "\n"
+        if len(content.encode()) > _MAX_STATE_BYTES:
+            raise InvestigationCoverageError(
+                "investigation coverage exceeds its file-size limit"
+            )
         temporary.write_text(
-            json.dumps(self.state.to_json(), indent=2, sort_keys=True) + "\n",
+            content,
             encoding="utf-8",
         )
         temporary.replace(self.state_path)
@@ -541,6 +859,22 @@ def _normalized_text(value: str) -> str:
 
 def _clean_strings(values: Sequence[str]) -> tuple[str, ...]:
     return tuple(sorted({_normalized_text(str(value)) for value in values if str(value).strip()}))
+
+
+def _clean_identity_path(values: Sequence[str]) -> tuple[str, ...]:
+    """Normalize a leaf-to-root identity path without destroying its order."""
+    path: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = _normalized_text(str(value))
+        if not normalized:
+            continue
+        if normalized in seen:
+            message = "hypothesis path contains a duplicate identity"
+            raise InvestigationCoverageError(message)
+        seen.add(normalized)
+        path.append(normalized)
+    return tuple(path)
 
 
 def _string_tuple(value: object) -> tuple[str, ...]:
@@ -584,6 +918,8 @@ __all__ = [
     "CoverageStage",
     "InvestigationCoverageError",
     "InvestigationCoverageLedger",
+    "PlannerFeedbackError",
+    "PreparedCoverageCompletion",
     "SurfaceCell",
     "canonical_family",
 ]

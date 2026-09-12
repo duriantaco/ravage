@@ -12,6 +12,7 @@ from ravage.agent_core.autonomous_graph.entrypoint import (
 from ravage.agent_core.autonomous_graph.operational_profile import (
     GraphOperationalProfileName,
 )
+from ravage.agent_core.autonomous_graph.work_planner import InvestigationPlannerMode
 from ravage.agent_core.autonomous_route import (
     AutonomousRouteResult,
     run_base_then_autonomous_route,
@@ -38,6 +39,7 @@ def run_selected_autonomous_route(
     target_url: str,
     settings: AIWebAgentSettings,
     operational_profile: GraphOperationalProfileName = (GraphOperationalProfileName.STANDARD),
+    planner_mode: InvestigationPlannerMode = InvestigationPlannerMode.LEGACY,
 ) -> AutonomousRouteResult | BaseThenGraphResult:
     """Dispatch one explicitly selected post-base route under the same hard ceiling."""
     if engine == "agent-graph":
@@ -48,9 +50,13 @@ def run_selected_autonomous_route(
             config=graph_config_for_budget(
                 max_model_requests,
                 operational_profile=operational_profile,
+                planner_mode=planner_mode,
             ),
         )
     if engine == "frontier":
+        if planner_mode != InvestigationPlannerMode.LEGACY:
+            message = "non-legacy planner mode requires the agent-graph autonomous route"
+            raise ValueError(message)
         return run_base_then_autonomous_route(
             brief_path=brief_path,
             target_url=target_url,

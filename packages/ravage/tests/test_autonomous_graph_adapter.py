@@ -20,6 +20,7 @@ from ravage.agent_core.autonomous_graph.models import (
     GraphObjective,
     GraphStatus,
 )
+from ravage.agent_core.autonomous_graph.work_planner import InvestigationPlannerMode
 from ravage.agent_core.autonomous_graph.worker import (
     GraphModelReply,
     GraphToolResult,
@@ -523,6 +524,15 @@ async def test_bounded_graph_run_combines_base_and_route_accounting(
     )
     assert result.investigation["enabled"] is True
     assert result.investigation["coverage_cells"] == INITIAL_NODE_COUNT
+    assert result.investigation["planner"] == {
+        "action_authorization_remains_policy_gated": True,
+        "candidate_controls_recommendations": False,
+        "degradation_reasons": [],
+        "degraded": False,
+        "decision_records": 0,
+        "mode": "legacy",
+        "policy_version": "branch-search-v1",
+    }
     assert (context.workspace_dir / "investigation-coverage.json").is_file()
     assert (context.workspace_dir / "investigation-failures.json").is_file()
 
@@ -533,6 +543,21 @@ def test_investigation_engine_can_be_disabled_without_changing_base_limits() -> 
     assert config.investigation_enabled is False
     assert config.to_json()["investigation_enabled"] is False
     assert config.limits == GraphLimits()
+
+
+def test_feedback_planner_mode_is_explicit_and_bound_to_route_identity() -> None:
+    legacy = GraphRouteConfig()
+    shadow = GraphRouteConfig(planner_mode=InvestigationPlannerMode.SHADOW)
+
+    assert "planner" not in legacy.to_json()
+    assert shadow.to_json()["planner"] == {
+        "mode": "shadow",
+        "policy_version": "branch-search-v1",
+    }
+    with pytest.raises(GraphRouteAdapterError, match="InvestigationPlannerMode"):
+        GraphRouteConfig(planner_mode="online")  # type: ignore[arg-type]
+    with pytest.raises(GraphRouteAdapterError, match="policy_version"):
+        GraphRouteConfig(planner_policy_version="unreviewed")
 
 
 def test_frontier_translation_drops_unverifiable_base_evidence_refs() -> None:

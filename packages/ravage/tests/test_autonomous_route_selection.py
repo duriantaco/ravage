@@ -6,6 +6,7 @@ import pytest
 from ravage.agent_core import autonomous_route_selection
 from ravage.agent_core.ai_agent import AIWebAgentSettings
 from ravage.agent_core.autonomous_graph.adapter import GraphRouteConfig
+from ravage.agent_core.autonomous_graph.work_planner import InvestigationPlannerMode
 from ravage.agent_core.autonomous_route_selection import run_selected_autonomous_route
 from ravage.agent_core.frontier_route import FrontierRouteConfig
 
@@ -47,7 +48,37 @@ def test_agent_graph_selection_preserves_base_settings_and_builds_graph_budget(
     assert config.limits.max_model_requests == ROUTE_REQUESTS
     assert config.limits.max_tool_calls == ROUTE_REQUESTS * 4
     assert config.limits.proof_reserve_model_requests == PROOF_RESERVE
+    assert config.planner_mode is InvestigationPlannerMode.LEGACY
     assert settings.max_turns == BASE_REQUESTS
+
+
+def test_agent_graph_selection_propagates_shadow_planner_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def graph_runner(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        autonomous_route_selection,
+        "run_base_then_autonomous_graph_route",
+        graph_runner,
+    )
+
+    run_selected_autonomous_route(
+        engine="agent-graph",
+        max_model_requests=ROUTE_REQUESTS,
+        brief_path=Path("brief.yaml"),
+        target_url=TARGET_URL,
+        settings=AIWebAgentSettings(max_turns=BASE_REQUESTS),
+        planner_mode=InvestigationPlannerMode.SHADOW,
+    )
+
+    config = captured["config"]
+    assert isinstance(config, GraphRouteConfig)
+    assert config.planner_mode is InvestigationPlannerMode.SHADOW
 
 
 def test_frontier_selection_remains_available(
@@ -78,6 +109,18 @@ def test_frontier_selection_remains_available(
     config = captured["config"]
     assert isinstance(config, FrontierRouteConfig)
     assert config.max_model_requests == ROUTE_REQUESTS
+
+
+def test_frontier_selection_rejects_nonlegacy_planner_mode() -> None:
+    with pytest.raises(ValueError, match="non-legacy planner mode requires the agent-graph"):
+        run_selected_autonomous_route(
+            engine="frontier",
+            max_model_requests=ROUTE_REQUESTS,
+            brief_path=Path("brief.yaml"),
+            target_url=TARGET_URL,
+            settings=AIWebAgentSettings(max_turns=BASE_REQUESTS),
+            planner_mode=InvestigationPlannerMode.SHADOW,
+        )
 
 
 def test_route_selection_rejects_unknown_engine_before_execution() -> None:

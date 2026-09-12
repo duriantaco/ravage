@@ -31,6 +31,7 @@ from ravage.agent_core.autonomous_graph.scoped_http import (
     ScopedHttpTransportRequest,
     ScopedHttpTransportResponse,
 )
+from ravage.agent_core.autonomous_graph.work_planner import InvestigationPlannerMode
 from ravage.model_core.providers import ResolvedModelRoute
 from ravage.traffic.manifest import read_traffic_manifest
 from ravage.traffic.policy import TrafficPolicyConfig, TrafficPolicyController
@@ -665,6 +666,23 @@ def test_remote_route_requires_explicit_authorization(tmp_path: Path) -> None:
             ),
             workspace_dir=tmp_path / "workspace",
             config=graph_config_for_budget(8),
+        )
+
+
+def test_remote_route_rejects_unattributed_feedback_planning(tmp_path: Path) -> None:
+    brief_path = tmp_path / "brief.yaml"
+    _write_brief(brief_path)
+
+    with pytest.raises(RemoteGraphProductionError, match="catalog-attributed"):
+        run_remote_http_graph_route(
+            brief_path=brief_path,
+            target_url=TARGET_URL,
+            settings=AIWebAgentSettings(allow_remote_target=True),
+            workspace_dir=tmp_path / "workspace",
+            config=graph_config_for_budget(
+                8,
+                planner_mode=InvestigationPlannerMode.SHADOW,
+            ),
         )
 
 
