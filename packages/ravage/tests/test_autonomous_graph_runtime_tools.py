@@ -116,12 +116,8 @@ async def test_worker_uses_same_named_process_across_model_turns(
                 "process_start",
                 {
                     "name": "shell",
-                    "command": (
-                        "python3 -u -c 'import sys; "
-                        'print("ready", flush=True); '
-                        "line=sys.stdin.readline(); "
-                        'print("echo:"+line.strip(), flush=True)\''
-                    ),
+                    "command": "printf 'ready\\n'; IFS= read -r line; "
+                    "printf 'echo:%s\\n' \"$line\"",
                 },
             ),
             _execute(

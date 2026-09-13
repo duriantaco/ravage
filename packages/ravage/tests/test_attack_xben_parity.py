@@ -450,7 +450,12 @@ def test_public_attack_wires_the_opt_in_autonomous_route_without_changing_base_t
     assert settings.recovery_profile == "off"
 
 
-def test_public_attack_selects_agent_graph_without_changing_base_turns(
+@pytest.mark.parametrize(
+    "planner_mode",
+    [InvestigationPlannerMode.SHADOW, InvestigationPlannerMode.ONLINE],
+)
+def test_public_attack_selects_agent_graph_planner_without_changing_base_turns(
+    planner_mode: InvestigationPlannerMode,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -480,7 +485,7 @@ def test_public_attack_selects_agent_graph_without_changing_base_turns(
             "--autonomous-route-engine",
             "agent-graph",
             "--graph-planner-mode",
-            "shadow",
+            planner_mode.value,
             "--autonomous-route-max-requests",
             str(ROUTE_REQUEST_BUDGET),
         ]
@@ -490,7 +495,7 @@ def test_public_attack_selects_agent_graph_without_changing_base_turns(
     assert isinstance(settings, AIWebAgentSettings)
     assert captured["engine"] == "agent-graph"
     assert captured["max_model_requests"] == ROUTE_REQUEST_BUDGET
-    assert captured["planner_mode"] is InvestigationPlannerMode.SHADOW
+    assert captured["planner_mode"] is planner_mode
     assert settings.max_turns == BASE_TURN_BUDGET
 
 

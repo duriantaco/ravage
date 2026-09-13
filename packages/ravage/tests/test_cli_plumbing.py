@@ -1261,8 +1261,14 @@ def test_cli_attack_help_points_to_brief_template(
     assert "--authorized-remote-target" in output
     assert "--operational-profile" in output
     assert "--graph-planner-mode" in output
+    normalized_output = " ".join(output.split())
+    assert "shadow records candidate rankings" in normalized_output
+    assert "online executes feedback rankings" in normalized_output
+    assert "shadow and online are available only for local targets" in normalized_output
 
 
+@pytest.mark.parametrize("planner_mode", ["shadow", "online"])
+@pytest.mark.parametrize("public_cli", [False, True])
 @pytest.mark.parametrize(
     "route_args",
     [
@@ -1272,53 +1278,34 @@ def test_cli_attack_help_points_to_brief_template(
 )
 def test_cli_attack_rejects_graph_planner_mode_outside_agent_graph_route(
     route_args: list[str],
+    public_cli: bool,  # noqa: FBT001 - parametrized interface selector.
+    planner_mode: str,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     brief_path = tmp_path / "brief.yaml"
     brief_path.write_text(BRIEF_YAML, encoding="utf-8")
+    args = (
+        ["attack", str(brief_path), "--graph-planner-mode", planner_mode, *route_args]
+        if public_cli
+        else [
+            "--brief",
+            str(brief_path),
+            "--target-url",
+            "http://127.0.0.1:8765",
+            "--graph-planner-mode",
+            planner_mode,
+            *route_args,
+        ]
+    )
 
     with pytest.raises(SystemExit) as exc_info:
-        cli.main(
-            [
-                "attack",
-                str(brief_path),
-                "--graph-planner-mode",
-                "shadow",
-                *route_args,
-            ]
-        )
+        cli.main(args)
 
     assert exc_info.value.code == ARGPARSE_ERROR_EXIT
     assert (
         "--graph-planner-mode requires --autonomous-route --autonomous-route-engine agent-graph"
     ) in capsys.readouterr().err
-
-
-def test_cli_attack_does_not_expose_online_graph_planner_mode(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    brief_path = tmp_path / "brief.yaml"
-    brief_path.write_text(BRIEF_YAML, encoding="utf-8")
-
-    with pytest.raises(SystemExit) as exc_info:
-        cli.main(
-            [
-                "attack",
-                str(brief_path),
-                "--autonomous-route",
-                "--autonomous-route-engine",
-                "agent-graph",
-                "--graph-planner-mode",
-                "online",
-            ]
-        )
-
-    assert exc_info.value.code == ARGPARSE_ERROR_EXIT
-    error = capsys.readouterr().err
-    assert "invalid choice: 'online'" in error
-    assert "choose from legacy, shadow" in error
 
 
 def test_cli_attack_remote_target_stays_blocked_without_explicit_authorization(
@@ -1348,8 +1335,10 @@ def test_cli_attack_remote_target_stays_blocked_without_explicit_authorization(
 
 
 @pytest.mark.parametrize("public_cli", [False, True])
-def test_cli_attack_rejects_shadow_planner_for_remote_targets(
+@pytest.mark.parametrize("planner_mode", ["shadow", "online"])
+def test_cli_attack_rejects_nonlegacy_planner_for_remote_targets(
     public_cli: bool,  # noqa: FBT001 - parametrized interface selector.
+    planner_mode: str,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1365,7 +1354,7 @@ def test_cli_attack_rejects_shadow_planner_for_remote_targets(
         "--autonomous-route-engine",
         "agent-graph",
         "--graph-planner-mode",
-        "shadow",
+        planner_mode,
     ]
     args = (
         ["attack", str(brief_path), "--target-url", remote_url, *route_args]
@@ -1378,8 +1367,8 @@ def test_cli_attack_rejects_shadow_planner_for_remote_targets(
 
     assert exc_info.value.code == ARGPARSE_ERROR_EXIT
     error = capsys.readouterr().err
-    assert "shadow is unavailable for remote targets" in error
-    assert "HTTP-only actions lack catalog campaign attribution" in error
+    assert f"{planner_mode} is unavailable for remote targets" in error
+    assert "full target-traffic boundary is not yet evaluator-enforced" in error
 
 
 def test_cli_scan_runs_explicitly_authorized_remote_target(

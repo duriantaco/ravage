@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Protocol
 
 MODEL_GATEWAY_SCHEMA = "ravage.xben.model-gateway-receipt.v1"
-MODEL_GATEWAY_POLICY_SCHEMA = "ravage.xben.model-gateway-policy.v1"
+MODEL_GATEWAY_POLICY_SCHEMA = "ravage.xben.model-gateway-policy.v3"
 OPENAI_CHAT_PATH = "/v1/chat/completions"
 OPENAI_HOST = "api.openai.com"
 _ROW_ID_RE = re.compile(r"primary-(?:00[1-9]|0[1-9][0-9]|[1-9][0-9]{2})")
@@ -59,6 +59,93 @@ _MAX_INPUT_MONEY_ADJUSTED_EXPONENT = 28
 # beyond that derived maximum while keeping serialization finite.
 _MAX_EVIDENCE_MONEY_TEXT_CHARS = 256
 _MAX_EVIDENCE_MONEY_ADJUSTED_EXPONENT = 64
+
+# The gateway is an evaluator boundary, so request fields are fail-closed. Tool
+# and response-shape fields remain native to each agent, while controls that can
+# change generation are forbidden so both arms use the provider defaults.
+_ALLOWED_REQUEST_FIELDS = (
+    "function_call",
+    "functions",
+    "max_completion_tokens",
+    "max_tokens",
+    "messages",
+    "metadata",
+    "model",
+    "n",
+    "parallel_tool_calls",
+    "reasoning_effort",
+    "response_format",
+    "service_tier",
+    "store",
+    "stream",
+    "stream_options",
+    "tool_choice",
+    "tools",
+)
+_EVALUATOR_RESERVED_FIELDS = (
+    "prompt_cache_key",
+    "safety_identifier",
+    "user",
+)
+_FORBIDDEN_GENERATION_FIELDS = (
+    "audio",
+    "frequency_penalty",
+    "logit_bias",
+    "logprobs",
+    "modalities",
+    "prediction",
+    "presence_penalty",
+    "seed",
+    "stop",
+    "temperature",
+    "top_logprobs",
+    "top_p",
+    "verbosity",
+    "web_search_options",
+)
+
+
+def _input_token_reservation_policy() -> dict[str, object]:
+    return {
+        "algorithm": "utf8_body_bytes_plus_fixed_overhead",
+        "measured_body_stage": "canonical_after_static_normalization_before_dynamic_cap",
+        "fixed_overhead_tokens": _INPUT_TOKEN_OVERHEAD,
+        "cached_discount_assumed": False,
+        "affordability_rule": "floor_remaining_cost_to_output_tokens",
+    }
+
+
+def _request_field_policy() -> dict[str, object]:
+    return {
+        "unknown_fields": "reject",
+        "allowed_fields": list(_ALLOWED_REQUEST_FIELDS),
+        "evaluator_reserved_fields": {
+            "enforcement": "reject_if_present",
+            "fields": list(_EVALUATOR_RESERVED_FIELDS),
+        },
+        "provider_default_generation_fields": {
+            "enforcement": "reject_if_present",
+            "fields": list(_FORBIDDEN_GENERATION_FIELDS),
+        },
+        "output_token_cap": {
+            "accepted_fields": ["max_completion_tokens", "max_tokens"],
+            "conflict": "reject",
+            "missing": "insert_policy_maximum",
+            "validation": "positive_integer_no_greater_than_policy_maximum",
+            "forwarded_field": "max_completion_tokens",
+        },
+        "reasoning_effort": {
+            "missing": "insert_frozen_policy_value",
+            "provided": "require_exact_frozen_policy_value",
+            "explicit_null": "reject",
+        },
+        "normalized_fields": {
+            "n": 1,
+            "service_tier": "default",
+            "store": False,
+            "stream_options_when_streaming": {"include_usage": True},
+        },
+    }
 
 
 class ModelGatewayError(RuntimeError):
@@ -216,14 +303,16 @@ class ModelGatewayPolicy:
             "max_upstream_response_bytes": self.max_upstream_response_bytes,
             "upstream_timeout_seconds": self.upstream_timeout_seconds,
             "max_parallel_requests": self.max_parallel_requests,
-            "input_token_reservation": {
-                "algorithm": "utf8_body_bytes_plus_fixed_overhead",
-                "fixed_overhead_tokens": _INPUT_TOKEN_OVERHEAD,
-                "cached_discount_assumed": False,
-            },
+            "input_token_reservation": _input_token_reservation_policy(),
+            "request_field_policy": _request_field_policy(),
             "retry_policy": "gateway_never_retries",
             "unknown_usage_policy": "charge_full_reservation_and_invalidate_row",
         }
+
+    @property
+    def digest(self) -> str:
+        """Return the canonical digest embedded in comparison commitments."""
+        return _sha256(_canonical_json(self.to_json()))
 
 
 @dataclass(frozen=True)
@@ -414,7 +503,7 @@ class ComparisonModelGateway:
 
     @property
     def policy_digest(self) -> str:
-        return _sha256(_canonical_json(self.policy.to_json()))
+        return self.policy.digest
 
     def start(self) -> None:
         with self._lock:
@@ -794,25 +883,46 @@ class ComparisonModelGateway:
         started_monotonic = time.monotonic()
         try:
             payload = _decode_json_object(raw, "model request")
+            request_fields = set(payload)
+            if request_fields.intersection(_FORBIDDEN_GENERATION_FIELDS):
+                raise _GatewayHTTPFailure(  # noqa: TRY301 - finalized below.
+                    400, "generation_control_forbidden"
+                )
+            if request_fields.intersection(_EVALUATOR_RESERVED_FIELDS):
+                raise _GatewayHTTPFailure(  # noqa: TRY301 - finalized below.
+                    400, "evaluator_reserved_field"
+                )
+            if not request_fields.issubset(_ALLOWED_REQUEST_FIELDS):
+                raise _GatewayHTTPFailure(  # noqa: TRY301 - finalized below.
+                    400, "unsupported_request_field"
+                )
             if payload.get("model") != self.policy.model:
                 raise _GatewayHTTPFailure(400, "model_mismatch")
-            if payload.get("reasoning_effort") != self.policy.reasoning_effort:
+            if (
+                "reasoning_effort" in payload
+                and payload["reasoning_effort"] != self.policy.reasoning_effort
+            ):
                 raise _GatewayHTTPFailure(400, "reasoning_effort_mismatch")
+            payload["reasoning_effort"] = self.policy.reasoning_effort
             if not isinstance(payload.get("messages"), list) or not payload["messages"]:
                 raise _GatewayHTTPFailure(400, "messages_required")
-            if payload.get("n", 1) != 1:
+            choices = payload.get("n", 1)
+            if isinstance(choices, bool) or not isinstance(choices, int) or choices != 1:
                 raise _GatewayHTTPFailure(400, "single_choice_required")
-            if "max_tokens" in payload:
-                raise _GatewayHTTPFailure(400, "legacy_max_tokens_forbidden")
+            if "max_completion_tokens" in payload and "max_tokens" in payload:
+                raise _GatewayHTTPFailure(400, "completion_token_field_conflict")
             requested_cap = payload.get(
-                "max_completion_tokens", self.policy.max_completion_tokens_per_request
+                "max_completion_tokens",
+                payload.get("max_tokens", self.policy.max_completion_tokens_per_request),
             )
             if (
                 isinstance(requested_cap, bool)
                 or not isinstance(requested_cap, int)
-                or requested_cap != self.policy.max_completion_tokens_per_request
+                or not 0 < requested_cap <= self.policy.max_completion_tokens_per_request
             ):
                 raise _GatewayHTTPFailure(400, "completion_token_contract_mismatch")
+            payload.pop("max_tokens", None)
+            payload["max_completion_tokens"] = requested_cap
             stream = payload.get("stream", False)
             if not isinstance(stream, bool):
                 raise _GatewayHTTPFailure(400, "stream_flag_invalid")
@@ -821,6 +931,7 @@ class ComparisonModelGateway:
                 raise _GatewayHTTPFailure(400, "service_tier_mismatch")
             if payload.get("store") not in {None, False}:
                 raise _GatewayHTTPFailure(400, "stored_completion_forbidden")
+            payload["n"] = 1
             payload["service_tier"] = "default"
             payload["store"] = False
             if stream:
@@ -1308,6 +1419,7 @@ def _validate_policy_receipt(value: object) -> dict[str, object]:
         "upstream_timeout_seconds",
         "max_parallel_requests",
         "input_token_reservation",
+        "request_field_policy",
         "retry_policy",
         "unknown_usage_policy",
     }
@@ -1357,12 +1469,12 @@ def _validate_policy_receipt(value: object) -> dict[str, object]:
         if observed > maximum:
             raise ModelGatewayError(f"gateway policy {name} exceeds its supported maximum")
     reservation = value.get("input_token_reservation")
-    if reservation != {
-        "algorithm": "utf8_body_bytes_plus_fixed_overhead",
-        "fixed_overhead_tokens": _INPUT_TOKEN_OVERHEAD,
-        "cached_discount_assumed": False,
-    }:
+    if reservation != _input_token_reservation_policy():
         raise ModelGatewayError("model gateway receipt reservation policy is invalid")
+    request_fields = value.get("request_field_policy")
+    if request_fields != _request_field_policy():
+        message = "model gateway receipt request-field policy is invalid"
+        raise ModelGatewayError(message)
     return dict(value)
 
 

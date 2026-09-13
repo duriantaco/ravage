@@ -45,6 +45,13 @@ from ravage.agent_core.ai_agent import (
     run_ai_web_agent,
 )
 from ravage.agent_core.attack_surface import merge_surface_state, surface_from_recon
+from ravage.agent_core.autonomous_graph.cli_policy import (
+    CLI_GRAPH_PLANNER_MODES,
+    GRAPH_PLANNER_MODE_HELP,
+    GraphPlannerCliPolicyError,
+    resolve_cli_graph_planner_mode,
+    validate_cli_graph_planner_target,
+)
 from ravage.agent_core.autonomous_graph.operational_profile import (
     GraphOperationalProfileName,
 )
@@ -247,10 +254,7 @@ _TESTFIRE_MAX_PHYSICAL_REQUESTS = 24
 _TESTFIRE_MAX_REQUEST_BODY_BYTES = 1_024
 _TESTFIRE_MAX_RPS = 0.5
 _TESTFIRE_REQUEST_PROFILE = "testfire-login-demo"
-_CLI_GRAPH_PLANNER_MODES = (
-    InvestigationPlannerMode.LEGACY.value,
-    InvestigationPlannerMode.SHADOW.value,
-)
+_CLI_GRAPH_PLANNER_MODES = CLI_GRAPH_PLANNER_MODES
 
 _TOP_LEVEL_COMMANDS = (
     "attack",
@@ -477,11 +481,7 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
     parser.add_argument(
         "--graph-planner-mode",
         choices=_CLI_GRAPH_PLANNER_MODES,
-        help=(
-            "agent-graph planner rollout mode: shadow (local targets only) records candidate "
-            "rankings while legacy executes (default: legacy); requires "
-            "--autonomous-route --autonomous-route-engine agent-graph"
-        ),
+        help=GRAPH_PLANNER_MODE_HELP,
     )
     parser.add_argument(
         "--operational-profile",
@@ -551,14 +551,11 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
         parser.error("only --agent ai-web is supported")
     if args.autonomous_route and args.recovery_profile != "off":
         parser.error("--autonomous-route requires --recovery-profile off")
-    if args.graph_planner_mode is not None and (
-        not args.autonomous_route or args.autonomous_route_engine != "agent-graph"
-    ):
-        parser.error(
-            "--graph-planner-mode requires --autonomous-route --autonomous-route-engine agent-graph"
-        )
-    planner_mode = InvestigationPlannerMode(
-        args.graph_planner_mode or InvestigationPlannerMode.LEGACY.value
+    planner_mode = _resolve_attack_graph_planner_mode(
+        parser,
+        autonomous_route=args.autonomous_route,
+        autonomous_route_engine=args.autonomous_route_engine,
+        requested_mode=args.graph_planner_mode,
     )
     if args.report_path is not None:
         _validate_report_output(parser, args.report_path)
@@ -595,11 +592,11 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901, PLR0911, PLR0912
         requested_identity=args.identity,
     )
     remote_target = not is_local_url(args.target_url)
-    if remote_target and planner_mode == InvestigationPlannerMode.SHADOW:
-        parser.error(
-            "--graph-planner-mode shadow is unavailable for remote targets because "
-            "HTTP-only actions lack catalog campaign attribution"
-        )
+    _validate_attack_graph_planner_target(
+        parser,
+        planner_mode=planner_mode,
+        remote_target=remote_target,
+    )
     if remote_target and args.traffic_policy is None:
         args.traffic_policy = "low-noise"
     traffic_workspace = args.workspace_dir or (
@@ -1884,6 +1881,38 @@ def _pin_parsed_knowledge_pack(
     parsed.knowledge_pack_sha256 = None if metadata is None else metadata.sha256
 
 
+def _resolve_attack_graph_planner_mode(
+    parser: argparse.ArgumentParser,
+    *,
+    autonomous_route: bool,
+    autonomous_route_engine: str,
+    requested_mode: str | None,
+) -> InvestigationPlannerMode:
+    try:
+        return resolve_cli_graph_planner_mode(
+            autonomous_route=autonomous_route,
+            autonomous_route_engine=autonomous_route_engine,
+            requested_mode=requested_mode,
+        )
+    except GraphPlannerCliPolicyError as exc:
+        parser.error(str(exc))
+
+
+def _validate_attack_graph_planner_target(
+    parser: argparse.ArgumentParser,
+    *,
+    planner_mode: InvestigationPlannerMode,
+    remote_target: bool,
+) -> None:
+    try:
+        validate_cli_graph_planner_target(
+            mode=planner_mode,
+            remote_target=remote_target,
+        )
+    except GraphPlannerCliPolicyError as exc:
+        parser.error(str(exc))
+
+
 def _resolve_traffic_policy_args(  # noqa: C901, PLR0912 - fail-closed profile checks.
     parser: argparse.ArgumentParser,
     parsed: argparse.Namespace,
@@ -2152,11 +2181,7 @@ def _attack(  # noqa: C901, PLR0912, PLR0915 - CLI options are intentionally exp
     parser.add_argument(
         "--graph-planner-mode",
         choices=_CLI_GRAPH_PLANNER_MODES,
-        help=(
-            "agent-graph planner rollout mode: shadow (local targets only) records candidate "
-            "rankings while legacy executes (default: legacy); requires "
-            "--autonomous-route --autonomous-route-engine agent-graph"
-        ),
+        help=GRAPH_PLANNER_MODE_HELP,
     )
     parser.add_argument(
         "--operational-profile",
@@ -2247,14 +2272,11 @@ def _attack(  # noqa: C901, PLR0912, PLR0915 - CLI options are intentionally exp
     _pin_parsed_knowledge_pack(parser, parsed)
     if parsed.autonomous_route and parsed.recovery_profile != "off":
         parser.error("--autonomous-route requires --recovery-profile off")
-    if parsed.graph_planner_mode is not None and (
-        not parsed.autonomous_route or parsed.autonomous_route_engine != "agent-graph"
-    ):
-        parser.error(
-            "--graph-planner-mode requires --autonomous-route --autonomous-route-engine agent-graph"
-        )
-    planner_mode = InvestigationPlannerMode(
-        parsed.graph_planner_mode or InvestigationPlannerMode.LEGACY.value
+    planner_mode = _resolve_attack_graph_planner_mode(
+        parser,
+        autonomous_route=parsed.autonomous_route,
+        autonomous_route_engine=parsed.autonomous_route_engine,
+        requested_mode=parsed.graph_planner_mode,
     )
     if parsed.brief is None:
         parser.error("an engagement brief is required; run `ravage init URL` first")
@@ -2310,11 +2332,11 @@ def _attack(  # noqa: C901, PLR0912, PLR0915 - CLI options are intentionally exp
         allow_paid_models=parsed.allow_paid_models,
     )
     remote_target = not is_local_url(target_url)
-    if remote_target and planner_mode == InvestigationPlannerMode.SHADOW:
-        parser.error(
-            "--graph-planner-mode shadow is unavailable for remote targets because "
-            "HTTP-only actions lack catalog campaign attribution"
-        )
+    _validate_attack_graph_planner_target(
+        parser,
+        planner_mode=planner_mode,
+        remote_target=remote_target,
+    )
     if remote_target and parsed.traffic_policy is None:
         parsed.traffic_policy = "low-noise"
     resume_traffic_workspace = _resume_traffic_policy_workspace(parsed)
