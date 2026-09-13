@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 import pytest
 from ravage.xben_parts.comparison_model_gateway import (
     ComparisonModelGateway,
+    ModelGatewayError,
     ModelGatewayPolicy,
     ModelPricing,
     RowRegistrationError,
@@ -73,6 +74,23 @@ class BlockingTransport:
         return self.response
 
 
+@dataclass
+class FailingTransport:
+    calls: int = 0
+
+    def send(
+        self,
+        body: bytes,
+        *,
+        api_key: str,
+        timeout_seconds: int,
+        maximum_response_bytes: int,
+    ) -> UpstreamResponse:
+        del body, api_key, timeout_seconds, maximum_response_bytes
+        self.calls += 1
+        raise TimeoutError("synthetic upstream timeout")
+
+
 class PausingAdmissionGateway(ComparisonModelGateway):
     """Expose the old ordinal-to-reservation race window deterministically."""
 
@@ -112,6 +130,7 @@ def test_gateway_enforces_contract_accounts_usage_and_retains_hashes_only(
     assert sent["model"] == MODEL
     assert sent["reasoning_effort"] == REASONING
     assert sent["max_completion_tokens"] == 100
+    assert sent["n"] == 1
     assert sent["service_tier"] == "default"
     assert sent["store"] is False
     assert transport.requests[0]["api_key"] == upstream_key
@@ -149,6 +168,78 @@ def test_gateway_enforces_contract_accounts_usage_and_retains_hashes_only(
         )
         == receipt
     )
+
+
+def test_gateway_normalizes_pinned_client_compaction_request(tmp_path: Path) -> None:
+    transport = FakeTransport([_json_response(completion_tokens=20)])
+    gateway = ComparisonModelGateway(
+        policy=_policy(), upstream_api_key="secret", transport=transport
+    )
+    gateway.start()
+    token = gateway.register_row("primary-025", max_requests=1, max_cost_usd="0.05")
+    request = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "compact this conversation"}],
+        "max_tokens": 64,
+    }
+    try:
+        status, _ = _post(gateway, token, request)
+    finally:
+        gateway.close()
+
+    assert status == 200
+    assert len(transport.requests) == 1
+    forwarded_bytes = transport.requests[0]["body"]
+    assert isinstance(forwarded_bytes, bytes)
+    forwarded = json.loads(forwarded_bytes)
+    assert forwarded["reasoning_effort"] == REASONING
+    assert forwarded["max_completion_tokens"] == 64
+    assert "max_tokens" not in forwarded
+    receipt = gateway.seal_row("primary-025", tmp_path / "client-compaction.json")
+    assert receipt["records"][0]["input_token_upper_bound"] == len(forwarded_bytes) + 4096
+    assert (
+        validate_model_gateway_receipt(
+            receipt,
+            expected_row_id="primary-025",
+            expected_policy_sha256=gateway.policy_digest,
+            expected_max_requests=1,
+            expected_max_cost_usd="0.05",
+        )
+        == receipt
+    )
+
+
+@pytest.mark.parametrize(
+    ("cap_fields", "expected_cap"),
+    [({}, 100), ({"max_completion_tokens": 64}, 64)],
+)
+def test_gateway_accepts_omitted_or_smaller_canonical_output_cap(
+    cap_fields: dict[str, object],
+    expected_cap: int,
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport([_json_response(completion_tokens=10)])
+    gateway = ComparisonModelGateway(
+        policy=_policy(), upstream_api_key="secret", transport=transport
+    )
+    gateway.start()
+    token = gateway.register_row("primary-026", max_requests=1, max_cost_usd="0.05")
+    request: dict[str, object] = {
+        "model": MODEL,
+        "reasoning_effort": REASONING,
+        "messages": [{"role": "user", "content": "bounded"}],
+        **cap_fields,
+    }
+    try:
+        status, _ = _post(gateway, token, request)
+    finally:
+        gateway.close()
+
+    assert status == 200
+    forwarded = json.loads(transport.requests[0]["body"])
+    assert forwarded["max_completion_tokens"] == expected_cap
+    assert "max_tokens" not in forwarded
+    assert gateway.seal_row("primary-026", tmp_path / "accepted-cap.json")["valid"] is True
 
 
 def test_receipt_verifier_rejects_recomputed_but_false_cost_accounting(
@@ -228,9 +319,12 @@ def test_gateway_validates_stream_terminal_usage(tmp_path: Path) -> None:
     [
         ({"model": "gpt-5.4-mini"}, "model_mismatch"),
         ({"reasoning_effort": "low"}, "reasoning_effort_mismatch"),
-        ({"max_completion_tokens": 99}, "completion_token_contract_mismatch"),
+        ({"reasoning_effort": None}, "reasoning_effort_mismatch"),
+        ({"max_tokens": 100}, "completion_token_field_conflict"),
         ({"service_tier": "priority"}, "service_tier_mismatch"),
         ({"store": True}, "stored_completion_forbidden"),
+        ({"n": True}, "single_choice_required"),
+        ({"n": 1.0}, "single_choice_required"),
     ],
 )
 def test_gateway_rejects_contract_drift_and_invalidates_row(
@@ -255,6 +349,37 @@ def test_gateway_rejects_contract_drift_and_invalidates_row(
     receipt = gateway.seal_row("primary-003", tmp_path / f"{code}.json")
     assert receipt["valid"] is False
     assert receipt["records"][0]["failure_code"] == code
+
+
+@pytest.mark.parametrize("field", ["max_completion_tokens", "max_tokens"])
+@pytest.mark.parametrize("value", [0, -1, 101, True, 1.5])
+def test_gateway_rejects_invalid_output_caps_before_upstream(
+    field: str,
+    value: object,
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport([_json_response()])
+    gateway = ComparisonModelGateway(
+        policy=_policy(), upstream_api_key="secret", transport=transport
+    )
+    gateway.start()
+    token = gateway.register_row("primary-027", max_requests=1, max_cost_usd="0.05")
+    request = {
+        "model": MODEL,
+        "reasoning_effort": REASONING,
+        "messages": [{"role": "user", "content": "invalid cap"}],
+        field: value,
+    }
+    try:
+        status, body = _post(gateway, token, request)
+    finally:
+        gateway.close()
+
+    assert status == 400
+    assert json.loads(body)["error"]["code"] == "completion_token_contract_mismatch"
+    assert transport.requests == []
+    receipt = gateway.seal_row("primary-027", tmp_path / "invalid-cap.json")
+    assert receipt["valid"] is False
 
 
 def test_gateway_request_limit_is_atomic_and_does_not_forward_extra_call(
@@ -301,7 +426,205 @@ def test_gateway_reduces_output_reservation_before_forwarding_at_cost_ceiling(
     forwarded = json.loads(transport.requests[0]["body"])
     assert 0 < forwarded["max_completion_tokens"] < 100
     receipt = gateway.seal_row("primary-005", tmp_path / "cost.json")
+    normalized_before_dynamic_cap = {
+        **_request("bounded"),
+        "n": 1,
+        "service_tier": "default",
+        "store": False,
+    }
+    normalized_bytes = json.dumps(
+        normalized_before_dynamic_cap,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    forwarded_bytes = transport.requests[0]["body"]
+    record = receipt["records"][0]
+    assert record["input_token_upper_bound"] == len(normalized_bytes) + 4096
+    assert record["forwarded_request_sha256"] == (
+        "sha256:" + hashlib.sha256(forwarded_bytes).hexdigest()
+    )
     assert float(receipt["totals"]["charged_cost_usd"]) <= 0.0035
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "audio",
+        "frequency_penalty",
+        "logit_bias",
+        "logprobs",
+        "modalities",
+        "prediction",
+        "presence_penalty",
+        "seed",
+        "stop",
+        "temperature",
+        "top_logprobs",
+        "top_p",
+        "verbosity",
+        "web_search_options",
+    ],
+)
+def test_gateway_rejects_generation_controls_before_upstream(tmp_path: Path, field: str) -> None:
+    transport = FakeTransport([_json_response()])
+    gateway = ComparisonModelGateway(
+        policy=_policy(), upstream_api_key="secret", transport=transport
+    )
+    gateway.start()
+    token = gateway.register_row("primary-022", max_requests=1, max_cost_usd="0.05")
+    request = _request("defaults")
+    request[field] = 0
+    try:
+        status, body = _post(gateway, token, request)
+    finally:
+        gateway.close()
+
+    assert status == 400
+    assert json.loads(body)["error"]["code"] == "generation_control_forbidden"
+    assert transport.requests == []
+    receipt = gateway.seal_row("primary-022", tmp_path / f"{field}.json")
+    assert receipt["valid"] is False
+    assert receipt["records"][0]["failure_code"] == "generation_control_forbidden"
+
+
+@pytest.mark.parametrize("field", ["prompt_cache_key", "safety_identifier", "user"])
+def test_gateway_rejects_evaluator_reserved_fields_before_upstream(
+    field: str,
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport([_json_response()])
+    gateway = ComparisonModelGateway(
+        policy=_policy(), upstream_api_key="secret", transport=transport
+    )
+    gateway.start()
+    token = gateway.register_row("primary-028", max_requests=1, max_cost_usd="0.05")
+    request = _request("reserved")
+    request[field] = "arm-controlled"
+    try:
+        status, body = _post(gateway, token, request)
+    finally:
+        gateway.close()
+
+    assert status == 400
+    assert json.loads(body)["error"]["code"] == "evaluator_reserved_field"
+    assert transport.requests == []
+    receipt = gateway.seal_row("primary-028", tmp_path / f"{field}.json")
+    assert receipt["valid"] is False
+
+
+def test_gateway_rejects_unknown_request_fields_fail_closed(tmp_path: Path) -> None:
+    transport = FakeTransport([_json_response()])
+    gateway = ComparisonModelGateway(
+        policy=_policy(), upstream_api_key="secret", transport=transport
+    )
+    gateway.start()
+    token = gateway.register_row("primary-023", max_requests=1, max_cost_usd="0.05")
+    request = _request("unknown")
+    request["future_sampling_knob"] = 1
+    try:
+        status, body = _post(gateway, token, request)
+    finally:
+        gateway.close()
+
+    assert status == 400
+    assert json.loads(body)["error"]["code"] == "unsupported_request_field"
+    assert transport.requests == []
+    receipt = gateway.seal_row("primary-023", tmp_path / "unknown.json")
+    assert receipt["valid"] is False
+
+
+def test_gateway_transport_is_attempted_exactly_once(tmp_path: Path) -> None:
+    transport = FailingTransport()
+    gateway = ComparisonModelGateway(
+        policy=_policy(), upstream_api_key="secret", transport=transport
+    )
+    gateway.start()
+    token = gateway.register_row("primary-024", max_requests=1, max_cost_usd="0.05")
+    try:
+        status, body = _post(gateway, token, _request("one attempt"))
+    finally:
+        gateway.close()
+
+    assert status == 502
+    assert json.loads(body)["error"]["code"] == "upstream_transport_failed"
+    assert transport.calls == 1
+    receipt = gateway.seal_row("primary-024", tmp_path / "transport.json")
+    assert receipt["valid"] is False
+    assert receipt["records"][0]["failure_code"] == "upstream_transport:TimeoutError"
+
+
+def test_policy_digest_commits_request_and_reservation_rules() -> None:
+    policy = _policy()
+    serialized = json.dumps(
+        policy.to_json(),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+
+    assert policy.digest == "sha256:" + hashlib.sha256(serialized).hexdigest()
+    policy_json = policy.to_json()
+    assert policy_json["schema_version"] == "ravage.xben.model-gateway-policy.v3"
+    request_policy = policy_json["request_field_policy"]
+    assert isinstance(request_policy, dict)
+    assert request_policy["output_token_cap"] == {
+        "accepted_fields": ["max_completion_tokens", "max_tokens"],
+        "conflict": "reject",
+        "missing": "insert_policy_maximum",
+        "validation": "positive_integer_no_greater_than_policy_maximum",
+        "forwarded_field": "max_completion_tokens",
+    }
+    assert request_policy["reasoning_effort"] == {
+        "missing": "insert_frozen_policy_value",
+        "provided": "require_exact_frozen_policy_value",
+        "explicit_null": "reject",
+    }
+    assert request_policy["evaluator_reserved_fields"] == {
+        "enforcement": "reject_if_present",
+        "fields": ["prompt_cache_key", "safety_identifier", "user"],
+    }
+    generation_fields = request_policy["provider_default_generation_fields"]
+    assert isinstance(generation_fields, dict)
+    assert "max_tokens" not in generation_fields["fields"]
+
+
+def test_receipt_verifier_rejects_rehashed_request_policy_tampering(tmp_path: Path) -> None:
+    gateway = ComparisonModelGateway(
+        policy=_policy(), upstream_api_key="secret", transport=FakeTransport([])
+    )
+    gateway.register_row("primary-029", max_requests=1, max_cost_usd="0.05")
+    receipt = gateway.seal_row("primary-029", tmp_path / "policy-tamper.json")
+    request_policy = receipt["policy"]["request_field_policy"]
+    request_policy["output_token_cap"]["conflict"] = "allow"
+    policy_bytes = json.dumps(
+        receipt["policy"],
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    receipt["policy_sha256"] = "sha256:" + hashlib.sha256(policy_bytes).hexdigest()
+    body = {key: value for key, value in receipt.items() if key != "document_sha256"}
+    document_bytes = json.dumps(
+        body,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    receipt["document_sha256"] = "sha256:" + hashlib.sha256(document_bytes).hexdigest()
+
+    with pytest.raises(ModelGatewayError, match="request-field policy is invalid"):
+        validate_model_gateway_receipt(
+            receipt,
+            expected_row_id="primary-029",
+            expected_policy_sha256=receipt["policy_sha256"],
+            expected_max_requests=1,
+            expected_max_cost_usd="0.05",
+        )
 
 
 def test_campaign_reservations_are_atomic_across_concurrent_rows(tmp_path: Path) -> None:
