@@ -9,6 +9,8 @@ from typing import Self
 class OpenAIStubHandler(BaseHTTPRequestHandler):
     actions: list[dict[str, object]]
     requests_seen: list[dict[str, object]]
+    repeat_last: bool
+    action_lock: threading.Lock
 
     def do_POST(self) -> None:
         if self.path != "/v1/chat/completions":
@@ -18,11 +20,20 @@ class OpenAIStubHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", "0"))
         raw_body = self.rfile.read(content_length).decode("utf-8")
         payload = json.loads(raw_body)
-        self.requests_seen.append(payload)
-        action = self.actions.pop(0)
+        with self.action_lock:
+            self.requests_seen.append(payload)
+            if not self.actions:
+                self.send_error(503, "OpenAI stub response script exhausted")
+                return
+            action = (
+                self.actions[0]
+                if self.repeat_last and len(self.actions) == 1
+                else self.actions.pop(0)
+            )
         response = {
             "id": "chatcmpl-test",
             "object": "chat.completion",
+            "model": str(payload.get("model") or "fixture-model"),
             "choices": [
                 {
                     "index": 0,
@@ -33,6 +44,12 @@ class OpenAIStubHandler(BaseHTTPRequestHandler):
                     "finish_reason": "stop",
                 }
             ],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": {"cached_tokens": 0},
+            },
         }
         body = json.dumps(response).encode()
         self.send_response(200)
@@ -46,11 +63,21 @@ class OpenAIStubHandler(BaseHTTPRequestHandler):
 
 
 class OpenAIStubServer:
-    def __init__(self, actions: list[dict[str, object]]) -> None:
+    def __init__(
+        self,
+        actions: list[dict[str, object]],
+        *,
+        repeat_last: bool = False,
+    ) -> None:
         self._handler: type[OpenAIStubHandler] = type(
             "PerTestOpenAIStubHandler",
             (OpenAIStubHandler,),
-            {"actions": actions, "requests_seen": []},
+            {
+                "actions": actions,
+                "requests_seen": [],
+                "repeat_last": repeat_last,
+                "action_lock": threading.Lock(),
+            },
         )
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
