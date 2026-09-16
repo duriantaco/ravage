@@ -1,0 +1,4 @@
+interface:
+  display_name: "Discover Source Advisories"
+  short_description: "Map repository dependencies to current advisories"
+  default_prompt: "Use $ravage-source-advisory-discovery to inventory this repository and find current advisory candidates."

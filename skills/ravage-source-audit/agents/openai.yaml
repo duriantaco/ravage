@@ -1,0 +1,4 @@
+interface:
+  display_name: "Audit Source Code"
+  short_description: "Find source-backed security and logic flaws"
+  default_prompt: "Use $ravage-source-audit to perform a read-only security audit of this authorized repository."

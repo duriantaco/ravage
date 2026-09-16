@@ -1,0 +1,4 @@
+interface:
+  display_name: "Check Source Advisory Fit"
+  short_description: "Verify CVE reachability in an exact snapshot"
+  default_prompt: "Use $ravage-source-advisory-applicability to determine whether this advisory applies to the authorized source snapshot."

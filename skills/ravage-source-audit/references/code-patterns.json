@@ -1,0 +1,222 @@
+{
+  "schema_version": "ravage.source-pattern-catalog.v1",
+  "scope": "Stable source-code vulnerability shapes. These records are navigation and proof checklists, not signatures or CVE claims.",
+  "rules": [
+    {
+      "id": "AC-001",
+      "family": "access-control",
+      "skill": "ravage-source-access-control",
+      "signals": ["request identifier loads an object", "authenticated subject is available", "ownership or tenant predicate is absent"],
+      "trace": "Trace the external identifier through canonicalization and lookup to the final authorization decision.",
+      "counterevidence": ["central policy middleware", "query scoped by subject or tenant", "unforgeable server-side object binding"]
+    },
+    {
+      "id": "AC-002",
+      "family": "access-control",
+      "skill": "ravage-source-access-control",
+      "signals": ["privileged action has multiple entry points", "one path bypasses the shared policy", "background or bulk path calls service directly"],
+      "trace": "Enumerate every caller of the privileged operation and compare enforcement before the shared side effect.",
+      "counterevidence": ["callee-level mandatory authorization", "capability object proven unforgeable", "deny-by-default dispatcher"]
+    },
+    {
+      "id": "AC-003",
+      "family": "access-control",
+      "skill": "ravage-source-access-control",
+      "signals": ["policy exception falls through", "unknown role or resource type", "error converted to allow"],
+      "trace": "Follow every exceptional and default branch to the effective allow or deny result.",
+      "counterevidence": ["closed enum exhaustiveness", "default deny", "exception terminates request"]
+    },
+    {
+      "id": "BL-001",
+      "family": "business-logic",
+      "skill": "ravage-source-business-logic",
+      "signals": ["client supplies price, credit, role, entitlement, or status", "server persists supplied value", "authoritative value exists elsewhere"],
+      "trace": "Compare the client value with the server-side source of truth at the commit point.",
+      "counterevidence": ["server recomputation", "signed immutable quote", "post-parse overwrite before persistence"]
+    },
+    {
+      "id": "BL-002",
+      "family": "business-logic",
+      "skill": "ravage-source-business-logic",
+      "signals": ["workflow endpoints callable independently", "state transition checks differ", "later step assumes earlier validation"],
+      "trace": "Build the allowed state machine and trace a skipped, reordered, or replayed transition to its postcondition.",
+      "counterevidence": ["central transition function", "database constraint", "single-use transition token bound to state"]
+    },
+    {
+      "id": "BL-003",
+      "family": "business-logic",
+      "skill": "ravage-source-business-logic",
+      "signals": ["refund, invite, reset, coupon, or approval can be retried", "consumption marker updates separately", "partial failure is recoverable"],
+      "trace": "Trace success, retry, rollback, and exception paths around the one-time asset.",
+      "counterevidence": ["atomic consume-and-apply", "unique constraint", "idempotency record covers the side effect"]
+    },
+    {
+      "id": "CC-001",
+      "family": "concurrency",
+      "skill": "ravage-source-concurrency",
+      "signals": ["check and write are separate", "shared mutable record", "multiple workers or requests can enter"],
+      "trace": "Write an explicit two-actor interleaving and map each step to transaction and lock boundaries.",
+      "counterevidence": ["serializable transaction", "conditional atomic update", "exclusive lock spans check and write"]
+    },
+    {
+      "id": "CC-002",
+      "family": "concurrency",
+      "skill": "ravage-source-concurrency",
+      "signals": ["webhook or job retries", "side effect precedes completion marker", "delivery is at least once"],
+      "trace": "Trace duplicate delivery through deduplication scope, side effect, commit, and acknowledgement.",
+      "counterevidence": ["durable idempotency key", "transactional outbox or inbox", "downstream idempotent operation"]
+    },
+    {
+      "id": "CC-003",
+      "family": "concurrency",
+      "skill": "ravage-source-concurrency",
+      "signals": ["filesystem or authorization check before later use", "identity can change between operations", "path is reopened"],
+      "trace": "Identify the mutable object between check and use and whether the same handle or identity is preserved.",
+      "counterevidence": ["descriptor-relative operation", "immutable snapshot", "revalidation immediately before side effect"]
+    },
+    {
+      "id": "IN-001",
+      "family": "injection",
+      "skill": "ravage-source-injection",
+      "signals": ["untrusted value concatenated into query text", "dynamic identifiers or clauses", "string query API"],
+      "trace": "Track value and grammar position into the executed query, including wrappers and query builders.",
+      "counterevidence": ["typed parameter binding", "closed allowlist for identifiers", "value never reaches execution"]
+    },
+    {
+      "id": "IN-002",
+      "family": "injection",
+      "skill": "ravage-source-injection",
+      "signals": ["shell invocation", "string command composition", "user value reaches executable or arguments"],
+      "trace": "Distinguish direct argv execution from shell parsing and trace each controllable grammar boundary.",
+      "counterevidence": ["fixed executable and separate argv", "closed enum mapping", "shell disabled"]
+    },
+    {
+      "id": "IN-003",
+      "family": "injection",
+      "skill": "ravage-source-injection",
+      "signals": ["template or expression compiled from input", "context-aware escaping missing", "safe-marking after partial filtering"],
+      "trace": "Identify the sink grammar and prove whether the final encoder or sandbox matches that exact context.",
+      "counterevidence": ["constant template with value binding", "correct context encoder at final sink", "strict sandbox with unreachable dangerous objects"]
+    },
+    {
+      "id": "FP-001",
+      "family": "files-and-parsers",
+      "skill": "ravage-source-files-and-parsers",
+      "signals": ["untrusted path joined to base", "normalization before or after policy differs", "prefix string containment"],
+      "trace": "Follow decoding, normalization, symlink resolution, containment, open, and later rename or extraction.",
+      "counterevidence": ["descriptor-relative confined open", "canonical path component comparison", "storage key not interpreted as a path"]
+    },
+    {
+      "id": "FP-002",
+      "family": "files-and-parsers",
+      "skill": "ravage-source-files-and-parsers",
+      "signals": ["archive entries extracted", "entry names control destinations", "links or overwrite behavior accepted"],
+      "trace": "Trace each entry name and link through normalization to the final extraction root and overwrite policy.",
+      "counterevidence": ["per-entry canonical containment", "links rejected", "exclusive creation in isolated directory"]
+    },
+    {
+      "id": "FP-003",
+      "family": "files-and-parsers",
+      "skill": "ravage-source-files-and-parsers",
+      "signals": ["polymorphic object reconstruction", "unsafe YAML or native object stream", "XML external resolution enabled"],
+      "trace": "Bind attacker influence to parser mode, allowed types or resolvers, instantiated behavior, and reachable side effects.",
+      "counterevidence": ["data-only parser", "closed type allowlist", "external entities and network resolvers disabled"]
+    },
+    {
+      "id": "OR-001",
+      "family": "outbound-requests",
+      "skill": "ravage-source-outbound-requests",
+      "signals": ["user controls URL", "policy validates text before client parsing", "multiple URL parsers or normalization stages"],
+      "trace": "Trace raw input through decoding, parsing, validation, canonicalization, and connector destination.",
+      "counterevidence": ["single canonical parser", "resolved destination checked", "closed destination allowlist"]
+    },
+    {
+      "id": "OR-002",
+      "family": "outbound-requests",
+      "skill": "ravage-source-outbound-requests",
+      "signals": ["redirect following enabled", "only initial URL checked", "credentials or headers forwarded"],
+      "trace": "Follow redirect policy and header propagation across every hop and scheme change.",
+      "counterevidence": ["redirects disabled", "every hop revalidated", "sensitive headers stripped on origin change"]
+    },
+    {
+      "id": "OR-003",
+      "family": "outbound-requests",
+      "skill": "ravage-source-outbound-requests",
+      "signals": ["hostname checked before connection", "DNS answer reused inconsistently", "proxy performs separate resolution"],
+      "trace": "Compare the address authorized by policy with the address actually connected by the effective transport.",
+      "counterevidence": ["connect-to checked address", "post-resolution network policy", "trusted fixed proxy enforces destination"]
+    },
+    {
+      "id": "ID-001",
+      "family": "identity-tokens",
+      "skill": "ravage-source-identity-tokens",
+      "signals": ["token header selects algorithm or key", "verification options are dynamic", "issuer or audience omitted"],
+      "trace": "Map attacker-controlled token fields to verifier configuration and every accepted identity claim.",
+      "counterevidence": ["fixed algorithm allowlist", "trusted key selection independent of token URL fields", "issuer and audience required"]
+    },
+    {
+      "id": "ID-002",
+      "family": "identity-tokens",
+      "skill": "ravage-source-identity-tokens",
+      "signals": ["session survives login, logout, password change, or role change", "identifier is reused", "revocation state is not consulted"],
+      "trace": "Trace session minting, binding, rotation, lookup, invalidation, and authorization cache lifetime.",
+      "counterevidence": ["rotation at privilege boundary", "server-side revocation checked", "short-lived version-bound credential"]
+    },
+    {
+      "id": "ID-003",
+      "family": "identity-tokens",
+      "skill": "ravage-source-identity-tokens",
+      "signals": ["reset or invite token reusable", "token not bound to subject or purpose", "expiry checked separately from consume"],
+      "trace": "Trace entropy, storage, binding, comparison, expiry, consumption, and related state changes.",
+      "counterevidence": ["high-entropy single-use digest", "atomic consumption", "purpose and account binding"]
+    },
+    {
+      "id": "CF-001",
+      "family": "security-config",
+      "skill": "ravage-source-security-config",
+      "signals": ["security middleware is order-sensitive", "route registered before guard", "exception path bypasses wrapper"],
+      "trace": "Derive the effective middleware and route order for the production entry point.",
+      "counterevidence": ["framework-enforced global wrapper", "callee-level guard", "all entry points share protected composition"]
+    },
+    {
+      "id": "CF-002",
+      "family": "security-config",
+      "skill": "ravage-source-security-config",
+      "signals": ["debug or permissive default", "environment parsing fails open", "example config can enter release build"],
+      "trace": "Resolve defaults, configuration precedence, build mode, and deployment files to the reachable effective value.",
+      "counterevidence": ["production override guaranteed by build", "startup fails closed", "unsafe branch excluded from artifact"]
+    },
+    {
+      "id": "CF-003",
+      "family": "security-config",
+      "skill": "ravage-source-security-config",
+      "signals": ["trusted proxy headers affect origin or identity", "CORS or CSRF setting is broad", "cookie policy differs by environment"],
+      "trace": "Trace the setting through proxy topology and framework defaults to the security decision it controls.",
+      "counterevidence": ["trusted-hop allowlist", "exact origin policy", "anti-CSRF secret unavailable cross-site"]
+    },
+    {
+      "id": "SC-001",
+      "family": "supply-chain",
+      "skill": "ravage-source-supply-chain",
+      "signals": ["private package name can resolve publicly", "multiple registries", "source priority is implicit"],
+      "trace": "Derive package identity, registry precedence, namespace ownership, and lock provenance.",
+      "counterevidence": ["exclusive scoped registry", "repository source pin", "verified lock and artifact digest"]
+    },
+    {
+      "id": "SC-002",
+      "family": "supply-chain",
+      "skill": "ravage-source-supply-chain",
+      "signals": ["CI action, image, or dependency uses mutable tag", "artifact crosses trust boundary", "signature or digest absent"],
+      "trace": "Trace the mutable reference to the privileged build step and resulting artifact provenance.",
+      "counterevidence": ["immutable digest", "verified signature or provenance", "untrusted step has no release capability"]
+    },
+    {
+      "id": "SC-003",
+      "family": "supply-chain",
+      "skill": "ravage-source-supply-chain",
+      "signals": ["install hook, plugin, generator, or build script executes", "input comes from fork or untrusted branch", "secrets are available"],
+      "trace": "Map untrusted build input to code execution and the credentials, filesystem, or publication capability exposed.",
+      "counterevidence": ["hooks disabled", "isolated tokenless job", "trusted-source gate before privileged stage"]
+    }
+  ]
+}

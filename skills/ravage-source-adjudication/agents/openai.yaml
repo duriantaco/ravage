@@ -1,0 +1,4 @@
+interface:
+  display_name: "Adjudicate Source Finding"
+  short_description: "Independently reject source-review false positives"
+  default_prompt: "Use $ravage-source-adjudication to independently review this completed source candidate."
