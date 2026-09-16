@@ -346,6 +346,14 @@ ravage skills list builtin
 ravage skills validate builtin
 ~~~
 
+The repository also includes thirteen separate, source-code-only review skills
+for coding agents. They cover access control, business logic, concurrency,
+injection, files and parsers, outbound requests, identity tokens, security
+configuration, supply-chain trust, and current advisory applicability. They are
+exposed to Claude Code through `.claude/skills/` and to Codex through
+`.agents/skills/`; they do not run Ravage probes or test a live target. See
+[Source Audit Skills](docs/source-audit-skills.md).
+
 The [Improvement Lab](docs/improvement-lab.md) ingests sanitized prior-run
 structure, evaluates candidate patches in independent workspaces, archives
 accepted and rejected versions, and requires matched no-regression evidence

@@ -8,6 +8,9 @@ before an entry is described as released.
 
 ### Added
 
+- Added thirteen source-code-only security review skills, a versioned structural
+  vulnerability-pattern catalog, Claude Code and Codex project adapters, and
+  read-only source-audit and source-adjudication specialists.
 - Added a request-aware, gray-box HTTP action path for model-driven runs. It
   reuses session cookies, records redacted request contracts, replays observed
   request shapes, and links each agent request to durable evidence identifiers.
