@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Identity Tokens"
+  short_description: "Audit session and token verification lifecycles"
+  default_prompt: "Use $ravage-source-identity-tokens to review session, JWT, OAuth, and recovery-token lifecycles in this code."

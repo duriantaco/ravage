@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Files And Parsers"
+  short_description: "Find path, upload, archive, and parser flaws"
+  default_prompt: "Use $ravage-source-files-and-parsers to trace untrusted file and parser lifecycles in this repository."

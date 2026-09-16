@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Security Configuration"
+  short_description: "Derive unsafe effective security settings"
+  default_prompt: "Use $ravage-source-security-config to derive the effective security configuration and middleware order."

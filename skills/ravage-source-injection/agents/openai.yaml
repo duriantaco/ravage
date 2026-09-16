@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Source Injection"
+  short_description: "Trace untrusted data into interpreter grammars"
+  default_prompt: "Use $ravage-source-injection to trace source-to-sink injection paths and context-specific defenses."

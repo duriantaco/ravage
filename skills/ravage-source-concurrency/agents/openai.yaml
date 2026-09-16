@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Source Concurrency"
+  short_description: "Find races, TOCTOU, and idempotency gaps"
+  default_prompt: "Use $ravage-source-concurrency to derive source-backed race interleavings and transaction assumptions."

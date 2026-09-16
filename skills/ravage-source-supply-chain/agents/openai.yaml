@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Source Supply Chain"
+  short_description: "Audit build, CI, registry, and artifact trust"
+  default_prompt: "Use $ravage-source-supply-chain to map source-level build and dependency trust boundaries."

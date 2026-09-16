@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Source Access Control"
+  short_description: "Trace ownership, role, and tenant enforcement"
+  default_prompt: "Use $ravage-source-access-control to review this repository's authorization decisions and bypass paths."

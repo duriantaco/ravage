@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Business Logic"
+  short_description: "Find workflow and state-invariant violations"
+  default_prompt: "Use $ravage-source-business-logic to trace this workflow's invariants and source-level bypass sequences."

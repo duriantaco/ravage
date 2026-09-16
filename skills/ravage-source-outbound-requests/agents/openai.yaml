@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Outbound Requests"
+  short_description: "Trace SSRF and URL-policy mismatches"
+  default_prompt: "Use $ravage-source-outbound-requests to review this code's URL parsing, policy, redirect, and connection chain."
