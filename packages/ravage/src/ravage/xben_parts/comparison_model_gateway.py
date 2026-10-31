@@ -34,6 +34,7 @@ from typing import Protocol
 
 MODEL_GATEWAY_SCHEMA = "ravage.xben.model-gateway-receipt.v1"
 MODEL_GATEWAY_POLICY_SCHEMA = "ravage.xben.model-gateway-policy.v1"
+MODEL_GATEWAY_CAMPAIGN_SCHEMA = "ravage.xben.model-gateway-campaign-receipt.v1"
 OPENAI_CHAT_PATH = "/v1/chat/completions"
 OPENAI_HOST = "api.openai.com"
 _ROW_ID_RE = re.compile(r"primary-(?:00[1-9]|0[1-9][0-9]|[1-9][0-9]{2})")
@@ -59,6 +60,7 @@ _MAX_INPUT_MONEY_ADJUSTED_EXPONENT = 28
 # beyond that derived maximum while keeping serialization finite.
 _MAX_EVIDENCE_MONEY_TEXT_CHARS = 256
 _MAX_EVIDENCE_MONEY_ADJUSTED_EXPONENT = 64
+_PRIMARY_CAMPAIGN_ROW_IDS = tuple(f"primary-{index:03d}" for index in range(1, 41))
 
 
 class ModelGatewayError(RuntimeError):
@@ -319,6 +321,13 @@ class _RowState:
 
 
 @dataclass(frozen=True)
+class _SealedRowEvidence:
+    output_path: Path
+    canonical_receipt: bytes
+    file_sha256: str
+
+
+@dataclass(frozen=True)
 class _Reservation:
     row_id: str
     ordinal: int
@@ -397,6 +406,8 @@ class ComparisonModelGateway:
         self._condition = threading.Condition(self._lock)
         self._rows: dict[str, _RowState] = {}
         self._row_by_token_hash: dict[str, str] = {}
+        self._sealed_row_evidence: dict[str, _SealedRowEvidence] = {}
+        self._campaign_sealed = False
         self._campaign_charged_cost_usd = _ZERO
         self._campaign_active_reserved_cost_usd = _ZERO
         self._server: _GatewayHTTPServer | None = None
@@ -418,6 +429,8 @@ class ComparisonModelGateway:
 
     def start(self) -> None:
         with self._lock:
+            if self._campaign_sealed:
+                raise ModelGatewayError("model gateway campaign is already sealed")
             if self._server is not None:
                 raise ModelGatewayError("model gateway is already running")
             gateway = self
@@ -483,6 +496,8 @@ class ComparisonModelGateway:
         token = secrets.token_urlsafe(48)
         token_hash = _sha256(token.encode())
         with self._lock:
+            if self._campaign_sealed:
+                raise RowRegistrationError("model gateway campaign is already sealed")
             if row_id in self._rows:
                 raise RowRegistrationError("model gateway row is already registered")
             self._rows[row_id] = _RowState(
@@ -554,15 +569,98 @@ class ComparisonModelGateway:
                 if row.active_requests or row.active_reserved_cost_usd != 0:
                     raise RowSealError("model gateway row did not become terminal")
                 receipt = self._row_receipt(row)
-                _write_json_exclusive(output_path, receipt)
+                file_digest = _write_json_exclusive(output_path, receipt)
             except BaseException:
                 row.sealing = False
                 self._condition.notify_all()
                 raise
             row.sealed = True
             row.sealing = False
+            self._sealed_row_evidence[row_id] = _SealedRowEvidence(
+                output_path=output_path.expanduser().absolute(),
+                canonical_receipt=_canonical_json(receipt),
+                file_sha256=file_digest,
+            )
             self._condition.notify_all()
             return receipt
+
+    def seal_primary_campaign(self, output_path: Path) -> dict[str, object]:
+        """Bind the complete forty-row primary ledger into create-only evidence.
+
+        Row receipts remain the accounting authority.  Their retained bytes
+        must still match the snapshots captured when admission was closed,
+        including invalid rows whose conservative charges remain reportable.
+        """
+
+        with self._lock:
+            if self._campaign_sealed:
+                raise RowSealError("model gateway campaign is already sealed")
+            if self._server is not None or self._thread is not None:
+                raise RowSealError("model gateway must be stopped before campaign sealing")
+            if set(self._rows) != set(_PRIMARY_CAMPAIGN_ROW_IDS):
+                raise RowSealError("model gateway campaign must contain exactly forty primary rows")
+            if set(self._sealed_row_evidence) != set(_PRIMARY_CAMPAIGN_ROW_IDS) or any(
+                not row.sealed
+                or not row.closing
+                or row.sealing
+                or row.active_requests
+                or row.active_reserved_cost_usd != 0
+                or row.active_ordinals
+                or row.reservations
+                for row in self._rows.values()
+            ):
+                raise RowSealError("model gateway campaign contains unsealed or active rows")
+            if self._campaign_active_reserved_cost_usd != 0:
+                raise RowSealError("model gateway campaign has active cost reservations")
+            first = self._rows[_PRIMARY_CAMPAIGN_ROW_IDS[0]]
+            if any(
+                row.max_requests != first.max_requests or row.max_cost_usd != first.max_cost_usd
+                for row in self._rows.values()
+            ):
+                raise RowSealError("model gateway campaign row budgets differ")
+            receipts: dict[str, object] = {}
+            file_digests: dict[str, str] = {}
+            for row_id in _PRIMARY_CAMPAIGN_ROW_IDS:
+                evidence = self._sealed_row_evidence[row_id]
+                if evidence.output_path.is_symlink() or not evidence.output_path.is_file():
+                    raise RowSealError("sealed model gateway row evidence is unavailable")
+                with evidence.output_path.open("rb") as retained_file:
+                    retained = retained_file.read(_MAX_RECEIPT_BYTES + 1)
+                if len(retained) > _MAX_RECEIPT_BYTES or _sha256(retained) != evidence.file_sha256:
+                    raise RowSealError("sealed model gateway row evidence changed")
+                receipt = _decode_json_object(evidence.canonical_receipt, "sealed model row")
+                receipts[row_id] = receipt
+                file_digests[row_id] = evidence.file_sha256
+            policy = self.policy.to_json()
+            rows, totals, valid = _campaign_accounting(
+                policy=policy,
+                expected_policy_sha256=self.policy_digest,
+                expected_max_requests_per_row=first.max_requests,
+                expected_max_cost_usd_per_row=first.max_cost_usd,
+                row_receipts=receipts,
+                row_receipt_file_sha256=file_digests,
+            )
+            if totals["charged_cost_usd"] != _money(self._campaign_charged_cost_usd):
+                raise RowSealError("model gateway campaign charge ledger is inconsistent")
+            body: dict[str, object] = {
+                "schema_version": MODEL_GATEWAY_CAMPAIGN_SCHEMA,
+                "created_at": _now(),
+                "policy": policy,
+                "policy_sha256": self.policy_digest,
+                "row_count": len(_PRIMARY_CAMPAIGN_ROW_IDS),
+                "limits": {
+                    "max_requests_per_row": first.max_requests,
+                    "max_cost_usd_per_row": _money(first.max_cost_usd),
+                },
+                "rows": rows,
+                "totals": totals,
+                "all_rows_terminal": True,
+                "valid": valid,
+            }
+            body["document_sha256"] = _sha256(_canonical_json(body))
+            _write_json_exclusive(output_path, body)
+            self._campaign_sealed = True
+            return body
 
     def _terminalize_active_requests(self, row: _RowState) -> None:
         """Turn every admitted request into immutable conservative evidence."""
@@ -1292,6 +1390,182 @@ def validate_model_gateway_receipt(
     return dict(payload)
 
 
+def validate_model_gateway_campaign_receipt(
+    payload: object,
+    *,
+    expected_policy_sha256: str,
+    expected_campaign_max_cost_usd: int | str | Decimal,
+    expected_max_requests_per_row: int,
+    expected_max_cost_usd_per_row: int | str | Decimal,
+    row_receipts: Mapping[str, object],
+    row_receipt_file_sha256: Mapping[str, str],
+) -> dict[str, object]:
+    """Independently bind and recompute the complete primary campaign ledger."""
+
+    fields = {
+        "schema_version",
+        "created_at",
+        "policy",
+        "policy_sha256",
+        "row_count",
+        "limits",
+        "rows",
+        "totals",
+        "all_rows_terminal",
+        "valid",
+        "document_sha256",
+    }
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != fields
+        or payload.get("schema_version") != MODEL_GATEWAY_CAMPAIGN_SCHEMA
+    ):
+        raise ModelGatewayError("model gateway campaign receipt fields are invalid")
+    body = {key: value for key, value in payload.items() if key != "document_sha256"}
+    if payload.get("document_sha256") != _sha256(_canonical_json(body)):
+        raise ModelGatewayError("model gateway campaign document digest is invalid")
+    _receipt_timestamp(payload.get("created_at"), "campaign receipt creation time")
+    policy = _validate_policy_receipt(payload.get("policy"))
+    policy_digest = _sha256(_canonical_json(policy))
+    if (
+        policy_digest != _receipt_sha256(expected_policy_sha256, "expected model policy digest")
+        or payload.get("policy_sha256") != policy_digest
+    ):
+        raise ModelGatewayError("model gateway campaign policy binding is invalid")
+    campaign_maximum = _receipt_money(
+        expected_campaign_max_cost_usd, "expected campaign cost ceiling"
+    )
+    if policy["campaign_max_cost_usd"] != campaign_maximum:
+        raise ModelGatewayError("model gateway campaign cost ceiling differs from its policy")
+    if (
+        _receipt_positive_integer(payload.get("row_count"), "campaign row count")
+        != len(_PRIMARY_CAMPAIGN_ROW_IDS)
+        or payload.get("all_rows_terminal") is not True
+    ):
+        raise ModelGatewayError("model gateway campaign is not the complete terminal primary matrix")
+    rows, totals, valid = _campaign_accounting(
+        policy=policy,
+        expected_policy_sha256=policy_digest,
+        expected_max_requests_per_row=expected_max_requests_per_row,
+        expected_max_cost_usd_per_row=expected_max_cost_usd_per_row,
+        row_receipts=row_receipts,
+        row_receipt_file_sha256=row_receipt_file_sha256,
+    )
+    limits = payload.get("limits")
+    if (
+        not isinstance(limits, dict)
+        or set(limits) != {"max_requests_per_row", "max_cost_usd_per_row"}
+        or _receipt_positive_integer(
+            limits.get("max_requests_per_row"), "campaign per-row request ceiling"
+        )
+        != expected_max_requests_per_row
+        or limits.get("max_cost_usd_per_row")
+        != _receipt_money(expected_max_cost_usd_per_row, "expected row cost ceiling")
+    ):
+        raise ModelGatewayError("model gateway campaign row budget binding is invalid")
+    if payload.get("rows") != rows:
+        raise ModelGatewayError("model gateway campaign row evidence bindings are inconsistent")
+    observed_rows = payload["rows"]
+    assert isinstance(observed_rows, list)  # Its value must equal the recomputed list above.
+    if any(
+        observed["valid"] is not expected["valid"]
+        for observed, expected in zip(observed_rows, rows, strict=True)
+    ):
+        raise ModelGatewayError("model gateway campaign row validity verdict is inconsistent")
+    observed_totals = payload.get("totals")
+    if not isinstance(observed_totals, dict) or set(observed_totals) != set(totals):
+        raise ModelGatewayError("model gateway campaign total fields are invalid")
+    for name in ("requests_started", "requests_recorded"):
+        _receipt_nonnegative_integer(observed_totals.get(name), f"campaign {name}")
+    if (
+        observed_totals != totals
+        or observed_totals.get("within_cost_limit") is not totals["within_cost_limit"]
+        or payload.get("valid") is not valid
+    ):
+        raise ModelGatewayError("model gateway campaign accounting verdict is inconsistent")
+    return dict(payload)
+
+
+def _campaign_accounting(
+    *,
+    policy: Mapping[str, object],
+    expected_policy_sha256: str,
+    expected_max_requests_per_row: int,
+    expected_max_cost_usd_per_row: int | str | Decimal,
+    row_receipts: Mapping[str, object],
+    row_receipt_file_sha256: Mapping[str, str],
+) -> tuple[list[dict[str, object]], dict[str, object], bool]:
+    if (
+        not isinstance(row_receipts, Mapping)
+        or not isinstance(row_receipt_file_sha256, Mapping)
+        or set(row_receipts) != set(_PRIMARY_CAMPAIGN_ROW_IDS)
+        or set(row_receipt_file_sha256) != set(_PRIMARY_CAMPAIGN_ROW_IDS)
+    ):
+        raise ModelGatewayError("model gateway campaign requires exactly forty primary row receipts")
+    if (
+        _receipt_positive_integer(expected_max_requests_per_row, "expected row request ceiling")
+        > _MAX_REQUESTS_PER_ROW
+    ):
+        raise ModelGatewayError("model gateway campaign row request ceiling exceeds its maximum")
+    maximum = _decimal(
+        _receipt_money(expected_max_cost_usd_per_row, "expected row cost ceiling"),
+        "expected row cost ceiling",
+    )
+    campaign_maximum = _decimal(policy["campaign_max_cost_usd"], "campaign cost ceiling")
+    if maximum > campaign_maximum:
+        raise ModelGatewayError("model gateway campaign row cost ceiling exceeds the campaign cap")
+    rows: list[dict[str, object]] = []
+    tokens: set[str] = set()
+    requests_started = 0
+    requests_recorded = 0
+    charged_total = _ZERO
+    actual_total = _ZERO
+    all_rows_valid = True
+    for row_id in _PRIMARY_CAMPAIGN_ROW_IDS:
+        receipt = validate_model_gateway_receipt(
+            row_receipts[row_id],
+            expected_row_id=row_id,
+            expected_policy_sha256=expected_policy_sha256,
+            expected_max_requests=expected_max_requests_per_row,
+            expected_max_cost_usd=maximum,
+        )
+        if receipt["policy"] != policy:
+            raise ModelGatewayError("model gateway campaign row policies differ")
+        token = _receipt_sha256(receipt["row_token_sha256"], "row token digest")
+        if token in tokens:
+            raise ModelGatewayError("model gateway campaign row tokens are not unique")
+        tokens.add(token)
+        file_digest = _receipt_sha256(
+            row_receipt_file_sha256[row_id], "row receipt file digest"
+        )
+        row_totals = receipt["totals"]
+        assert isinstance(row_totals, dict)  # Checked by the row receipt validator.
+        requests_started += row_totals["requests_started"]
+        requests_recorded += row_totals["requests_recorded"]
+        charged_total = _add_money(charged_total, Decimal(row_totals["charged_cost_usd"]))
+        actual_total = _add_money(actual_total, Decimal(row_totals["known_actual_cost_usd"]))
+        all_rows_valid = all_rows_valid and receipt["valid"] is True
+        rows.append(
+            {
+                "row_id": row_id,
+                "row_token_sha256": token,
+                "row_document_sha256": receipt["document_sha256"],
+                "row_receipt_file_sha256": file_digest,
+                "valid": receipt["valid"],
+            }
+        )
+    within_cost_limit = charged_total <= campaign_maximum
+    totals: dict[str, object] = {
+        "requests_started": requests_started,
+        "requests_recorded": requests_recorded,
+        "charged_cost_usd": _money(charged_total),
+        "known_actual_cost_usd": _money(actual_total),
+        "campaign_max_cost_usd": _money(campaign_maximum),
+        "within_cost_limit": within_cost_limit,
+    }
+    return rows, totals, all_rows_valid and within_cost_limit
+
+
 def _validate_policy_receipt(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ModelGatewayError("model gateway receipt policy is malformed")
@@ -1873,7 +2147,7 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _write_json_exclusive(path: Path, payload: Mapping[str, object]) -> None:
+def _write_json_exclusive(path: Path, payload: Mapping[str, object]) -> str:
     target = path.expanduser()
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     serialized = (json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n").encode(
@@ -1886,12 +2160,14 @@ def _write_json_exclusive(path: Path, payload: Mapping[str, object]) -> None:
             output.write(serialized)
     except FileExistsError as exc:
         raise RowSealError(f"refusing to replace model gateway evidence: {target}") from exc
+    return _sha256(serialized)
 
 
 __all__ = [
-    "ComparisonModelGateway",
+    "MODEL_GATEWAY_CAMPAIGN_SCHEMA",
     "MODEL_GATEWAY_POLICY_SCHEMA",
     "MODEL_GATEWAY_SCHEMA",
+    "ComparisonModelGateway",
     "ModelGatewayError",
     "ModelGatewayPolicy",
     "ModelPricing",
@@ -1899,5 +2175,6 @@ __all__ = [
     "RowSealError",
     "UpstreamResponse",
     "UpstreamTransport",
+    "validate_model_gateway_campaign_receipt",
     "validate_model_gateway_receipt",
 ]
