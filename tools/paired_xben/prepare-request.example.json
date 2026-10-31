@@ -1,0 +1,114 @@
+{
+  "authenticity": {
+    "cosign_binary": "/ABSOLUTE/cosign-darwin-arm64",
+    "cosign_release_bundle": "/ABSOLUTE/cosign-darwin-arm64.sigstore.json",
+    "cosign_release_bundle_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "cosign_release_identity": "keyless@projectsigstore.iam.gserviceaccount.com",
+    "cosign_release_oidc_issuer": "https://accounts.google.com",
+    "drand_verifier": "/ABSOLUTE/drandverify",
+    "publication_certificate_identity": "https://github.com/OWNER/REPOSITORY/.github/workflows/paired-xben.yml@refs/heads/main",
+    "publication_certificate_oidc_issuer": "https://token.actions.githubusercontent.com",
+    "sigstore_trusted_root": "/ABSOLUTE/sigstore-trusted-root.json"
+  },
+  "budgets": {
+    "per_row": {
+      "max_cost_usd": "0.55",
+      "max_model_requests": 40,
+      "max_target_requests": 96,
+      "wall_seconds": 600
+    }
+  },
+  "compatibility_catalog": {
+    "path": "/ABSOLUTE/ravage/tools/paired_xben/compatibility/catalog.json",
+    "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "execution": {
+    "docker_executable": "/Applications/Docker.app/Contents/Resources/bin/docker",
+    "docker_socket": "/ABSOLUTE/.docker/run/docker.sock",
+    "oci_images": {
+      "ravage_tool": "ghcr.io/duriantaco/ravage-kali@sha256:475ee5f275b475ef75a4810f04d806565907c330b17bf3cc1aea7a5000d2142c",
+      "strix_sandbox": "ghcr.io/usestrix/strix-sandbox@sha256:e5e5d9927f15ca95ad49804ef7d22439771cd27378f400da6edd47556799baff",
+      "target_gateway": "registry.example.invalid/replace-target-gateway@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "target_probe": "docker.io/curlimages/curl@sha256:5a91ea0c9c3ee27b4abe657b68cf6bf0676afa13b236b3bda34283cb3924d4f6"
+    },
+    "private_target_root": "/ABSOLUTE/empty-mode-0700-private-target-root",
+    "ravage_target_listen_port": 38191,
+    "required_free_gib": 20,
+    "timeouts": {
+      "build_seconds": 900,
+      "inspect_seconds": 30,
+      "startup_seconds": 180,
+      "teardown_seconds": 90
+    },
+    "trusted_path": "/Applications/Docker.app/Contents/Resources/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "upstream_api_key_environment": "OPENAI_API_KEY"
+  },
+  "model_gateway": {
+    "policy": {
+      "campaign_max_cost_usd": "22",
+      "max_completion_tokens_per_request": 8192,
+      "max_parallel_requests": 1,
+      "max_request_body_bytes": 1048576,
+      "max_upstream_response_bytes": 8388608,
+      "model": "gpt-5.4-mini-2026-03-17",
+      "pricing_usd_per_million_tokens": {
+        "cached_input_per_million": "0.075",
+        "input_per_million": "0.75",
+        "output_per_million": "4.5"
+      },
+      "reasoning_effort": "high",
+      "upstream_timeout_seconds": 600
+    },
+    "pricing_source": {
+      "artifact_path": "/ABSOLUTE/gpt-5.4-mini-2026-03-17.md",
+      "artifact_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "kind": "openai_model_page_markdown",
+      "published_on": null,
+      "retrieved_at": "2026-09-11T00:00:00+00:00",
+      "url": "https://developers.openai.com/api/docs/models/gpt-5.4-mini.md"
+    }
+  },
+  "runtimes": {
+    "ravage": {
+      "executable": "/ABSOLUTE/ravage-runtime/.venv/bin/ravage",
+      "runtime_environment_manifest": "/ABSOLUTE/ravage-runtime-environment.json",
+      "runtime_read_roots": [
+        "/ABSOLUTE/outer-python-installation",
+        "/ABSOLUTE/ravage-runtime",
+        "/ABSOLUTE/ravage-runtime/.venv"
+      ]
+    },
+    "strix": {
+      "executable": "/ABSOLUTE/strix-runtime/.venv/bin/strix",
+      "runtime_environment_manifest": "/ABSOLUTE/strix-runtime-environment.json",
+      "runtime_read_roots": [
+        "/ABSOLUTE/outer-python-installation",
+        "/ABSOLUTE/strix-runtime",
+        "/ABSOLUTE/strix-runtime/.venv"
+      ]
+    }
+  },
+  "schema_version": "ravage.paired-xben.prepare-request.v1",
+  "sources": {
+    "ravage": {
+      "expected_commit": "0000000000000000000000000000000000000000",
+      "origin_url": "https://github.com/OWNER/ravage.git",
+      "repository": "/ABSOLUTE/ravage-runtime"
+    },
+    "strix": {
+      "expected_commit": "95e085eb6ce29c72ff84313b012cd2c9e9c1cfe5",
+      "origin_url": "https://github.com/usestrix/strix.git",
+      "repository": "/ABSOLUTE/strix-runtime"
+    },
+    "xben": {
+      "expected_commit": "a16cb1ba0701b20d63913846536fc7b0672082af",
+      "origin_url": "https://github.com/xbow-engineering/validation-benchmarks.git",
+      "repository": "/ABSOLUTE/xben-runtime"
+    }
+  },
+  "website": {
+    "classification": "known_site",
+    "reference_artifact": "/ABSOLUTE/known-website-source-or-manifest",
+    "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}

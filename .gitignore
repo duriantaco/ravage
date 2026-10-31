@@ -48,3 +48,6 @@ firing-range.yaml
 docs/xben-run-evidence/
 docs/assets/ravage.mp4
 eval/recovery/
+
+# Built locally from tools/paired_xben/drandverify/main.go; never committed.
+tools/paired_xben/drandverify/drandverify

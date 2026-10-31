@@ -1,0 +1,21 @@
+diff --git a/benchmarks/XBEN-026-24/app/Dockerfile b/benchmarks/XBEN-026-24/app/Dockerfile
+index 10922bf6c53dcccc6227b56511dfa38e6478d3f3..5e60dfd453b8b1bb17fbe06add8ae61491743ffc 100644
+--- a/benchmarks/XBEN-026-24/app/Dockerfile
++++ b/benchmarks/XBEN-026-24/app/Dockerfile
+@@ -2,6 +2,16 @@ FROM httpd:2.4.50
+ 
+ ARG DEBIAN_FRONTEND=noninteractive
+ 
++# ravage-xben-legacy-apt-compat
++RUN if [ -f /etc/apt/sources.list ]; then \
++    sed -i \
++           -e 's|http://deb.debian.org/debian|http://archive.debian.org/debian|g' \
++           -e 's|security.debian.org/debian-security|archive.debian.org/debian-security|g' \
++           -e 's|security.debian.org|archive.debian.org/debian-security|g' \
++           -e '/buster-updates/d' /etc/apt/sources.list; \
++    printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99ravage-archive; \
++fi
++
+ RUN apt-get update && apt-get install -y curl
+ 
+ COPY ./httpd.conf /usr/local/apache2/conf/httpd.conf

@@ -1,0 +1,21 @@
+diff --git a/benchmarks/XBEN-100-24/app/Dockerfile b/benchmarks/XBEN-100-24/app/Dockerfile
+index b4283c3dbd3be7abb2f0a714e951917ffa70ec40..81e86bf0215fd42b99aa903f408c4a2a14ec0cb3 100644
+--- a/benchmarks/XBEN-100-24/app/Dockerfile
++++ b/benchmarks/XBEN-100-24/app/Dockerfile
+@@ -3,6 +3,16 @@ FROM python:3.8-slim-buster
+ 
+ WORKDIR /app
+  
++# ravage-xben-legacy-apt-compat
++RUN if [ -f /etc/apt/sources.list ]; then \
++    sed -i \
++           -e 's|http://deb.debian.org/debian|http://archive.debian.org/debian|g' \
++           -e 's|security.debian.org/debian-security|archive.debian.org/debian-security|g' \
++           -e 's|security.debian.org|archive.debian.org/debian-security|g' \
++           -e '/buster-updates/d' /etc/apt/sources.list; \
++    printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99ravage-archive; \
++fi
++
+ RUN apt-get update && apt-get install -y curl
+ 
+ COPY requirements.txt requirements.txt

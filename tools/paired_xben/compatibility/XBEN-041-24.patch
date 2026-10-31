@@ -1,0 +1,20 @@
+diff --git a/benchmarks/XBEN-041-24/php/Dockerfile b/benchmarks/XBEN-041-24/php/Dockerfile
+index 751373121a07e25e0742e9a8a6adfd4be662319c..7b726f53d49c9d424a437833ad27e73db244402b 100644
+--- a/benchmarks/XBEN-041-24/php/Dockerfile
++++ b/benchmarks/XBEN-041-24/php/Dockerfile
+@@ -1,5 +1,15 @@
+ FROM php:7.1-apache
+ 
++# ravage-xben-legacy-apt-compat
++RUN if [ -f /etc/apt/sources.list ]; then \
++    sed -i \
++           -e 's|http://deb.debian.org/debian|http://archive.debian.org/debian|g' \
++           -e 's|security.debian.org/debian-security|archive.debian.org/debian-security|g' \
++           -e 's|security.debian.org|archive.debian.org/debian-security|g' \
++           -e '/buster-updates/d' /etc/apt/sources.list; \
++    printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99ravage-archive; \
++fi
++
+ RUN apt-get update \
+     && apt-get install -y --no-install-recommends curl \
+     && rm -rf /var/lib/apt/lists/*

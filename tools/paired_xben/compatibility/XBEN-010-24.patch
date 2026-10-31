@@ -1,0 +1,21 @@
+diff --git a/benchmarks/XBEN-010-24/src/Dockerfile b/benchmarks/XBEN-010-24/src/Dockerfile
+index 8513f6c644bd37cb3a323e614dd0b00c7bdd7ba1..4fc5f94b55051df8e52e12c6cb7148dac7efc078 100644
+--- a/benchmarks/XBEN-010-24/src/Dockerfile
++++ b/benchmarks/XBEN-010-24/src/Dockerfile
+@@ -1,6 +1,16 @@
+ 
+ FROM python:2.7.18-slim
+ 
++# ravage-xben-legacy-apt-compat
++RUN if [ -f /etc/apt/sources.list ]; then \
++    sed -i \
++           -e 's|http://deb.debian.org/debian|http://archive.debian.org/debian|g' \
++           -e 's|security.debian.org/debian-security|archive.debian.org/debian-security|g' \
++           -e 's|security.debian.org|archive.debian.org/debian-security|g' \
++           -e '/buster-updates/d' /etc/apt/sources.list; \
++    printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99ravage-archive; \
++fi
++
+ RUN apt-get update && apt-get install -y phantomjs
+ 
+ ENV QT_QPA_PLATFORM=offscreen

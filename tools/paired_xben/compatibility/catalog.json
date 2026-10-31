@@ -1,0 +1,72 @@
+{
+  "schema_version": "ravage.paired-xben.compatibility-catalog.v1",
+  "benchmark": "XBEN",
+  "source": {
+    "origin": "https://github.com/xbow-engineering/validation-benchmarks.git",
+    "commit_sha": "a16cb1ba0701b20d63913846536fc7b0672082af",
+    "benchmarks_tree_sha": "e2f75b893d23f51be7353cfab2f21fb4361d073c"
+  },
+  "coverage": {
+    "case_id_pattern": "XBEN-001-24..XBEN-104-24",
+    "case_count": 104,
+    "default_action": "no_patch",
+    "unlisted_cases_receive_patch": false
+  },
+  "policy": {
+    "purpose": "Restore package-index availability for archived Debian releases without changing challenge application logic, services, credentials, vulnerabilities, or flags.",
+    "allowed_change_class": "legacy_debian_apt_mirror_only",
+    "semantic_challenge_changes_allowed": false,
+    "selection_time_changes_allowed": false,
+    "post_draw_changes_allowed": false
+  },
+  "patches": [
+    {
+      "case_id": "XBEN-010-24",
+      "path": "XBEN-010-24.patch",
+      "sha256": "07821c84c9afe560d20e69e369c2d17dbc3f28a68fd51cc9493559908bbfefb6",
+      "touched_files": ["benchmarks/XBEN-010-24/src/Dockerfile"]
+    },
+    {
+      "case_id": "XBEN-026-24",
+      "path": "XBEN-026-24.patch",
+      "sha256": "64f69cf0dc63659f8a683eebc7d1209e73a737235d7670b5eb1345082ecbe792",
+      "touched_files": ["benchmarks/XBEN-026-24/app/Dockerfile"]
+    },
+    {
+      "case_id": "XBEN-041-24",
+      "path": "XBEN-041-24.patch",
+      "sha256": "8ec2af44c7de8ae0ab2afe698048eab604733307355f404c3b26c621b3aa83f9",
+      "touched_files": ["benchmarks/XBEN-041-24/php/Dockerfile"]
+    },
+    {
+      "case_id": "XBEN-047-24",
+      "path": "XBEN-047-24.patch",
+      "sha256": "0c63a34a021cb9455ffe5572bab587f9ebe0b06fa0dc7beefd37bb6fa03dc619",
+      "touched_files": ["benchmarks/XBEN-047-24/src/Dockerfile"]
+    },
+    {
+      "case_id": "XBEN-051-24",
+      "path": "XBEN-051-24.patch",
+      "sha256": "c31b55a27e955e1abd2d411a1267b26be1a12ee9cd606dc91a916636a09271b1",
+      "touched_files": ["benchmarks/XBEN-051-24/src/Dockerfile"]
+    },
+    {
+      "case_id": "XBEN-093-24",
+      "path": "XBEN-093-24.patch",
+      "sha256": "72785d84e7784c8e850db219c38c0043d0effb6678c341a47ae5ad496880a908",
+      "touched_files": ["benchmarks/XBEN-093-24/app/Dockerfile"]
+    },
+    {
+      "case_id": "XBEN-094-24",
+      "path": "XBEN-094-24.patch",
+      "sha256": "a3f3f95d3a5af327af590dc66bb4e61ad60aab0849ec077b53dc6f21238f2d90",
+      "touched_files": ["benchmarks/XBEN-094-24/app/Dockerfile"]
+    },
+    {
+      "case_id": "XBEN-100-24",
+      "path": "XBEN-100-24.patch",
+      "sha256": "c0982972cf4e3b3378513ad29998d843dd3945f67e2c43393c1b49c1276a7bff",
+      "touched_files": ["benchmarks/XBEN-100-24/app/Dockerfile"]
+    }
+  ]
+}
