@@ -1,0 +1,197 @@
+{
+  "schema_version": "ravage.known-site.production-request.v4",
+  "campaign_id": "known-site-website-20260912-v1",
+  "canonical_campaign_directory": "/Users/oha/ravage/runs/comparisons/20260911-strix-ravage-xben20/known-site-website-20260912-v1",
+  "authenticated_order_source": {
+    "paired_campaign_directory": "/Users/oha/ravage/runs/comparisons/20260911-strix-ravage-xben20/REQUIRED_RESOLVED_PAIRED_XBEN_CAMPAIGN",
+    "paired_campaign_id": "required-resolved-paired-xben-campaign",
+    "commitment_document_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "preflight_document_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "beacon_document_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "selection_document_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "draw_key_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "website_content_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "website_reference_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "site_source": {
+    "origin_url": "https://github.com/duriantaco/ravage.git",
+    "repository": "/Users/oha/ravage",
+    "commit": "1c3c22e4665d5526b4a291743ca24dae8901d1db",
+    "tree": "98f62a4aa76e540c4cd79f12f5c06da2033077cd",
+    "relative_path": "examples/labs/ravage-node-market-box"
+  },
+  "systems": {
+    "ravage": {
+      "origin_url": "https://github.com/duriantaco/ravage.git",
+      "repository": "/Users/oha/ravage",
+      "commit": "1c3c22e4665d5526b4a291743ca24dae8901d1db",
+      "tree": "35c748c026751b7a753a16f08cfa020eba6c757e",
+      "executable": "/ABSOLUTE/REQUIRED_PACKAGE_ONLY_RAVAGE/bin/ravage",
+      "executable_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "runtime_environment_manifest": "/ABSOLUTE/REQUIRED_PACKAGE_ONLY_RAVAGE/runtime-environment.json",
+      "runtime_environment_manifest_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "runtime_read_roots": [
+        "/ABSOLUTE/REQUIRED_PACKAGE_ONLY_RAVAGE",
+        "/ABSOLUTE/REQUIRED_OUTER_PYTHON_RUNTIME"
+      ],
+      "tool_image_reference": "ghcr.io/duriantaco/ravage-kali@sha256:475ee5f275b475ef75a4810f04d806565907c330b17bf3cc1aea7a5000d2142c",
+      "tool_image_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "tool_image_archive": "/ABSOLUTE/REQUIRED_OFFLINE_IMAGES/ravage-kali-linux-amd64.oci.tar",
+      "tool_image_archive_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "platform": "linux/amd64"
+    },
+    "strix": {
+      "origin_url": "https://github.com/usestrix/strix.git",
+      "repository": "/Users/oha/ravage/.reference_repos/strix-eval-20260911",
+      "commit": "95e085eb6ce29c72ff84313b012cd2c9e9c1cfe5",
+      "tree": "77b2f68b08d03bd9c349ebb8b1c0a884bcbe0a80",
+      "executable": "/ABSOLUTE/REQUIRED_PACKAGE_ONLY_STRIX/bin/strix",
+      "executable_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "runtime_environment_manifest": "/ABSOLUTE/REQUIRED_PACKAGE_ONLY_STRIX/runtime-environment.json",
+      "runtime_environment_manifest_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "runtime_read_roots": [
+        "/ABSOLUTE/REQUIRED_PACKAGE_ONLY_STRIX",
+        "/ABSOLUTE/REQUIRED_OUTER_PYTHON_RUNTIME"
+      ],
+      "tool_image_reference": "ghcr.io/usestrix/strix-sandbox@sha256:e5e5d9927f15ca95ad49804ef7d22439771cd27378f400da6edd47556799baff",
+      "tool_image_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "tool_image_archive": "/ABSOLUTE/REQUIRED_OFFLINE_IMAGES/strix-sandbox-linux-amd64.oci.tar",
+      "tool_image_archive_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "platform": "linux/amd64"
+    }
+  },
+  "target_runtime": {
+    "platform": "linux/amd64",
+    "images": {
+      "node_base": {
+        "reference": "registry.example.invalid/required-node-base@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "expected_image_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "proxy": {
+        "reference": "registry.example.invalid/required-nginx-proxy@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "expected_image_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "http_meter": {
+        "reference": "registry.example.invalid/required-http-meter@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "expected_image_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "readiness_probe": {
+        "reference": "registry.example.invalid/required-readiness-probe@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "expected_image_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "http_meter": {
+      "program_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "protocol": "http/1.0-1.1-origin-form"
+    },
+    "dependency_lock": {
+      "required": true,
+      "relative_path": "web/package-lock.json",
+      "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "package_json_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "installer": "npm-ci-omit-dev"
+    },
+    "proxy_configuration": {
+      "relative_path": "proxy/nginx.conf",
+      "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  "model_gateway_policy": {
+    "schema_version": "ravage.xben.model-gateway-policy.v1",
+    "upstream": "https://api.openai.com/v1/chat/completions",
+    "model": "gpt-5.4-mini-2026-03-17",
+    "reasoning_effort": "high",
+    "pricing_usd_per_million_tokens": {
+      "input_per_million": "0.75",
+      "cached_input_per_million": "0.075",
+      "output_per_million": "4.5"
+    },
+    "campaign_max_cost_usd": "1.1",
+    "max_completion_tokens_per_request": 8192,
+    "max_request_body_bytes": 1048576,
+    "max_upstream_response_bytes": 8388608,
+    "upstream_timeout_seconds": 600,
+    "max_parallel_requests": 1,
+    "input_token_reservation": {
+      "algorithm": "utf8_body_bytes_plus_fixed_overhead",
+      "fixed_overhead_tokens": 4096,
+      "cached_discount_assumed": false
+    },
+    "retry_policy": "gateway_never_retries",
+    "unknown_usage_policy": "charge_full_reservation_and_invalidate_row"
+  },
+  "limits": {
+    "per_arm": {
+      "wall_seconds": 600,
+      "max_model_requests": 40,
+      "max_target_requests": 96,
+      "max_cost_usd": "0.55"
+    },
+    "campaign": {
+      "wall_seconds": 1200,
+      "max_model_requests": 80,
+      "max_target_requests": 192,
+      "max_cost_usd": "1.1"
+    }
+  },
+  "docker_separation": {
+    "target": {
+      "docker_executable": "/Applications/Docker.app/Contents/Resources/bin/docker",
+      "docker_executable_sha256": "sha256:85dd50c82c33a1dcd7ff4fbd09b17a37fd0d4152f6817a8efb2e2a54b4d8d038",
+      "docker_socket_path": "/Users/oha/.docker/run/docker.sock",
+      "docker_socket_path_sha256": "sha256:ccf5678c74cb58aa52484d742f35fa6410ecd1669935e0339cd97a74fe5421d9",
+      "docker_host": "unix:///Users/oha/.docker/run/docker.sock",
+      "docker_host_sha256": "sha256:75c6f7471b3ea7269e961ced9788e20216661aa16bdf6af1284b3412ab048434",
+      "daemon_identity_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "agent_vm": {
+      "docker_executable": "/Applications/Docker.app/Contents/Resources/bin/docker",
+      "docker_executable_sha256": "sha256:85dd50c82c33a1dcd7ff4fbd09b17a37fd0d4152f6817a8efb2e2a54b4d8d038",
+      "controller_kind": "colima-lima-ephemeral-v1",
+      "controller_implementation": "/ABSOLUTE/REQUIRED_REVIEWED_AGENT_VM_CONTROLLER",
+      "controller_implementation_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "controller_policy": "/ABSOLUTE/REQUIRED_AGENT_VM_CONTROLLER_POLICY.json",
+      "controller_policy_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "supervisor_executable": "/ABSOLUTE/REQUIRED_PINNED_COLIMA_OR_LIMA_SUPERVISOR",
+      "supervisor_executable_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "supervisor_runtime_manifest": "/ABSOLUTE/REQUIRED_SUPERVISOR_RUNTIME_MANIFEST.json",
+      "supervisor_runtime_manifest_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "vm_template": "/ABSOLUTE/REQUIRED_AGENT_VM_TEMPLATE.yaml",
+      "vm_template_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "base_image": "/ABSOLUTE/REQUIRED_OFFLINE_IMAGES/agent-vm-base-linux-amd64.qcow2",
+      "base_image_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "relay_implementation": "/ABSOLUTE/REQUIRED_REVIEWED_HOST_RELAY",
+      "relay_implementation_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "relay_enforcement_kind": "qemu-slirp-restrict-on-guestfwd-v1",
+      "relay_policy": "/ABSOLUTE/REQUIRED_HOST_RELAY_POLICY.json",
+      "relay_policy_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "plans": {
+        "primary-001": {
+          "docker_socket_path": "/private/tmp/ravage-known-site-primary-001/docker.sock",
+          "docker_socket_path_sha256": "sha256:dd094626326ed0b085626daa5dd1c53a2143818c098dbcb48fa07984a7290e43",
+          "docker_host": "unix:///private/tmp/ravage-known-site-primary-001/docker.sock",
+          "docker_host_sha256": "sha256:11f19ca68b37e05bc584c33de1d80f38889217a5c0a32ff390ebed99e5ae92b0"
+        },
+        "primary-002": {
+          "docker_socket_path": "/private/tmp/ravage-known-site-primary-002/docker.sock",
+          "docker_socket_path_sha256": "sha256:edb0a1a9ed6d807274c9a72dfbe2ba2fec1c4b135e30a14486e2e4a07a79fb6d",
+          "docker_host": "unix:///private/tmp/ravage-known-site-primary-002/docker.sock",
+          "docker_host_sha256": "sha256:3dcf22c5890d028c81ce7f7cc437d71c8f6af7eecc7c2529be4eba9c0327c476"
+        }
+      }
+    }
+  },
+  "execution": {
+    "trusted_path": "/Applications/Docker.app/Contents/Resources/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "sandbox_executable": "/usr/bin/sandbox-exec",
+    "sandbox_executable_sha256": "sha256:335f509a57364b5ebe25ee6b6484ea47e36ffa9c3fa14b8edb4eec0fc590b0ad",
+    "upstream_api_key_environment": "OPENAI_API_KEY"
+  },
+  "isolation_provider": {
+    "name": "required-reviewed-known-site-dual-daemon-provider-v1",
+    "implementation_path": "/ABSOLUTE/REQUIRED_REVIEWED_KNOWN_SITE_ISOLATION_PROVIDER.py",
+    "implementation_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "target_meter_exposure": "target-host-loopback-only",
+    "agent_visible_target_path": "independently-enforced-metered-relay"
+  }
+}
