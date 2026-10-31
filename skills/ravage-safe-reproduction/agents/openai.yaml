@@ -1,0 +1,4 @@
+interface:
+  display_name: "Reproduce With Ravage Safely"
+  short_description: "Validate one hypothesis with paired controls"
+  default_prompt: "Use $ravage-safe-reproduction to validate this fitted hypothesis on the exactly authorized target with minimum-impact paired evidence."
