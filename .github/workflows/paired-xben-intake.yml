@@ -1,0 +1,41 @@
+name: Paired XBEN submission intake
+
+on:
+  push:
+    branches:
+      - paired-xben-intake/**
+    paths:
+      - .paired-xben-submission/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: paired-xben-intake-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  retain:
+    name: Retain exact untrusted submission bytes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the submission branch without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Require the one fixed submission directory
+        run: |
+          set -euo pipefail
+          test -f .paired-xben-submission/submission.json
+          test -d .paired-xben-submission/payload
+
+      - name: Upload a create-only Actions artifact for main-branch validation
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: paired-xben-submission-${{ github.run_id }}
+          path: .paired-xben-submission/*
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 7

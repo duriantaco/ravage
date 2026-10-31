@@ -1,0 +1,99 @@
+name: Paired XBEN target-gateway image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+
+concurrency:
+  group: paired-xben-target-gateway-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build, sign, and report immutable digest
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      github.ref_protected == true &&
+      github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact source without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned official Cosign release
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      - name: Build one create-only linux/amd64 image
+        id: build
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ghcr.io/duriantaco/ravage-xben-target-gateway
+        run: |
+          set -euo pipefail
+          tag="${IMAGE}:${GITHUB_SHA}"
+          printf '%s' "${GHCR_TOKEN}" | docker login ghcr.io \
+            --username "${GITHUB_ACTOR}" --password-stdin >/dev/null
+          if docker buildx imagetools inspect "${tag}" >/dev/null 2>&1; then
+            echo "The source-bound image tag already exists; refusing replacement." >&2
+            exit 1
+          fi
+          docker buildx build \
+            --file tools/paired_xben/images/target-gateway.Dockerfile \
+            --platform linux/amd64 \
+            --build-arg "SOURCE_REVISION=${GITHUB_SHA}" \
+            --provenance=mode=max \
+            --sbom=true \
+            --metadata-file "${RUNNER_TEMP}/build-metadata.json" \
+            --tag "${tag}" \
+            --push .
+          digest="$(jq -er \
+            '."containerimage.digest" | select(test("^sha256:[0-9a-f]{64}$"))' \
+            "${RUNNER_TEMP}/build-metadata.json")"
+          docker buildx imagetools inspect "${IMAGE}@${digest}" >/dev/null
+          echo "reference=${IMAGE}@${digest}" >>"${GITHUB_OUTPUT}"
+
+      - name: Keylessly sign the exact image digest
+        env:
+          IMAGE_REFERENCE: ${{ steps.build.outputs.reference }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${IMAGE_REFERENCE}"
+          cosign verify \
+            --certificate-identity \
+              "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/paired-xben-helper-image.yml@refs/heads/main" \
+            --certificate-oidc-issuer \
+              "https://token.actions.githubusercontent.com" \
+            "${IMAGE_REFERENCE}" >/dev/null
+
+      - name: Retain BuildKit metadata
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: paired-xben-target-gateway-${{ github.sha }}
+          path: ${{ runner.temp }}/build-metadata.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 90
+
+      - name: Report the only admissible reference
+        env:
+          IMAGE_REFERENCE: ${{ steps.build.outputs.reference }}
+        run: |
+          set -euo pipefail
+          {
+            echo '### Paired-XBEN target gateway'
+            echo
+            echo "Source: \`${GITHUB_SHA}\`"
+            echo
+            echo "Digest-pinned reference: \`${IMAGE_REFERENCE}\`"
+            echo
+            echo 'Use the digest, never the source tag, in a benchmark commitment.'
+          } >>"${GITHUB_STEP_SUMMARY}"

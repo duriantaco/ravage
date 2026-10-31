@@ -1,0 +1,48 @@
+name: Paired XBEN execution (hard blocked)
+
+on:
+  workflow_dispatch:
+    inputs:
+      campaign_id:
+        description: Exact campaign whose immutable 02-matrix release would be verified
+        required: true
+        type: string
+
+# This checked-in workflow is deliberately non-runnable.  It fixes the future
+# workflow identity so its bytes can be committed, while ensuring a dispatch
+# cannot receive a model secret, start a target, or expand a scored matrix until
+# every github_runner implementation blocker has been removed and tested.
+permissions:
+  contents: read
+
+concurrency:
+  group: paired-xben-execution-${{ inputs.campaign_id }}
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    name: Emit fail-closed implementation assessment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Explicitly reject an unauthorized ref or rerun
+        if: >-
+          github.ref != 'refs/heads/main' ||
+          github.ref_protected != true ||
+          github.run_attempt != 1
+        run: exit 2
+
+      - name: Check out the exact execution revision without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Refuse model, target, Docker, draw, or matrix execution
+        run: >-
+          python -m tools.paired_xben.github_runner assessment
+          --output "${RUNNER_TEMP}/paired-xben-github-runner-assessment.json"
