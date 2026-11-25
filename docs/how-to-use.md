@@ -676,6 +676,16 @@ values by default. An ordinary application should not produce a `Flag found`
 message; look for `Vulnerability confirmed` and the report's Findings section
 instead.
 
+### Browse saved runs
+
+`ravage history runs` reads finished reports from the direct child
+directories of a run archive. The JSON groups runs by engagement, target
+origin, and recorded scope. Each entry includes a relative report path, the
+report's SHA-256 digest, the outcome, the finding count, and available
+coverage status.
+Incomplete and interrupted runs keep their recorded outcome. Use a separate
+archive directory for each project you want to browse.
+
 ## Optional Workflows
 
 None of the workflows in this section is required before the two primary attack
