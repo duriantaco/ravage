@@ -10,13 +10,13 @@ exclude = ["packages/mcp_servers/*"]
 
 [dependency-groups]
 dev = [
-    "cryptography>=42.0",
-    "mypy>=1.10",
-    "pydantic>=2.8",
-    "pytest>=8.2",
-    "pytest-asyncio>=0.23",
-    "pyyaml>=6.0",
-    "ruff>=0.5",
+    "cryptography>=50.0.1",
+    "mypy>=2.3.1",
+    "pydantic>=2.13.5",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pyyaml>=6.0.3",
+    "ruff>=0.16.7",
 ]
 
 [tool.pytest.ini_options]
