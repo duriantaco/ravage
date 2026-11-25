@@ -213,6 +213,11 @@ def _assert_observe_ui(
             raise SmokeCheckError(
                 "clean `ravage observe` omitted authenticated transport JavaScript"
             )
+        presentation = _read_url(f"http://127.0.0.1:{port}/src/presentation.js")
+        if b"formatCost" not in presentation:
+            raise SmokeCheckError(
+                "clean `ravage observe` omitted cockpit cost presentation JavaScript"
+            )
         stylesheet = _read_url(f"http://127.0.0.1:{port}/src/styles.css")
         if not stylesheet:
             raise SmokeCheckError("clean `ravage observe` served empty cockpit CSS")
