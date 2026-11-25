@@ -34,7 +34,7 @@ The operational source of truth is:
 - [Model Providers](model-providers.md): Ollama, LM Studio, vLLM, LiteLLM,
   hosted OpenAI, native Anthropic Claude, and model route inspection.
 - [Offline Repository Context](offline-repository-context.md): bounded local
-  source capture and the separate read-only `ravage review` model loop.
+  source capture and exact excerpts.
 - [Memory Design](memory.md): planned local SQLite memory model, redaction,
   review policy, retention, and evaluation standard.
 - [Improvement Lab](improvement-lab.md): isolated prior-run projection,
@@ -89,11 +89,6 @@ observation, and repeats until `final` or the turn budget is reached. Every
 attack writes a canonical `report.json`; `--report` additionally writes the
 human-readable `report.md`. Every run also retains `audit.db`, `stdout.log`, and
 workspace artifacts.
-
-`ravage review SOURCE_ROOT` runs a separate model loop over a frozen local text
-snapshot. Its available actions only list files and omissions, search text,
-request bounded excerpts, and return source-review candidates. It does not
-construct target, shell, browser, probe, or attack tools.
 
 `ravage scan` is optional deterministic DAST. It performs scoped discovery and
 typed probes without an LLM action loop and writes an auditable run directory.
