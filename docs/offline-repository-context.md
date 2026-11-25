@@ -4,12 +4,9 @@ title: Offline Repository Context
 
 # Offline Repository Context
 
-`ravage.repository_context` provides a read-only text snapshot for offline code
-review. It includes UTF-8 source, configuration, and documentation across file
-extensions. It does not execute repository code or contact a model or network.
-The dedicated `ravage review` agent uses this snapshot through a closed set of
-read-only context actions. The attack agent can use the same bounded reader only
-when the operator explicitly enables model source access.
+`ravage.repository_context` captures a read-only text snapshot of UTF-8
+source, configuration, and documentation files. The attack agent can use
+this bounded reader when the operator explicitly enables model source access.
 
 ```python
 from pathlib import Path
@@ -26,38 +23,6 @@ unfiltered = capture_repository(
     ignore_policy=ContextIgnorePolicy.NONE,
 )
 ```
-
-Run a bounded review with the default local model profile:
-
-```bash
-ravage review /path/to/repository
-```
-
-The review agent can list captured files and omissions, search literal text,
-request bounded excerpts, and finish with source-backed candidates. It cannot
-invoke shell, Python, project code, target HTTP or network actions, browsers,
-probes, or attack runtimes. A nonempty repository must yield at least one excerpt
-before the agent may finish. A final candidate must cite an excerpt receipt from
-the same frozen snapshot; Ravage supplies the relative path, exact lines, excerpt
-and file digests, and snapshot identity rather than trusting model-authored
-references.
-
-The default profile calls a loopback Ollama endpoint. A hosted or paid-risk model
-requires `--allow-paid-models` and receives only the file metadata, search results,
-and excerpts requested during the review. Repository text is treated as untrusted
-data, but the capture exclusions are not a general secret detector. Review the
-repository and provider policy before allowing source text to leave the machine.
-The command writes candidate metadata and source references to standard output.
-Ravage omits raw search-line and excerpt fields from the JSON trace; model-authored
-summaries and candidate descriptions can still quote source content.
-The top-level summary is explicitly marked `model_authored_unverified`. Raw
-excerpt text and the frozen snapshot are not persisted by this command, so retain
-the reviewed revision or rerun the review if the working tree changes.
-The JSON also records an objective digest and length, requested and selected
-model tiers, route ordinal, reasoning mode, output cap, turn and cost limits,
-usage, and context-coverage counters for comparing recorded run settings without
-copying the objective text into the artifact. Retain the model configuration,
-Ravage revision, repository revision, and objective separately for reproduction.
 
 ## Attack source navigation
 
@@ -172,13 +137,6 @@ traversal currently requires POSIX, including Linux and macOS.
 Search results mark additional matches with `truncated=True`. Long matching
 lines return a bounded window around the match with its starting column and a
 `text_truncated` flag. Excerpts over 100 lines or 20,000 characters are rejected.
-The review agent applies narrower per-action limits, a total observation budget,
-a model-turn limit, duplicate-action blocking, and a model-cost ceiling. Paid
-routes use a conservative pre-request bound and stop before dispatch when the
-remaining configured budget cannot cover the next request. Routes that cannot
-enforce their configured output-token cap are rejected before a model call. A
-review excerpt whose requested end is past the file's last line is clamped to
-EOF and reports that adjustment; a request that starts past EOF still fails.
 
 ## Regression cases
 
@@ -191,7 +149,6 @@ Run the offline suite:
 ```bash
 .venv/bin/python -m pytest \
   packages/ravage/tests/test_repository_context.py \
-  packages/ravage/tests/test_repository_review.py \
   packages/ravage/tests/test_source_navigation.py \
   packages/ravage/tests/test_source_navigation_python_mounts.py \
   packages/ravage/tests/test_ai_agent_source_context.py -q
@@ -208,9 +165,6 @@ references are separate from the reader.
 The Python source analyzer reads three of these eight files, as its
 documented contract requires. This reader exposes all eight. That difference
 measures file-context breadth; it is not a vulnerability-detection score or a
-semantic retrieval evaluation. The review regressions
-prove that model-selected searches and excerpts reach the model and that final
-candidates bind to captured evidence. They do not establish improved vulnerability
-detection. Attack regressions separately verify consent, transient source
+semantic retrieval evaluation. Attack regressions verify consent, transient source
 observations, snapshot-bound resume, and source-guided live requests; they do not
 establish a recall gain.
