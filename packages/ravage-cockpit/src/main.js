@@ -8,6 +8,7 @@
 // changed panel mutates — no flicker, no scroll jumps.
 
 import { cockpitFetch, consumeEventStream, sessionToken } from "./transport.js";
+import { formatCost, resultSummary, runTone, targetSuffix } from "./presentation.js";
 
 const app = document.querySelector("#app");
 
@@ -27,6 +28,7 @@ const state = {
   streamConnected: false,
   lastStreamAt: 0,
   flags: { count: 0, values: [] },
+  findingsExpanded: false,
   status: {},
 };
 
@@ -195,6 +197,8 @@ function applyState(snapshot) {
     state.rawLines = [];
     state.focusKey = null;
     state.autoFollow = true;
+    state.findingsExpanded = false;
+    state.status = {};
     refs.steps.replaceChildren();
     renderDetailEmpty();
     state.autoScroll = true;
@@ -504,7 +508,7 @@ function renderRail(block) {
   const route = selection.last_model_route || {};
   facts.body.append(factRow("model", [route.model, route.provider].filter(Boolean).join(" · ") || "—"));
   facts.body.append(factRow("requests", String(run.model_requests ?? metrics.model_replies ?? 0)));
-  facts.body.append(factRow("cost", run.cost_usd ? `$${run.cost_usd}` : "$0"));
+  facts.body.append(factRow("cost", formatCost(run)));
   const tools = Array.isArray(selection.selected_tools) ? selection.selected_tools : [];
   facts.body.append(factRow("tools", tools.length ? tools.join(", ") : "builtin"));
   refs.rail.append(facts.section);
@@ -514,7 +518,16 @@ function renderRail(block) {
   if (!findings.length) {
     fnd.body.append(textEl("div", "none yet", "muted"));
   } else {
-    findings.slice(0, 12).forEach((finding) => fnd.body.append(findingRow(finding)));
+    const visible = state.findingsExpanded ? findings : findings.slice(0, 12);
+    visible.forEach((finding) => fnd.body.append(findingRow(finding)));
+    if (findings.length > 12) {
+      const toggle = button(state.findingsExpanded ? "Show first 12" : `Show all ${findings.length}`, () => {
+        state.findingsExpanded = !state.findingsExpanded;
+        renderRail(state.status);
+      });
+      toggle.setAttribute("aria-expanded", String(state.findingsExpanded));
+      fnd.body.append(toggle);
+    }
   }
   refs.rail.append(fnd.section);
 
@@ -559,7 +572,7 @@ function killChain(stages) {
 
 function findingRow(finding) {
   const status = String(finding.status || "").toLowerCase();
-  const tone = status.includes("confirm") ? "pass" : status.includes("reject") ? "fail" : "warn";
+  const tone = status === "confirmed" ? "pass" : status === "rejected" ? "fail" : "warn";
   const row = el("div", `finding ${tone}`);
   row.append(el("span", "fdot"));
   row.append(textEl("span", finding.vuln_class || "finding", "fclass"));
@@ -568,8 +581,6 @@ function findingRow(finding) {
 }
 
 function shortStatus(status) {
-  if (status.includes("confirm")) return "confirmed";
-  if (status.includes("reject")) return "rejected";
   return status || "open";
 }
 
@@ -584,8 +595,8 @@ function factRow(name, value) {
 
 function updateStatus(block) {
   state.status = { ...state.status, ...block };
-  const run = block.run || {};
-  const metrics = block.metrics || {};
+  const run = state.status.run || {};
+  const metrics = state.status.metrics || {};
   state.mode = block.mode || state.mode;
   state.startedAt = run.started_at ? Date.parse(run.started_at) : state.startedAt;
   state.flags = block.flags || state.flags;
@@ -596,33 +607,18 @@ function updateStatus(block) {
   const phase = run.phase || "idle";
   const label = run.label || metrics.run_label || "";
   refs.runState.textContent = state.mode === "replay" ? `replay · ${label}` : `${phase} · ${label}`;
-  refs.runState.className = `runstate ${statusTone(run, metrics, state.mode)}`;
+  refs.runState.className = `runstate ${runTone(run, metrics, state.mode)}`;
 
   refs.turn.textContent = run.max_turns ? `turn ${run.turn || 0}/${run.max_turns}` : (run.turn ? `turn ${run.turn}` : "");
-  const route = (block.selection || {}).last_model_route || {};
+  const route = (state.status.selection || {}).last_model_route || {};
   refs.model.textContent = route.model ? `· ${route.model}` : "";
-  refs.cost.textContent = run.cost_usd ? `· $${run.cost_usd}` : "";
+  refs.cost.textContent = `· cost ${formatCost(run)}`;
 
-  const flags = state.flags || {};
-  const findings = (block.evidence && block.evidence.findings) || metrics.findings || 0;
-  if (flags.count > 0) {
-    const value = Array.isArray(flags.values) && flags.values[0] ? flags.values[0] : `${flags.count} flag`;
-    refs.result.textContent = `✔ ${value}`;
-    refs.result.className = "result pass";
-  } else {
-    refs.result.textContent = `${findings} finding${findings === 1 ? "" : "s"} · no flag`;
-    refs.result.className = "result muted";
-  }
+  const result = resultSummary(state.status);
+  refs.result.textContent = result.text;
+  refs.result.className = `result ${result.tone}`;
   renderElapsed();
   renderRail(state.status);
-}
-
-function statusTone(run, metrics, mode) {
-  if ((state.flags && state.flags.count) || metrics.flags) return "pass";
-  const label = String(run.label || metrics.run_label || "");
-  if (label.startsWith("Stopped")) return "warn";
-  if (mode === "replay" || run.active === false) return "done";
-  return "run";
 }
 
 // ---- target (topbar info only) ------------------------------------------
@@ -634,16 +630,11 @@ function updateTarget(block) {
   state.mode = mode;
   const url = target.url || run.target_url || "";
   state.targetUrl = url;
-  const status = target.status || {};
   if (!url) {
     refs.target.textContent = "target pending";
     return;
   }
-  let suffix = "";
-  if (mode === "replay") suffix = " · torn down";
-  else if (status.reachable === false) suffix = " · offline";
-  else if (status.status) suffix = ` · HTTP ${status.status}`;
-  refs.target.textContent = url + suffix;
+  refs.target.textContent = url + targetSuffix(target, run, mode);
 }
 
 // ---- docker + evidence strip -------------------------------------------
