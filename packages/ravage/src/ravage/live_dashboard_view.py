@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
 import re
+from collections import Counter
 from typing import TYPE_CHECKING
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -161,6 +163,7 @@ def _metrics(
     run_success = _run_success(run_completed)
     model_replies = sum(1 for row in audit_rows if row.get("action") == "model_reply_received")
     flags = _collect_flags(events, audit_rows)
+    cost_usd, cost_status = _cost_accounting(audit_rows)
     return {
         "completed": completed,
         "run_success": run_success,
@@ -177,7 +180,8 @@ def _metrics(
         "flags": len(flags),
         "terminal_sessions": len(terminal),
         "current_turn": _current_turn(audit_rows),
-        "cost_usd_total": _cost_total(audit_rows),
+        "cost_usd_total": cost_usd,
+        "cost_status": cost_status,
     }
 
 
@@ -190,13 +194,48 @@ def _current_turn(audit_rows: list[dict[str, Any]]) -> int:
     return turn
 
 
-def _cost_total(audit_rows: list[dict[str, Any]]) -> float:
-    total = 0.0
+def _cost_accounting(audit_rows: list[dict[str, Any]]) -> tuple[float | None, str]:
+    """Describe observed model charges without treating missing receipts as free."""
+    starts = [row for row in audit_rows if row.get("action") == "model_request_started"]
+    replies = [row for row in audit_rows if row.get("action") == "model_reply_received"]
+    started_ids = Counter(_cost_request_id(row) for row in starts)
+    replied_ids = Counter(_cost_request_id(row) for row in replies)
+    costs: list[float] = []
+    dispatched: set[str] = set()
     for row in audit_rows:
+        request_id = _cost_request_id(row)
+        if row.get("action") == "model_request_started" and request_id is not None:
+            dispatched.add(request_id)
+        if row.get("action") != "model_reply_received":
+            continue
         cost = row.get("cost_usd")
-        if isinstance(cost, (int, float)):
-            total += float(cost)
-    return round(total, 4)
+        payload = _record_payload(row)
+        if (
+            request_id is not None
+            and request_id in dispatched
+            and started_ids[request_id] == 1
+            and replied_ids[request_id] == 1
+            and payload.get("cost_known") is True
+            and payload.get("usage_reported") is True
+            and isinstance(cost, (int, float))
+            and not isinstance(cost, bool)
+            and math.isfinite(cost)
+            and cost >= 0
+        ):
+            costs.append(float(cost))
+    if not costs:
+        return None, "unknown"
+
+    # The observer reads a bounded tail. Charges in that window are only a
+    # subtotal when earlier rows or model replies are unavailable.
+    truncated = not audit_rows or audit_rows[0].get("id") != 1
+    partial = truncated or started_ids != replied_ids or len(costs) != len(replies)
+    return round(sum(costs), 8), "partial" if partial else "known"
+
+
+def _cost_request_id(row: dict[str, Any]) -> str | None:
+    value = _record_payload(row).get("model_request_id")
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def _latest_objective(audit_rows: list[dict[str, Any]], events: list[dict[str, Any]]) -> str:
@@ -626,7 +665,8 @@ def _viewer_run_block(  # noqa: PLR0913
         "objective": _latest_objective(audit_rows, events),
         "turn": metrics.get("current_turn", 0),
         "max_turns": _viewer_manifest_max_turns(manifest),
-        "cost_usd": metrics.get("cost_usd_total", 0.0),
+        "cost_usd": metrics.get("cost_usd_total"),
+        "cost_status": metrics.get("cost_status", "unknown"),
         "model_requests": metrics.get("model_replies", 0),
     }
 
